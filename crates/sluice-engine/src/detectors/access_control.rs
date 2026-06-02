@@ -64,7 +64,19 @@ impl Detector for AccessControlDetector {
             if cx.has_access_control(f) || cx.is_initializer(f) || f.is_constructor() {
                 continue;
             }
-            let priv_write = f.effects.storage_writes.iter().find(|w| is_privileged_name(&w.var));
+            // Admin state is a scalar (`owner = x`), not a per-key mapping write
+            // (which is ordinary per-entity bookkeeping). Skip mapping writes.
+            let is_mapping_var = |name: &str| {
+                cx.contract_of(f.id)
+                    .and_then(|c| c.state_vars.iter().find(|v| v.name == name))
+                    .map(|v| v.is_mapping())
+                    .unwrap_or(false)
+            };
+            let priv_write = f
+                .effects
+                .storage_writes
+                .iter()
+                .find(|w| is_privileged_name(&w.var) && !is_mapping_var(&w.var));
             if let Some(w) = priv_write {
                 // skip if a sibling-consensus finding already covers it (dedup by line later)
                 let b = FindingBuilder::new(self.id(), Category::AccessControl)

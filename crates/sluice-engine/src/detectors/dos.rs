@@ -55,11 +55,16 @@ impl Detector for DosDetector {
                 // recipient is caught and the batch survives.
                 if let Some(call_span) = external_call_in_loop(body) {
                     let pull_payment = uses_pull_payment(cx, f);
-                    if !pull_payment {
-                        // Sending native ETH (or any value) makes the grief trivial:
-                        // a contract recipient with a reverting `receive()` stops the
-                        // whole loop. That is value-flow corroboration.
-                        let sends_value = loop_sends_value(body);
+                    // The DoS-class pattern is a PUSH PAYMENT: a value-sending call
+                    // to a recipient that can revert, bricking the batch. A loop of
+                    // ordinary external/token calls over a CALLER-SUPPLIED array is
+                    // the caller's own concern, not a protocol DoS — flagging those
+                    // produced large false-positive volume on real batch functions.
+                    // Require either an ETH-sending call or iteration over a stored
+                    // (shared) array.
+                    let sends_value = loop_sends_value(body);
+                    let over_storage = loop_iterates_storage(cx, f, loop_stmt);
+                    if !pull_payment && (sends_value || over_storage) {
                         let mut b = FindingBuilder::new(self.id(), Category::DenialOfService)
                             .title("External call inside a loop (one reverting recipient bricks the batch)")
                             .severity(Severity::Medium)
@@ -327,6 +332,42 @@ fn uses_pull_payment(cx: &AnalysisContext, f: &Function) -> bool {
     pull_name || (src.contains("pending") && (src.contains("credit") || src.contains("balances[")))
 }
 
+/// True if `loop_stmt` iterates over (the length of, or by indexing) a *storage*
+/// array — i.e. shared state, so one bad entry griefs everyone. This separates a
+/// protocol push-loop over stored recipients from a caller-supplied calldata batch.
+fn loop_iterates_storage(cx: &crate::context::AnalysisContext, f: &Function, loop_stmt: &Stmt) -> bool {
+    let Some(c) = cx.contract_of(f.id) else {
+        return false;
+    };
+    let state: std::collections::HashSet<&str> = c.state_vars.iter().map(|v| v.name.as_str()).collect();
+    let mut hit = false;
+    loop_stmt.visit_exprs(&mut |e| match &e.kind {
+        ExprKind::Member { base, member } if member == "length" => {
+            if root_in(base, &state) {
+                hit = true;
+            }
+        }
+        ExprKind::Index { base, .. } => {
+            if root_in(base, &state) {
+                hit = true;
+            }
+        }
+        _ => {}
+    });
+    hit
+}
+
+fn root_in(e: &sluice_ir::Expr, state: &std::collections::HashSet<&str>) -> bool {
+    fn root(e: &sluice_ir::Expr) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Ident(n) => Some(n),
+            ExprKind::Member { base, .. } | ExprKind::Index { base, .. } => root(base),
+            _ => None,
+        }
+    }
+    root(e).map(|r| state.contains(r)).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -385,6 +426,23 @@ mod tests {
     fn fires_on_vuln() {
         let fs = run(VULN);
         assert!(fs.iter().any(|f| f.detector == "denial-of-service"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_calldata_batch() {
+        // A batch over a CALLER-supplied array doing a token pull is the caller's
+        // own concern, not a protocol DoS — must stay silent.
+        let fs = run(r#"
+            interface IERC20 { function transferFrom(address f, address t, uint256 a) external returns (bool); }
+            contract Batch {
+                function pull(address[] calldata tokens, uint256[] calldata amts) external {
+                    for (uint256 i = 0; i < tokens.length; i++) {
+                        IERC20(tokens[i]).transferFrom(msg.sender, address(this), amts[i]);
+                    }
+                }
+            }
+        "#);
+        assert!(!fs.iter().any(|f| f.detector == "denial-of-service"), "{:?}", fs);
     }
 
     #[test]

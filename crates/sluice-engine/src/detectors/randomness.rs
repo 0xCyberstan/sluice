@@ -20,7 +20,6 @@
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
-use crate::detectors::visit_calls;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
 use sluice_ir::{BinOp, Builtin, CallKind, Expr, ExprKind, Function};
 
@@ -69,45 +68,52 @@ impl RandomnessDetector {
         src: &str,
         out: &mut Vec<Finding>,
     ) {
-        // A `blockhash(...)` builtin also constitutes a randomness source but is
-        // a call, not a `block.*` member, so `reads_block_env` does not cover it.
-        let mut uses_blockhash = false;
-        // A `keccak256(...)` whose arguments transitively include a block-env
-        // value is the textbook "hash some block junk into a random number"
-        // pattern — strong on its own, regardless of the function name.
-        let mut keccak_over_block_env: Option<sluice_ir::Span> = None;
-        visit_calls(f, |c, span| {
-            match c.kind {
-                CallKind::Builtin(Builtin::Blockhash) => uses_blockhash = true,
-                CallKind::Builtin(Builtin::Keccak256) => {
-                    if keccak_over_block_env.is_none()
-                        && c.args.iter().any(|a| self.expr_reaches_block_env(cx, f, a))
-                    {
-                        keccak_over_block_env = Some(span);
-                    }
-                }
-                _ => {}
-            }
-        });
-
-        let reads_block_env = f.effects.reads_block_env || uses_blockhash;
-        if !reads_block_env {
+        // Proper randomness (VRF / commit-reveal) is never flagged.
+        if uses_proper_randomness(src) {
             return;
         }
 
-        // The outcome must look like a selection/reward, OR the block-env value
-        // must be hashed (keccak over block env is itself the random-draw shape).
-        let selection_like = name_is_selection(&f.name) || src_mentions_selection(src);
-        let span = match (keccak_over_block_env, selection_like) {
-            (Some(s), _) => s, // hashing block env: point at the hash, fires unconditionally.
-            (None, true) => block_env_span(f).unwrap_or(f.span),
-            (None, false) => return, // block env read with no selection role: not our class.
+        // The weak-randomness signature is a *selection* over a block-environment
+        // value: a modulo (`... % n`) or an array index whose value derives from
+        // the block environment (directly, via `blockhash`, or via `keccak256`).
+        // Merely reading `block.number` to record a start block, or hashing block
+        // data into an id, is NOT randomness and must not be flagged — that
+        // distinction is what keeps this quiet on real protocols.
+        let mut hit: Option<sluice_ir::Span> = None;
+        for s in &f.body {
+            s.visit_exprs(&mut |e| {
+                if hit.is_some() {
+                    return;
+                }
+                match &e.kind {
+                    ExprKind::Binary { op: sluice_ir::BinOp::Mod, lhs, .. } => {
+                        if self.expr_reaches_block_env(cx, f, lhs) {
+                            hit = Some(e.span);
+                        }
+                    }
+                    ExprKind::Index { index: Some(idx), .. } => {
+                        if self.expr_reaches_block_env(cx, f, idx) {
+                            hit = Some(e.span);
+                        }
+                    }
+                    _ => {}
+                }
+            });
+            if hit.is_some() {
+                break;
+            }
+        }
+        let span = match hit {
+            Some(s) => s,
+            None => return,
         };
+        // A selection/reward-flavored name raises confidence but is not required.
+        let selection_like = name_is_selection(&f.name) || src_mentions_selection(src);
 
         let mut b = FindingBuilder::new(self.id(), Category::WeakRandomness)
             .title("Predictable randomness derived from block environment")
             .severity(Severity::High)
-            .confidence(0.5)
+            .confidence(if selection_like { 0.7 } else { 0.55 })
             // Value-flow: a block-env source reaches a selection/reward sink.
             .dimension(Dimension::ValueFlow)
             .message(format!(
@@ -276,17 +282,6 @@ fn is_block_env_expr(e: &Expr) -> bool {
 
 /// Span of the first `block.*` env read in the body (best-effort, for locating
 /// the finding when no keccak is involved).
-fn block_env_span(f: &Function) -> Option<sluice_ir::Span> {
-    let mut found = None;
-    for s in &f.body {
-        s.visit_exprs(&mut |e| {
-            if found.is_none() && is_block_env_expr(e) {
-                found = Some(e.span);
-            }
-        });
-    }
-    found
-}
 
 /// The non-timestamp operand looks like a deadline/expiry/"unset" sentinel — an
 /// exact `block.timestamp == 0` / `== deadline` is not the value-critical

@@ -67,7 +67,9 @@ impl FrontierFacts {
             let view_readers = view_readers_of(scir, c.id);
 
             for f in scir.functions_of(c.id) {
-                if !f.has_body {
+                // Constructors run once at deploy and modifiers are analyzed via
+                // their host functions — neither is a reentrancy entry point.
+                if !f.has_body || f.is_constructor() || f.is_modifier() {
                     continue;
                 }
                 let guarded = function_has_lock(f) || contract_has_lock;
@@ -210,11 +212,15 @@ fn function_has_lock(f: &Function) -> bool {
         .any(|g| matches!(g.kind, GuardKind::ReentrancyLock))
 }
 
-/// For each storage var, the view/pure getters in the contract that read it.
+/// For each storage var, the *price/value-like* view getters in the contract
+/// that read it. Read-only reentrancy is only meaningful when an external
+/// consumer trusts a getter that returns a value derived from mid-update state
+/// (a price / share rate / virtual price) — the Curve/Sentinel class. Flagging
+/// every `version()`/`isLocked()`-style getter was pure noise on real code.
 fn view_readers_of(scir: &Scir, cid: ContractId) -> FxHashMap<String, Vec<FunctionId>> {
     let mut map: FxHashMap<String, Vec<FunctionId>> = FxHashMap::default();
     for f in scir.functions_of(cid) {
-        if f.is_view_or_pure() && f.is_externally_reachable() {
+        if f.is_view_or_pure() && f.is_externally_reachable() && is_value_oracle_getter(&f.name) {
             for r in &f.effects.storage_reads {
                 map.entry(r.var.clone()).or_default().push(f.id);
             }
@@ -223,12 +229,30 @@ fn view_readers_of(scir: &Scir, cid: ContractId) -> FxHashMap<String, Vec<Functi
     map
 }
 
+/// A getter whose return value reads like a price / share value an external
+/// protocol might consume as an oracle.
+fn is_value_oracle_getter(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    [
+        "price", "value", "share", "rate", "reserve", "virtual", "totalassets", "convertto",
+        "exchange", "quote", "worth", "collateral", "underlying", "pershare", "amountout",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
 fn detect_cross_function(scir: &Scir, cid: ContractId, facts: &mut FrontierFacts) {
     // Collect (function, vars-written-after-call, guarded) for functions with
     // an external call that is NOT followed by their own write (so classic
     // doesn't fire) but leaves shared state for siblings.
     let funcs: Vec<&Function> = scir.functions_of(cid).filter(|f| f.has_body).collect();
     for f in &funcs {
+        // Cross-function reentrancy is about an EXTERNAL entry point leaving
+        // shared state mid-call; internal helpers and constructors are not entry
+        // points an attacker calls directly.
+        if !f.is_externally_reachable() || f.is_constructor() {
+            continue;
+        }
         let Some(first) = first_reentrant_call(f) else {
             continue;
         };

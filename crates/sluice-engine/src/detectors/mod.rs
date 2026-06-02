@@ -84,13 +84,17 @@ pub(crate) fn is_accounting_name(name: &str) -> bool {
     .any(|k| l.contains(k))
 }
 
-/// Names that indicate privileged/admin state.
+/// Names that indicate privileged/admin state. Deliberately conservative:
+/// generic words like `operator`/`manager`/`minter`/`role` appear in ordinary
+/// per-entity bookkeeping and produced false positives on real protocols, so
+/// they are excluded. Combined with the mapping-write skip in the access-control
+/// detector (admin state is a scalar, not a per-key mapping).
 pub(crate) fn is_privileged_name(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     [
-        "owner", "admin", "governance", "governor", "operator", "treasury", "fee", "implementation",
-        "paused", "oracle", "pricefeed", "whitelist", "blacklist", "minter", "role", "pending",
-        "proxy", "beacon", "guardian", "authority", "manager",
+        "owner", "admin", "governance", "governor", "treasury", "implementation", "paused",
+        "oracle", "pricefeed", "whitelist", "blacklist", "pendingowner", "proxy", "beacon",
+        "guardian", "authority",
     ]
     .iter()
     .any(|k| l.contains(k))
