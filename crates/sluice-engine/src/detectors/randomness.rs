@@ -85,14 +85,18 @@ impl RandomnessDetector {
                 if hit.is_some() {
                     return;
                 }
+                // A genuine random draw seeds the modulo/index with a HASHED block
+                // value or with prevrandao/difficulty. A raw `block.timestamp %
+                // EPOCH` is deterministic time-bucketing, and `mapping[block.number]`
+                // is per-block accounting — neither is randomness.
                 match &e.kind {
                     ExprKind::Binary { op: sluice_ir::BinOp::Mod, lhs, .. } => {
-                        if self.expr_reaches_block_env(cx, f, lhs) {
+                        if self.expr_reaches_block_env(cx, f, lhs) && is_strong_random_seed(lhs) {
                             hit = Some(e.span);
                         }
                     }
                     ExprKind::Index { index: Some(idx), .. } => {
-                        if self.expr_reaches_block_env(cx, f, idx) {
+                        if self.expr_reaches_block_env(cx, f, idx) && is_strong_random_seed(idx) {
                             hit = Some(e.span);
                         }
                     }
@@ -224,6 +228,37 @@ impl RandomnessDetector {
 }
 
 // ------------------------------------------------------------------- helpers
+
+/// True if `e` is a *strong* random-draw seed: it hashes its inputs
+/// (keccak256/sha256) or uses blockhash, or references prevrandao/difficulty
+/// directly. This distinguishes `keccak256(block.*) % n` (a real draw) from
+/// `block.timestamp % EPOCH` (time-bucketing) and `mapping[block.number]`
+/// (per-block accounting), both of which are not randomness.
+fn is_strong_random_seed(e: &Expr) -> bool {
+    use sluice_ir::{Builtin, CallKind};
+    let mut strong = false;
+    e.visit(&mut |sub| match &sub.kind {
+        ExprKind::Call(c) => {
+            if matches!(
+                c.kind,
+                CallKind::Builtin(Builtin::Keccak256)
+                    | CallKind::Builtin(Builtin::Sha256)
+                    | CallKind::Builtin(Builtin::Blockhash)
+            ) {
+                strong = true;
+            }
+        }
+        ExprKind::Member { base, member } => {
+            if let ExprKind::Ident(b) = &base.kind {
+                if b == "block" && (member == "prevrandao" || member == "difficulty") {
+                    strong = true;
+                }
+            }
+        }
+        _ => {}
+    });
+    strong
+}
 
 /// A proper randomness construction the detector must not flag.
 fn uses_proper_randomness(src: &str) -> bool {
