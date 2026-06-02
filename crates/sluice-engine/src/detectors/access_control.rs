@@ -31,7 +31,7 @@ impl Detector for AccessControlDetector {
                     // are intentionally permissionless — neither is a missing-guard
                     // bug, so don't report them as consensus violations.
                     if let Some(f) = cx.scir.function(v.function) {
-                        if cx.is_initializer(f) || is_user_facing(&f.name) {
+                        if cx.is_initializer(f) || is_user_facing(&f.name) || is_framework_hook(&f.name) {
                             continue;
                         }
                     }
@@ -70,7 +70,7 @@ impl Detector for AccessControlDetector {
                 out.push(cx.finish(b, f.id, f.span));
             }
 
-            if cx.has_access_control(f) || cx.is_initializer(f) || f.is_constructor() {
+            if cx.has_access_control(f) || cx.is_initializer(f) || f.is_constructor() || is_framework_hook(&f.name) {
                 continue;
             }
             // Admin state is a scalar (`owner = x`), not a per-key mapping write
@@ -105,6 +105,26 @@ impl Detector for AccessControlDetector {
         }
         out
     }
+}
+
+/// Framework / standard lifecycle hooks that look unguarded but are gated by an
+/// implicit single trusted caller (e.g. a Kernel) or are pure metadata — flagging
+/// them for "missing access control" is a false positive (Default Framework's
+/// `configureDependencies`/`requestPermissions`, ERC-165 `supportsInterface`, …).
+fn is_framework_hook(name: &str) -> bool {
+    matches!(
+        name,
+        "configureDependencies"
+            | "requestPermissions"
+            | "supportsInterface"
+            | "KEYCODE"
+            | "VERSION"
+            | "changeKernel"
+            | "onERC721Received"
+            | "onERC1155Received"
+            | "onERC1155BatchReceived"
+            | "tokensReceived"
+    )
 }
 
 /// Intentionally-permissionless, user-facing function names that should not be

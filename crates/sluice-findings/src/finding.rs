@@ -65,6 +65,15 @@ pub enum Category {
     ForcedEther,
     IntegerOverflow,
     UncheckedMath,
+    // ---- expansion classes ----
+    OracleStaleness,
+    ArbitraryTransfer,
+    MsgValueInLoop,
+    MissingZeroCheck,
+    GasGriefing,
+    GovernanceTimelock,
+    ApproveRace,
+    StorageGap,
     Other,
 }
 
@@ -106,6 +115,14 @@ impl Category {
             ForcedEther => "forced-ether",
             IntegerOverflow => "integer-overflow",
             UncheckedMath => "unchecked-math",
+            OracleStaleness => "oracle-staleness",
+            ArbitraryTransfer => "arbitrary-transfer",
+            MsgValueInLoop => "msg-value-in-loop",
+            MissingZeroCheck => "missing-zero-check",
+            GasGriefing => "gas-griefing",
+            GovernanceTimelock => "governance-timelock",
+            ApproveRace => "approve-race",
+            StorageGap => "storage-gap",
             Other => "other",
         }
     }
@@ -129,6 +146,14 @@ impl Category {
             WeakRandomness => &["SWC-120", "CWE-330"],
             TimestampDependence => &["SWC-116"],
             IntegerOverflow | UncheckedMath => &["SWC-101", "CWE-190"],
+            OracleStaleness => &["CWE-672", "CWE-20"],
+            ArbitraryTransfer => &["CWE-284", "CWE-863"],
+            MsgValueInLoop => &["CWE-682"],
+            MissingZeroCheck => &["CWE-20", "SWC-123"],
+            GasGriefing => &["SWC-126", "CWE-400"],
+            GovernanceTimelock => &["CWE-284"],
+            ApproveRace => &["SWC-114"],
+            StorageGap => &["CWE-1108"],
             _ => &[],
         }
     }

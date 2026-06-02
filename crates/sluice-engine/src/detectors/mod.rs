@@ -21,6 +21,16 @@ pub mod integer_issues;
 pub mod randomness;
 pub mod selector;
 pub mod slippage;
+// v2 expansion detectors.
+pub mod approve_race;
+pub mod arbitrary_transfer;
+pub mod gas_griefing;
+pub mod governance_timelock;
+pub mod missing_zero_check;
+pub mod msg_value_loop;
+pub mod oracle_staleness;
+pub mod rounding;
+pub mod storage_gap;
 
 use crate::detector::Detector;
 
@@ -46,6 +56,16 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(selector::SelectorCollisionDetector),
         Box::new(integer_issues::IntegerIssuesDetector),
         Box::new(erc777::Erc777Detector),
+        // v2 expansion set.
+        Box::new(oracle_staleness::OracleStalenessDetector),
+        Box::new(arbitrary_transfer::ArbitraryTransferDetector),
+        Box::new(msg_value_loop::MsgValueInLoopDetector),
+        Box::new(missing_zero_check::MissingZeroCheckDetector),
+        Box::new(gas_griefing::GasGriefingDetector),
+        Box::new(governance_timelock::GovernanceTimelockDetector),
+        Box::new(approve_race::ApproveRaceDetector),
+        Box::new(storage_gap::StorageGapDetector),
+        Box::new(rounding::RoundingDetector),
     ]
 }
 

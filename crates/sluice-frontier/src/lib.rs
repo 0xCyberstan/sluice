@@ -8,7 +8,7 @@
 //! subtle **read-only reentrancy** case where a `view` getter exposes
 //! mid-update state to an external consumer.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use sluice_ir::{CallKind, ContractId, Function, FunctionId, GuardKind, Scir, Span};
 
 /// One external-call crossing.
@@ -65,6 +65,7 @@ impl FrontierFacts {
 
             // Map storage var -> view getters that read it (for read-only reentrancy).
             let view_readers = view_readers_of(scir, c.id);
+            let trusted = trusted_targets(scir, c.id);
 
             for f in scir.functions_of(c.id) {
                 // Constructors run once at deploy and modifiers are analyzed via
@@ -74,7 +75,7 @@ impl FrontierFacts {
                 }
                 let guarded = function_has_lock(f) || contract_has_lock;
 
-                let first_ext = first_reentrant_call(f);
+                let first_ext = first_reentrant_call(f, &trusted);
                 for cs in &f.effects.call_sites {
                     if !cs.kind.is_external_transfer_of_control() {
                         continue;
@@ -100,13 +101,27 @@ impl FrontierFacts {
                     });
                 }
 
-                // Classic reentrancy: write after the first external call.
+                // Classic reentrancy requires the actual CEI-violation shape: a
+                // storage variable that is READ BEFORE the external call (its
+                // stale value is used) and WRITTEN AFTER it. A write-after-call to
+                // a var that was not read before (e.g. an event-bookkeeping flag,
+                // or a registry entry) is not exploitable via re-entry — requiring
+                // the read-before-and-write-after overlap removes the bulk of the
+                // real-world false positives (Timelock flag-clears, factory
+                // registry writes, etc.).
                 if let Some(first) = first_ext {
+                    let reads_before: std::collections::HashSet<&str> = f
+                        .effects
+                        .storage_reads
+                        .iter()
+                        .filter(|r| r.order < first)
+                        .map(|r| r.var.as_str())
+                        .collect();
                     let vars_after: Vec<String> = f
                         .effects
                         .storage_writes
                         .iter()
-                        .filter(|w| w.order > first)
+                        .filter(|w| w.order > first && reads_before.contains(w.var.as_str()))
                         .map(|w| w.var.clone())
                         .collect();
                     if !vars_after.is_empty() {
@@ -179,6 +194,9 @@ fn is_view_method(name: Option<&str>) -> bool {
                 // governance / token view reads (ERC20Votes etc.)
                 | "getPastVotes" | "getPriorVotes" | "getVotes" | "getPastTotalSupply"
                 | "delegates" | "nonces" | "checkpoints" | "numCheckpoints" | "getCurrentVotes"
+                // factory deploy / clone helpers: deploy fresh code, no attacker callback
+                | "clone" | "cloneDeterministic" | "create" | "create2" | "create3"
+                | "predictDeterministicAddress" | "computeAddress" | "deploy"
         )
     )
 }
@@ -195,14 +213,61 @@ fn is_reentrancy_capable(cs: &sluice_ir::CallSite) -> bool {
     }
 }
 
-/// Order of the first reentrancy-capable external call in a function.
-fn first_reentrant_call(f: &Function) -> Option<u32> {
+/// Order of the first reentrancy-capable external call in a function, ignoring
+/// calls to `trusted` (immutable/constant) target addresses. An immutable target
+/// is set once at construction (WETH, a router, an in-protocol module) and is not
+/// an attacker-controlled re-entry vector — though value-sending and low-level
+/// calls are still counted regardless of target.
+fn first_reentrant_call(f: &Function, trusted: &FxHashSet<String>) -> Option<u32> {
     f.effects
         .call_sites
         .iter()
-        .filter(|cs| is_reentrancy_capable(cs))
+        .filter(|cs| is_reentrancy_capable(cs) && !is_trusted_external(cs, trusted))
         .map(|cs| cs.order)
         .min()
+}
+
+/// True if this is a plain (non-value, non-low-level) external method call to a
+/// trusted immutable/constant target. Token-transfer methods are NEVER trusted on
+/// this basis: even an immutable token address can be an ERC-777/ERC-721 contract
+/// whose transfer hook re-enters (the dForce/Lendf.me class), so those stay
+/// reentrancy-capable regardless of how the address was set.
+fn is_trusted_external(cs: &sluice_ir::CallSite, trusted: &FxHashSet<String>) -> bool {
+    cs.kind == CallKind::External
+        && !cs.sends_value
+        && !is_token_transfer_method(cs.func_name.as_deref())
+        && trusted.contains(target_root(&cs.target))
+}
+
+fn is_token_transfer_method(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "transfer" | "transferFrom" | "safeTransfer" | "safeTransferFrom" | "send"
+                | "operatorSend" | "safeMint" | "mint" | "safeBatchTransferFrom"
+        )
+    )
+}
+
+/// Leading identifier of a textual call target (`MINTR.x[y]` -> `MINTR`).
+fn target_root(target: &str) -> &str {
+    target
+        .split(|c: char| c == '.' || c == '(' || c == '[' || c == ' ')
+        .next()
+        .unwrap_or(target)
+}
+
+/// State variables that are immutable or constant addresses — trusted targets.
+fn trusted_targets(scir: &Scir, cid: ContractId) -> FxHashSet<String> {
+    scir.contract(cid)
+        .map(|c| {
+            c.state_vars
+                .iter()
+                .filter(|v| v.immutable || v.constant)
+                .map(|v| v.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn function_has_lock(f: &Function) -> bool {
@@ -246,6 +311,7 @@ fn detect_cross_function(scir: &Scir, cid: ContractId, facts: &mut FrontierFacts
     // an external call that is NOT followed by their own write (so classic
     // doesn't fire) but leaves shared state for siblings.
     let funcs: Vec<&Function> = scir.functions_of(cid).filter(|f| f.has_body).collect();
+    let trusted = trusted_targets(scir, cid);
     for f in &funcs {
         // Cross-function reentrancy is about an EXTERNAL entry point leaving
         // shared state mid-call; internal helpers and constructors are not entry
@@ -253,7 +319,7 @@ fn detect_cross_function(scir: &Scir, cid: ContractId, facts: &mut FrontierFacts
         if !f.is_externally_reachable() || f.is_constructor() {
             continue;
         }
-        let Some(first) = first_reentrant_call(f) else {
+        let Some(first) = first_reentrant_call(f, &trusted) else {
             continue;
         };
         if function_has_lock(f) {

@@ -21,10 +21,15 @@ pub fn dimension_multiplier(dims: usize) -> f32 {
 }
 
 /// Compute `(score, label)` for a finding.
+///
+/// Confidence is weighted heavily (`0.5 + 0.5·conf`) so that a lone, low-confidence
+/// heuristic settles into Low/Info while a corroborated, high-confidence finding
+/// rises to High/Critical. This is what gives the output a usable triage
+/// distribution instead of everything piling into High/Medium.
 pub fn score(f: &Finding) -> (f32, Severity) {
     let base = f.severity.base_score();
     let mult = dimension_multiplier(f.dimensions.len());
-    let conf = 0.75 + 0.25 * f.confidence;
+    let conf = 0.5 + 0.5 * f.confidence;
     let s = base * mult * conf;
     (s, label_from_score(s))
 }
@@ -32,11 +37,11 @@ pub fn score(f: &Finding) -> (f32, Severity) {
 pub fn label_from_score(s: f32) -> Severity {
     if s >= 100.0 {
         Severity::Critical
-    } else if s >= 60.0 {
+    } else if s >= 62.0 {
         Severity::High
     } else if s >= 33.0 {
         Severity::Medium
-    } else if s >= 12.0 {
+    } else if s >= 13.0 {
         Severity::Low
     } else {
         Severity::Info

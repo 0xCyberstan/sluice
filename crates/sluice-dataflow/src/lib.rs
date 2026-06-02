@@ -115,27 +115,43 @@ pub struct FnFlow {
 #[derive(Debug, Clone, Default)]
 pub struct DataflowFacts {
     per_fn: FxHashMap<FunctionId, FnFlow>,
+    /// Provenance flowing INTO each function's parameters from its callers
+    /// (interprocedural argument propagation). Index i is parameter i.
+    param_in: FxHashMap<FunctionId, Vec<ProvenanceSet>>,
 }
 
 impl DataflowFacts {
     /// Run the analysis over a whole module.
     pub fn analyze(scir: &Scir) -> Self {
         let mut facts = DataflowFacts::default();
-        // Seed with local flows (internal-call returns unknown initially).
+
+        // Precompute internal call edges once: (caller, callee, arg expressions).
+        // This is what lets attacker-controlled arguments flow INTO internal
+        // helper parameters, so bugs in helpers reachable from an external entry
+        // point are no longer invisible.
+        let edges = internal_call_edges(scir);
+
+        // Seed local flows (internal-call returns + param_in unknown initially).
         for f in scir.all_functions() {
             facts.per_fn.insert(f.id, build_flow(scir, f, &facts));
         }
-        // Interprocedural return-provenance fixpoint.
+
+        // Joint fixpoint over return-provenance AND parameter-provenance.
         for _ in 0..MAX_ROUNDS {
             let snapshot = facts.clone();
-            let mut changed = false;
+
+            // (a) Recompute incoming parameter provenance from caller arguments.
+            facts.param_in = compute_param_in(scir, &snapshot, &edges);
+
+            // (b) Recompute flows: callee returns from the snapshot, parameter
+            //     seeds from the freshly-computed param_in.
+            let mut new_per_fn: FxHashMap<FunctionId, FnFlow> = FxHashMap::default();
             for f in scir.all_functions() {
-                let flow = build_flow(scir, f, &snapshot);
-                if snapshot.per_fn.get(&f.id) != Some(&flow) {
-                    changed = true;
-                }
-                facts.per_fn.insert(f.id, flow);
+                new_per_fn.insert(f.id, build_flow(scir, f, &facts));
             }
+
+            let changed = new_per_fn != snapshot.per_fn || facts.param_in != snapshot.param_in;
+            facts.per_fn = new_per_fn;
             if !changed {
                 break;
             }
@@ -199,14 +215,22 @@ pub fn is_spot_price_call(c: &Call) -> bool {
 fn build_flow(scir: &Scir, f: &Function, facts: &DataflowFacts) -> FnFlow {
     let mut flow = FnFlow::default();
 
-    // Seed parameters.
+    // Seed parameters. Externally-reachable functions are entry points, so their
+    // parameters are attacker-controlled. Internal/private functions inherit the
+    // provenance their callers pass in (interprocedural), defaulting to Unknown
+    // when no caller is known yet.
     let attacker = f.is_externally_reachable();
-    for p in &f.params {
+    let incoming = facts.param_in.get(&f.id);
+    for (i, p) in f.params.iter().enumerate() {
         if let Some(name) = &p.name {
             let prov = if attacker {
                 ProvenanceSet::of(ValueSource::AttackerInput)
             } else {
-                ProvenanceSet::of(ValueSource::Unknown)
+                incoming
+                    .and_then(|v| v.get(i))
+                    .copied()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| ProvenanceSet::of(ValueSource::Unknown))
             };
             flow.var_prov.insert(name.clone(), prov);
         }
@@ -442,6 +466,54 @@ fn visit_returns(body: &[sluice_ir::Stmt], f: &mut impl FnMut(&Expr)) {
     }
 }
 
+/// Internal call edges `(caller, callee, arg-expressions)` for interprocedural
+/// argument propagation. Resolves a callee by matching the call's function name
+/// against the caller's resolved internal callees (best-effort, first match).
+fn internal_call_edges(scir: &Scir) -> Vec<(FunctionId, FunctionId, Vec<Expr>)> {
+    let mut edges = Vec::new();
+    for f in scir.all_functions() {
+        for s in &f.body {
+            s.visit_exprs(&mut |e| {
+                if let ExprKind::Call(c) = &e.kind {
+                    if c.kind == CallKind::Internal {
+                        if let Some(name) = &c.func_name {
+                            if let Some(callee) = f.callees.iter().copied().find(|cid| {
+                                scir.function(*cid).map(|g| g.name.as_str()) == Some(name.as_str())
+                            }) {
+                                edges.push((f.id, callee, c.args.clone()));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+    edges
+}
+
+/// Join the provenance of each call argument into the callee's parameter slots.
+fn compute_param_in(
+    scir: &Scir,
+    snapshot: &DataflowFacts,
+    edges: &[(FunctionId, FunctionId, Vec<Expr>)],
+) -> FxHashMap<FunctionId, Vec<ProvenanceSet>> {
+    let mut out: FxHashMap<FunctionId, Vec<ProvenanceSet>> = FxHashMap::default();
+    for f in scir.all_functions() {
+        out.insert(f.id, vec![ProvenanceSet::empty(); f.params.len()]);
+    }
+    for (caller, callee, args) in edges {
+        let Some(caller_flow) = snapshot.per_fn.get(caller) else { continue };
+        let Some(slot) = out.get_mut(callee) else { continue };
+        for (i, arg) in args.iter().enumerate() {
+            if i < slot.len() {
+                let p = eval(snapshot, scir, *caller, caller_flow, arg);
+                slot[i] = slot[i].union(p);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +523,24 @@ mod tests {
         let scir = sluice_parse::parse_sources(vec![("t.sol".into(), src.into())]).scir;
         let facts = DataflowFacts::analyze(&scir);
         (scir, facts)
+    }
+
+    #[test]
+    fn interprocedural_arg_provenance() {
+        // Attacker input passed into an internal helper must reach the helper's
+        // parameter (previously seeded Unknown, hiding bugs in helpers).
+        let (scir, facts) = analyze(
+            "contract C {
+                function entry(uint256 amt) external { _helper(amt); }
+                function _helper(uint256 x) internal { uint256 y = x; }
+            }",
+        );
+        let helper = scir.all_functions().find(|f| f.name == "_helper").unwrap();
+        let flow = facts.flow(helper.id).unwrap();
+        assert!(
+            flow.var_prov.get("x").map(|p| p.is_attacker_controlled()).unwrap_or(false),
+            "internal helper param should inherit attacker provenance from caller"
+        );
     }
 
     #[test]

@@ -21,9 +21,12 @@ impl Detector for UncheckedReturnDetector {
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
         let mut out = Vec::new();
         for c in cx.frontier.unchecked_returns() {
+            // Only value-moving transfers matter here. `approve` (and especially
+            // `approve(spender, 0)` resets) returns a bool that is conventionally
+            // ignored and is not a fund-loss vector — flagging it was noise.
             let is_token_call = matches!(
                 c.func_name.as_deref(),
-                Some("transfer") | Some("transferFrom") | Some("approve")
+                Some("transfer") | Some("transferFrom")
             ) && c.kind == CallKind::External;
 
             // Only two cases are genuinely "unchecked return" bugs:
