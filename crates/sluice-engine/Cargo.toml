@@ -1,0 +1,26 @@
+[package]
+name = "sluice-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sluice_engine"
+path = "src/lib.rs"
+
+[dependencies]
+sluice-ir        = { workspace = true }
+sluice-parse     = { workspace = true }
+sluice-dataflow  = { workspace = true }
+sluice-invariant = { workspace = true }
+sluice-frontier  = { workspace = true }
+sluice-findings  = { workspace = true }
+sluice-config    = { workspace = true }
+rustc-hash = { workspace = true }
+rayon      = { workspace = true }
+petgraph   = { workspace = true }
+anyhow     = { workspace = true }
+regex      = { workspace = true }
+once_cell  = { workspace = true }

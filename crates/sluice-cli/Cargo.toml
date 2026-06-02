@@ -1,0 +1,25 @@
+[package]
+name = "sluice-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sluice"
+path = "src/main.rs"
+
+[dependencies]
+sluice-ir       = { workspace = true }
+sluice-parse    = { workspace = true }
+sluice-engine   = { workspace = true }
+sluice-findings = { workspace = true }
+sluice-config   = { workspace = true }
+sluice-verify   = { workspace = true }
+clap       = { workspace = true }
+anyhow     = { workspace = true }
+walkdir    = { workspace = true }
+colored    = { workspace = true }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }

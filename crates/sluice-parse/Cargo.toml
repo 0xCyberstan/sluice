@@ -1,0 +1,18 @@
+[package]
+name = "sluice-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sluice_parse"
+path = "src/lib.rs"
+
+[dependencies]
+sluice-ir = { workspace = true }
+solang-parser = { workspace = true }
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
+anyhow = { workspace = true }

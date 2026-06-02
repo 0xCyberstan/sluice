@@ -1,0 +1,15 @@
+[package]
+name = "sluice-invariant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sluice_invariant"
+path = "src/lib.rs"
+
+[dependencies]
+sluice-ir = { workspace = true }
+rustc-hash = { workspace = true }
