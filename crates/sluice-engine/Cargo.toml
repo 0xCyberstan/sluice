@@ -24,3 +24,6 @@ petgraph   = { workspace = true }
 anyhow     = { workspace = true }
 regex      = { workspace = true }
 once_cell  = { workspace = true }
+
+[dev-dependencies]
+sluice-parse = { workspace = true }

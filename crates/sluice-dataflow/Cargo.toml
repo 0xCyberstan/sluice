@@ -14,3 +14,6 @@ path = "src/lib.rs"
 sluice-ir = { workspace = true }
 rustc-hash = { workspace = true }
 smallvec = { workspace = true }
+
+[dev-dependencies]
+sluice-parse = { workspace = true }

@@ -695,6 +695,7 @@ version = "0.1.0"
 dependencies = [
  "rustc-hash",
  "sluice-ir",
+ "sluice-parse",
  "smallvec",
 ]
 
@@ -733,6 +734,7 @@ version = "0.1.0"
 dependencies = [
  "rustc-hash",
  "sluice-ir",
+ "sluice-parse",
 ]
 
 [[package]]
@@ -741,6 +743,7 @@ version = "0.1.0"
 dependencies = [
  "rustc-hash",
  "sluice-ir",
+ "sluice-parse",
 ]
 
 [[package]]
