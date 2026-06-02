@@ -26,6 +26,15 @@ impl Detector for AccessControlDetector {
         for v in &cx.invariants.violations {
             if let InvariantKind::GuardConsensus { guard } = &v.kind {
                 if guard == "access-control" {
+                    // Initializers are guarded by `initializer` (not a per-call auth
+                    // modifier), and user-facing functions (deposit/withdraw/claim/…)
+                    // are intentionally permissionless — neither is a missing-guard
+                    // bug, so don't report them as consensus violations.
+                    if let Some(f) = cx.scir.function(v.function) {
+                        if cx.is_initializer(f) || is_user_facing(&f.name) {
+                            continue;
+                        }
+                    }
                     let conf = (v.consensus * 0.9).clamp(0.4, 0.9);
                     let b = FindingBuilder::new(self.id(), Category::AccessControl)
                         .title("Function skips the access-control guard its siblings enforce")
@@ -96,6 +105,19 @@ impl Detector for AccessControlDetector {
         }
         out
     }
+}
+
+/// Intentionally-permissionless, user-facing function names that should not be
+/// flagged for "missing the access-control guard their siblings enforce".
+fn is_user_facing(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    [
+        "deposit", "withdraw", "claim", "mint", "redeem", "stake", "unstake", "swap", "borrow",
+        "repay", "transfer", "approve", "permit", "wrap", "unwrap", "harvest", "compound",
+        "flashloan", "liquidate", "enter", "exit", "vote", "delegate",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
 }
 
 /// True if a function authorizes via `tx.origin` — either directly in its body

@@ -46,6 +46,13 @@ impl Detector for DosDetector {
                 continue;
             }
 
+            // Arrays an unguarded external function can grow without bound — the
+            // only ones whose iteration is an attacker-driven DoS. Admin-set /
+            // bounded lists (operatorDelegators, collateralTokens, ...) are
+            // excluded, which is what keeps this quiet on real protocols.
+            let growable = growable_arrays(cx, f);
+            let mut emitted = false;
+
             // ---- Pattern 2 & 3: walk the body for loop statements. ----
             for loop_stmt in loops_in(f) {
                 let body = loop_body(loop_stmt);
@@ -56,15 +63,12 @@ impl Detector for DosDetector {
                 if let Some(call_span) = external_call_in_loop(body) {
                     let pull_payment = uses_pull_payment(cx, f);
                     // The DoS-class pattern is a PUSH PAYMENT: a value-sending call
-                    // to a recipient that can revert, bricking the batch. A loop of
-                    // ordinary external/token calls over a CALLER-SUPPLIED array is
-                    // the caller's own concern, not a protocol DoS — flagging those
-                    // produced large false-positive volume on real batch functions.
-                    // Require either an ETH-sending call or iteration over a stored
-                    // (shared) array.
+                    // to a recipient that can revert, bricking the batch; OR a loop
+                    // over an ATTACKER-GROWABLE array. A loop over a caller-supplied
+                    // calldata array, or an admin-bounded storage list, is not a DoS.
                     let sends_value = loop_sends_value(body);
-                    let over_storage = loop_iterates_storage(cx, f, loop_stmt);
-                    if !pull_payment && (sends_value || over_storage) {
+                    let over_growable = loop_iterates_growable(loop_stmt, &growable);
+                    if !pull_payment && (sends_value || over_growable) {
                         let mut b = FindingBuilder::new(self.id(), Category::DenialOfService)
                             .title("External call inside a loop (one reverting recipient bricks the batch)")
                             .severity(Severity::Medium)
@@ -88,6 +92,7 @@ impl Detector for DosDetector {
                             b = b.dimension(Dimension::ValueFlow);
                         }
                         out.push(cx.finish(b, f.id, call_span));
+                        emitted = true;
                         // One DoS-in-loop finding per function is enough signal.
                         break;
                     }
@@ -115,17 +120,18 @@ impl Detector for DosDetector {
                                  iteration over caller-growable storage; prefer per-key mappings to arrays.",
                             );
                         out.push(cx.finish(b, f.id, push_span));
+                        emitted = true;
                         break;
                     }
                 }
             }
 
-            // ---- Pattern 1: unbounded loop bound (state-array length). ----
-            // `has_unbounded_loop` is true precisely when a loop bound references a
-            // state-array `.length` that an external function can grow, so this is a
-            // structural signal (no separate "owner-set small array" to suppress —
-            // those don't set the flag).
-            if f.effects.has_unbounded_loop {
+            // ---- Pattern 1: unbounded GAS loop over an attacker-growable array
+            // (no external call needed — the gas to iterate it can exceed the block
+            // limit). Gated on actual growability, not merely "a storage .length".
+            if !emitted {
+                let over_growable = loops_in(f).iter().any(|ls| loop_iterates_growable(ls, &growable));
+                if over_growable {
                 let b = FindingBuilder::new(self.id(), Category::UnboundedLoop)
                     .title("Unbounded loop over an attacker-growable array")
                     .severity(Severity::Medium)
@@ -143,6 +149,7 @@ impl Detector for DosDetector {
                          so the gas cost cannot be driven past the block limit by an attacker.",
                     );
                 out.push(cx.finish(b, f.id, f.span));
+                }
             }
         }
         out
@@ -332,23 +339,42 @@ fn uses_pull_payment(cx: &AnalysisContext, f: &Function) -> bool {
     pull_name || (src.contains("pending") && (src.contains("credit") || src.contains("balances[")))
 }
 
-/// True if `loop_stmt` iterates over (the length of, or by indexing) a *storage*
-/// array — i.e. shared state, so one bad entry griefs everyone. This separates a
-/// protocol push-loop over stored recipients from a caller-supplied calldata batch.
-fn loop_iterates_storage(cx: &crate::context::AnalysisContext, f: &Function, loop_stmt: &Stmt) -> bool {
+/// State arrays that an externally-reachable, NON-access-controlled function can
+/// `push` onto — i.e. arrays an attacker can grow without bound. Iterating one is
+/// an attacker-driven gas/DoS risk; iterating an admin-bounded list is not.
+fn growable_arrays(cx: &crate::context::AnalysisContext, f: &Function) -> std::collections::HashSet<String> {
+    let mut g = std::collections::HashSet::new();
     let Some(c) = cx.contract_of(f.id) else {
-        return false;
+        return g;
     };
-    let state: std::collections::HashSet<&str> = c.state_vars.iter().map(|v| v.name.as_str()).collect();
+    for fun in cx.scir.functions_of(c.id) {
+        if fun.is_externally_reachable() && !cx.has_access_control(fun) {
+            for w in &fun.effects.storage_writes {
+                // The parser records `arr.push(...)` as a write with a "push" path.
+                if w.path.contains("push") {
+                    g.insert(w.var.clone());
+                }
+            }
+        }
+    }
+    g
+}
+
+/// True if `loop_stmt` iterates over (the length of, or by indexing) an
+/// attacker-growable array.
+fn loop_iterates_growable(loop_stmt: &Stmt, growable: &std::collections::HashSet<String>) -> bool {
+    if growable.is_empty() {
+        return false;
+    }
     let mut hit = false;
     loop_stmt.visit_exprs(&mut |e| match &e.kind {
         ExprKind::Member { base, member } if member == "length" => {
-            if root_in(base, &state) {
+            if root_in(base, growable) {
                 hit = true;
             }
         }
         ExprKind::Index { base, .. } => {
-            if root_in(base, &state) {
+            if root_in(base, growable) {
                 hit = true;
             }
         }
@@ -357,7 +383,7 @@ fn loop_iterates_storage(cx: &crate::context::AnalysisContext, f: &Function, loo
     hit
 }
 
-fn root_in(e: &sluice_ir::Expr, state: &std::collections::HashSet<&str>) -> bool {
+fn root_in(e: &sluice_ir::Expr, set: &std::collections::HashSet<String>) -> bool {
     fn root(e: &sluice_ir::Expr) -> Option<&str> {
         match &e.kind {
             ExprKind::Ident(n) => Some(n),
@@ -365,7 +391,7 @@ fn root_in(e: &sluice_ir::Expr, state: &std::collections::HashSet<&str>) -> bool
             _ => None,
         }
     }
-    root(e).map(|r| state.contains(r)).unwrap_or(false)
+    root(e).map(|r| set.contains(r)).unwrap_or(false)
 }
 
 #[cfg(test)]
