@@ -24,6 +24,16 @@ impl Detector for SignatureDetector {
             if !f.has_body {
                 continue;
             }
+            // Replay protection (nonce/deadline/chainId) is the responsibility of
+            // the verification *entry point*, not of a pure recovery primitive.
+            // Skip library helpers and non-entry functions (e.g. an `ECDSA.recover`
+            // implementation legitimately has no nonce).
+            if !f.is_externally_reachable() || !f.is_state_mutating() {
+                continue;
+            }
+            if cx.contract_of(f.id).map(|c| c.is_library()).unwrap_or(false) {
+                continue;
+            }
             let src = cx.scir.span_text(f.span).to_ascii_lowercase();
             if !src.contains("ecrecover") {
                 continue;

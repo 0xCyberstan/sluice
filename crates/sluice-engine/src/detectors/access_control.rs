@@ -42,6 +42,25 @@ impl Detector for AccessControlDetector {
         // (2) Direct: external state-mutating function writes privileged state
         //     with no access control or initializer guard.
         for f in cx.entry_points() {
+            // (3) tx.origin authorization — checked FIRST, because a tx.origin
+            // guard is itself the vulnerability and would otherwise be mistaken
+            // for valid access control and suppressed.
+            if uses_tx_origin_auth(cx, f) {
+                let b = FindingBuilder::new(self.id(), Category::TxOriginAuth)
+                    .title("Authorization via tx.origin")
+                    .severity(Severity::High)
+                    .confidence(0.7)
+                    .dimension(Dimension::ValueFlow)
+                    .message(format!(
+                        "`{}` authorizes using `tx.origin`, which is phishable: a malicious \
+                         intermediary contract the owner is tricked into calling passes the check \
+                         on the victim's behalf.",
+                        f.name
+                    ))
+                    .recommendation("Use `msg.sender` for authorization, never `tx.origin`.");
+                out.push(cx.finish(b, f.id, f.span));
+            }
+
             if cx.has_access_control(f) || cx.is_initializer(f) || f.is_constructor() {
                 continue;
             }
@@ -62,24 +81,28 @@ impl Detector for AccessControlDetector {
                 out.push(cx.finish(b, f.id, w.span));
             }
 
-            // (3) tx.origin used for authorization.
-            if f.effects.reads_tx_origin
-                && f.effects.guards.iter().any(|g| g.text.contains("tx.origin"))
-            {
-                let b = FindingBuilder::new(self.id(), Category::TxOriginAuth)
-                    .title("Authorization via tx.origin")
-                    .severity(Severity::High)
-                    .confidence(0.7)
-                    .dimension(Dimension::ValueFlow)
-                    .message(format!(
-                        "`{}` authorizes using `tx.origin`, which is phishable: a malicious \
-                         intermediary contract passes the check on the victim's behalf.",
-                        f.name
-                    ))
-                    .recommendation("Use `msg.sender` for authorization, never `tx.origin`.");
-                out.push(cx.finish(b, f.id, f.span));
-            }
         }
         out
     }
+}
+
+/// True if a function authorizes via `tx.origin` — either directly in its body
+/// or through an applied modifier whose body reads `tx.origin`.
+fn uses_tx_origin_auth(cx: &AnalysisContext, f: &sluice_ir::Function) -> bool {
+    if f.effects.reads_tx_origin && f.effects.guards.iter().any(|g| g.text.contains("tx.origin")) {
+        return true;
+    }
+    // Look through applied modifiers (the `onlyOwner { require(tx.origin == owner) }` case).
+    for m in &f.modifiers {
+        if let Some(modf) = cx
+            .scir
+            .functions_of(f.contract)
+            .find(|x| x.is_modifier() && x.name == m.name)
+        {
+            if modf.effects.reads_tx_origin {
+                return true;
+            }
+        }
+    }
+    false
 }

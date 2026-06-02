@@ -1,0 +1,5 @@
+# Lending / money-market protocols (Aave/Compound-like).
+# Emphasizes oracle manipulation, missing solvency checks, and rounding.
+profile = "lending"
+min_confidence = 0.35
+# suppress = ["InterestRateModel.utilizationRate"]

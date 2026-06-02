@@ -85,17 +85,22 @@ impl Detector for UpgradeableDetector {
         //     Initializable/UUPS mixin, has an initializer, but the constructor
         //     doesn't call `_disableInitializers()`.
         for c in cx.scir.iter_contracts() {
-            let upgradeable = c.inherits_like("initializable")
-                || c.inherits_like("uupsupgradeable")
-                || c.inherits_like("upgradeable");
-            if !upgradeable {
-                continue;
-            }
             let has_initializer = cx
                 .scir
                 .functions_of(c.id)
                 .any(|f| cx.is_initializer(f) || f.name.to_ascii_lowercase().contains("initialize"));
-            if !has_initializer {
+            // A UUPS-style upgrade hook is strong evidence of an upgradeable
+            // implementation even without an `Initializable` base (many projects
+            // inline the pattern).
+            let has_upgrade_hook = cx.scir.functions_of(c.id).any(|f| {
+                let n = f.name.to_ascii_lowercase();
+                n.contains("upgradeto") || n.contains("_authorizeupgrade") || n == "proxiableuuid"
+            });
+            let upgradeable = c.inherits_like("initializable")
+                || c.inherits_like("uupsupgradeable")
+                || c.inherits_like("upgradeable")
+                || (has_initializer && has_upgrade_hook);
+            if !upgradeable || !has_initializer {
                 continue;
             }
             let ctor = cx.scir.functions_of(c.id).find(|f| f.is_constructor());

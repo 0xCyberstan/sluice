@@ -26,6 +26,22 @@ impl Detector for UncheckedReturnDetector {
                 Some("transfer") | Some("transferFrom") | Some("approve")
             ) && c.kind == CallKind::External;
 
+            // Only two cases are genuinely "unchecked return" bugs:
+            //   (a) a raw low-level call / send (the boolean really is dropped), or
+            //   (b) a RAW ERC-20 transfer/transferFrom/approve (returns a bool).
+            // Any other external call (notify hooks, `safe*` wrappers that revert,
+            // arbitrary contract methods) is NOT a finding — flagging those was a
+            // major false-positive source.
+            let is_low_level = matches!(c.kind, CallKind::LowLevelCall | CallKind::Send);
+            if !is_low_level && !is_token_call {
+                continue;
+            }
+            // `safe*` wrappers (SafeERC20 / Address.sendValue) revert on failure;
+            // ignoring their return is correct.
+            if c.func_name.as_deref().map(|n| n.starts_with("safe")).unwrap_or(false) {
+                continue;
+            }
+
             // SafeERC20 in scope → token transfers are safe.
             if is_token_call && cx.uses_safe_erc20(c.contract) {
                 continue;

@@ -16,6 +16,10 @@ pub struct Lowerer<'a> {
     pub known_types: &'a FxHashSet<String>,
     /// Names of declared libraries (for namespace-call detection).
     pub known_libraries: &'a FxHashSet<String>,
+    /// Function names declared in libraries. A member call `x.fn(...)` whose
+    /// method is one of these is a `using`-bound internal library call (e.g.
+    /// `digest.recover(sig)`, `token.safeTransfer(...)`), not an external call.
+    pub known_lib_funcs: &'a FxHashSet<String>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -391,6 +395,10 @@ impl<'a> Lowerer<'a> {
                             CallKind::Builtin(Builtin::ArrayPushPop)
                         } else if self.known_libraries.contains(&recv_root) {
                             // `Math.max(...)`, `SafeMath.add(...)` — internal lib call.
+                            CallKind::Internal
+                        } else if self.known_lib_funcs.contains(m) {
+                            // `using L for T` bound call: `digest.recover(sig)`,
+                            // `token.safeTransfer(...)` — internal, reverts on failure.
                             CallKind::Internal
                         } else {
                             CallKind::External

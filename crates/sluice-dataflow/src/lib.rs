@@ -176,15 +176,14 @@ pub const SPOT_PRICE_FUNCS: &[&str] = &[
     "getPricePerFullShare",
     "get_virtual_price",
     "getVirtualPrice",
-    "convertToAssets",
-    "convertToShares",
-    "totalAssets",
-    "quote",
-    "getRate",
-    "exchangeRate",
 ];
 
-/// Is this call a price read we treat as manipulable?
+/// Is this call a price read we treat as *manipulable within a transaction*?
+///
+/// Deliberately excludes ERC-4626 standard accounting (`totalAssets`,
+/// `convertToAssets`/`Shares`) and generic `quote`/`getRate`/`exchangeRate`,
+/// which are not necessarily manipulable external spot prices — including them
+/// produced oracle false positives on legitimate vaults.
 pub fn is_spot_price_call(c: &Call) -> bool {
     match &c.func_name {
         Some(n) => {

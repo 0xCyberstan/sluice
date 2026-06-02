@@ -174,6 +174,9 @@ fn is_view_method(name: Option<&str>) -> bool {
                 | "getAmountsIn" | "getAmountIn" | "symbol" | "name" | "totalAssets" | "convertToAssets"
                 | "convertToShares" | "previewRedeem" | "previewDeposit" | "previewMint"
                 | "previewWithdraw" | "getRate" | "exchangeRate" | "quote" | "observe"
+                // governance / token view reads (ERC20Votes etc.)
+                | "getPastVotes" | "getPriorVotes" | "getVotes" | "getPastTotalSupply"
+                | "delegates" | "nonces" | "checkpoints" | "numCheckpoints" | "getCurrentVotes"
         )
     )
 }

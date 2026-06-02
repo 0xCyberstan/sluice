@@ -1,0 +1,4 @@
+# ERC-4626 / yield-vault protocols.
+# Emphasizes first-depositor inflation, rounding direction, and reentrancy.
+profile = "vault"
+min_confidence = 0.35

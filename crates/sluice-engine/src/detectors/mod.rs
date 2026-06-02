@@ -10,6 +10,17 @@ pub mod signature;
 pub mod unchecked_return;
 pub mod upgradeable;
 pub mod vault;
+// Expansion detectors (authored in parallel; registered ahead of time).
+pub mod bridge;
+pub mod dos;
+pub mod erc777;
+pub mod fee_on_transfer;
+pub mod flashloan;
+pub mod forced_ether;
+pub mod integer_issues;
+pub mod randomness;
+pub mod selector;
+pub mod slippage;
 
 use crate::detector::Detector;
 
@@ -24,6 +35,17 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(signature::SignatureDetector),
         Box::new(upgradeable::UpgradeableDetector),
         Box::new(vault::VaultDetector),
+        // Expansion set.
+        Box::new(flashloan::FlashLoanGovernanceDetector),
+        Box::new(bridge::BridgeDetector),
+        Box::new(slippage::SlippageDetector),
+        Box::new(dos::DosDetector),
+        Box::new(fee_on_transfer::FeeOnTransferDetector),
+        Box::new(randomness::RandomnessDetector),
+        Box::new(forced_ether::ForcedEtherDetector),
+        Box::new(selector::SelectorCollisionDetector),
+        Box::new(integer_issues::IntegerIssuesDetector),
+        Box::new(erc777::Erc777Detector),
     ]
 }
 

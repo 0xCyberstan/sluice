@@ -1,0 +1,4 @@
+# Cross-chain bridges / messaging.
+# Emphasizes message verification, signature replay, access control, selector collisions.
+profile = "bridge"
+min_confidence = 0.30

@@ -1,0 +1,4 @@
+# AMM / DEX protocols.
+# Emphasizes oracle manipulation, slippage, and read-only reentrancy.
+profile = "amm"
+min_confidence = 0.35

@@ -90,6 +90,7 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     // ---- Phase 1: register contracts and collect global name sets. ----
     let mut known_types: FxHashSet<String> = FxHashSet::default();
     let mut known_libs: FxHashSet<String> = FxHashSet::default();
+    let mut known_lib_funcs: FxHashSet<String> = FxHashSet::default();
     let mut own_state_vars: FxHashMap<String, Vec<String>> = FxHashMap::default();
     let mut base_names: FxHashMap<String, Vec<String>> = FxHashMap::default();
 
@@ -108,10 +109,20 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
                     let id = ContractId(next_cid);
                     next_cid += 1;
                     let name = def.name.as_ref().map(|i| i.name.clone()).unwrap_or_default();
+                    let is_library = matches!(def.ty, pt::ContractTy::Library(_));
                     if !name.is_empty() {
                         known_types.insert(name.clone());
-                        if matches!(def.ty, pt::ContractTy::Library(_)) {
+                        if is_library {
                             known_libs.insert(name.clone());
+                        }
+                    }
+                    if is_library {
+                        for cp in &def.parts {
+                            if let pt::ContractPart::FunctionDefinition(fd) = cp {
+                                if let Some(n) = &fd.name {
+                                    known_lib_funcs.insert(n.name.clone());
+                                }
+                            }
                         }
                     }
                     // own state vars + base names
@@ -161,6 +172,7 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
             src,
             known_types: &known_types,
             known_libraries: &known_libs,
+            known_lib_funcs: &known_lib_funcs,
         };
 
         // State variables (own).
