@@ -54,7 +54,21 @@ pub fn generate_poc(scir: &Scir, finding: &Finding) -> String {
     let contract = &finding.contract;
     let func = &finding.function;
     let steps = attack_steps(finding.category, contract, func);
-    let pragma = scir.pragma_solidity.clone().unwrap_or_else(|| "^0.8.20".into());
+    // `pragma_solidity` may hold a full directive ("pragma solidity ^0.8.20") or
+    // just a version range; normalize to the bare version constraint.
+    let pragma = {
+        let raw = scir.pragma_solidity.clone().unwrap_or_default();
+        let v = raw
+            .trim()
+            .trim_start_matches("pragma")
+            .trim()
+            .trim_start_matches("solidity")
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if v.is_empty() { "^0.8.20".to_string() } else { v }
+    };
 
     format!(
         "// SPDX-License-Identifier: MIT\n\
