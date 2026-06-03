@@ -36,9 +36,9 @@
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
-use crate::detectors::is_privileged_name;
+use crate::detectors::{is_privileged_name, visit_calls};
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{Function, GuardKind};
+use sluice_ir::{CallKind, Expr, ExprKind, Function, GuardKind};
 
 pub struct UnprotectedInitializerDetector;
 
@@ -109,7 +109,21 @@ impl Detector for UnprotectedInitializerDetector {
             //     first call the flag is set and every later call reverts, so
             //     ownership cannot be re-seized. Parity's `initWallet` — `owner =
             //     _owner;` with no leading guard — has no such guard and still fires.
-            if has_one_shot_init_guard(f) {
+            //
+            //     EXCEPTION — delegatecall proxy (Stader VaultProxy H-01): a
+            //     one-shot flag stops *re*-initialization but provides no access
+            //     control, so it cannot stop a malicious *first* initialization.
+            //     For an ordinary logic contract that is usually tolerable — the
+            //     deployer initializes at/right-after construction (typically via a
+            //     factory in the same flow). But a contract whose fallback
+            //     `delegatecall`s an implementation it selects *at init time* is
+            //     deployed bare and initialized in a separate transaction, so an
+            //     attacker can front-run `initialise`, become owner, then steer the
+            //     delegatecall target — the canonical "initialize front-running"
+            //     proxy takeover. There the one-shot flag is NOT sufficient
+            //     protection, so we do NOT suppress: such an init must carry real
+            //     access control (or run inside the constructor) to be safe.
+            if has_one_shot_init_guard(f) && !contract_is_delegatecall_proxy(cx, f) {
                 continue;
             }
 
@@ -123,12 +137,14 @@ impl Detector for UnprotectedInitializerDetector {
                 .dimension(Dimension::Invariant)
                 .dimension(Dimension::ValueFlow)
                 .message(format!(
-                    "`{}` is an initializer-style function that writes privileged state (`{}`) but carries \
-                     neither an `initializer`/`reinitializer` guard nor an access-control check. Any account \
-                     can call it — and, with no `initializer` guard, call it again after deployment — to set \
-                     itself as owner/admin and take over the contract (the unprotected-`initialize` takeover \
-                     class).",
-                    f.name, var
+                    "`{}` is an initializer-style function that writes privileged state (`{}`) with no \
+                     access-control check. Any account can call it to set itself as owner/admin and take over \
+                     the contract. With no `initializer`/`reinitializer` guard and no hand-rolled one-shot flag \
+                     it is also re-callable after deployment; even where a one-shot flag blocks re-init, on a \
+                     delegatecall proxy (deployed bare, initialized in a separate transaction) an attacker can \
+                     still front-run the *first* `{}` call and seize ownership (the unprotected-`initialize` \
+                     takeover class).",
+                    f.name, var, f.name
                 ))
                 .recommendation(
                     "Add OpenZeppelin's `initializer` (or `reinitializer`) modifier so it runs exactly once, \
@@ -221,6 +237,56 @@ fn guard_references_any(guard_text: &str, vars: &[&str]) -> bool {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|t| !t.is_empty())
         .any(|tok| vars.iter().any(|v| v.eq_ignore_ascii_case(tok)))
+}
+
+/// True if `f`'s **owning contract** is a delegatecall proxy: some function on
+/// it (in practice the `fallback`) `delegatecall`s into a target that is *not*
+/// `address(this)`/`this`. Such a contract is deployed bare and forwards every
+/// call to a separately-deployed implementation it selects at init time, so its
+/// `initialise` runs in a transaction distinct from deployment and a one-shot
+/// flag — which only blocks *re*-init, not a malicious *first* init — does not
+/// protect it (Stader VaultProxy H-01).
+///
+/// We exclude **self-delegatecall** (`address(this)` / `this`) because that is
+/// the multicall pattern, not a forwarding proxy: control dispatches back into
+/// THIS contract's own code, against THIS contract's storage, so there is no
+/// init-front-running takeover. The exclusion mirrors `upgradeable.rs`'s
+/// `is_self_target`. We walk the receiver expression itself rather than the
+/// rendered `CallSite.target` string, because `ir_text` collapses
+/// `address(this)` to `address(...)` and the `this` argument would be lost.
+fn contract_is_delegatecall_proxy(cx: &AnalysisContext, f: &Function) -> bool {
+    let Some(contract) = cx.scir.contract(f.contract) else {
+        return false;
+    };
+    contract.functions.iter().any(|fid| {
+        cx.scir.function(*fid).is_some_and(|g| {
+            let mut found = false;
+            visit_calls(g, |c, _span| {
+                if matches!(c.kind, CallKind::DelegateCall) {
+                    // A forwarding (non-self) delegatecall makes this a proxy.
+                    let self_call = c.receiver.as_deref().is_some_and(is_this_expr);
+                    if !self_call {
+                        found = true;
+                    }
+                }
+            });
+            found
+        })
+    })
+}
+
+/// True if an expression resolves to the contract itself: a bare `this` or a
+/// cast of `this` (`address(this)`, `payable(this)`, `payable(address(this))`,
+/// ...). Mirrors `upgradeable.rs::is_this_expr` so the two proxy detectors agree
+/// on what a self-delegatecall is.
+fn is_this_expr(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => n == "this",
+        ExprKind::Call(c) if c.kind == CallKind::TypeCast => {
+            c.args.len() == 1 && is_this_expr(&c.args[0])
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +431,148 @@ contract ParityWallet {
             fs.iter().any(|f| f.detector == "unprotected-initializer"),
             "genuinely unguarded initializer (no leading flag check) must still fire: {:?}",
             fs
+        );
+    }
+
+    // ---- delegatecall proxy: one-shot flag is NOT sufficient (Stader H-01) ----
+
+    // Stader VaultProxy shape: a delegatecall *proxy* (its fallback forwards every
+    // call into an implementation chosen at init time) whose `initialise` sets
+    // `owner` guarded ONLY by a one-shot `isInitialized` boolean — no access
+    // control. The flag blocks re-init but not a malicious FIRST init: an attacker
+    // front-runs `initialise`, becomes owner, then steers the delegatecall target.
+    // MUST fire (the bug the plain one-shot-flag suppression used to hide).
+    const PROXY_FLAG_ONLY: &str = r#"
+pragma solidity ^0.8.16;
+interface IStaderConfig {
+    function getAdmin() external view returns (address);
+    function getValidatorWithdrawalVaultImplementation() external view returns (address);
+    function getNodeELRewardVaultImplementation() external view returns (address);
+}
+contract VaultProxy {
+    bool public isValidatorWithdrawalVault;
+    bool public isInitialized;
+    uint8 public poolId;
+    uint256 public id;
+    address public owner;
+    IStaderConfig public staderConfig;
+    error AlreadyInitialized();
+    error CallerNotOwner();
+    constructor() {}
+    function initialise(bool _isValidatorWithdrawalVault, uint8 _poolId, uint256 _id, address _staderConfig) external {
+        if (isInitialized) {
+            revert AlreadyInitialized();
+        }
+        isValidatorWithdrawalVault = _isValidatorWithdrawalVault;
+        isInitialized = true;
+        poolId = _poolId;
+        id = _id;
+        staderConfig = IStaderConfig(_staderConfig);
+        owner = staderConfig.getAdmin();
+    }
+    fallback(bytes calldata _input) external payable returns (bytes memory) {
+        address vaultImplementation = isValidatorWithdrawalVault
+            ? staderConfig.getValidatorWithdrawalVaultImplementation()
+            : staderConfig.getNodeELRewardVaultImplementation();
+        (bool success, bytes memory data) = vaultImplementation.delegatecall(_input);
+        if (!success) {
+            revert(string(data));
+        }
+        return data;
+    }
+    modifier onlyOwner() {
+        if (msg.sender != owner) { revert CallerNotOwner(); }
+        _;
+    }
+    function updateOwner(address _owner) external onlyOwner { owner = _owner; }
+}
+"#;
+
+    // Same delegatecall proxy, but `initialise` carries a real access-control
+    // check (`require(msg.sender == deployer)`). The proxy gate must NOT override
+    // genuine access control — an init only the deployer can call cannot be
+    // front-run. MUST stay SILENT.
+    const PROXY_GUARDED: &str = r#"
+pragma solidity ^0.8.16;
+interface IStaderConfig { function getAdmin() external view returns (address); }
+contract VaultProxyGuarded {
+    bool public isInitialized;
+    address public owner;
+    address public deployer;
+    IStaderConfig public staderConfig;
+    error AlreadyInitialized();
+    constructor() { deployer = msg.sender; }
+    function initialise(address _staderConfig) external {
+        require(msg.sender == deployer, "auth");
+        if (isInitialized) { revert AlreadyInitialized(); }
+        isInitialized = true;
+        staderConfig = IStaderConfig(_staderConfig);
+        owner = staderConfig.getAdmin();
+    }
+    fallback(bytes calldata _input) external payable returns (bytes memory) {
+        (bool ok, bytes memory data) = address(staderConfig).delegatecall(_input);
+        require(ok);
+        return data;
+    }
+}
+"#;
+
+    // A multicall contract that self-delegatecalls (`address(this).delegatecall`)
+    // and also has a one-shot-flag init writing `owner`. Self-delegatecall is NOT
+    // a forwarding proxy, so the one-shot flag remains sufficient. MUST stay
+    // SILENT (guards against the proxy gate over-matching on multicall).
+    const SELF_DELEGATECALL_MULTICALL: &str = r#"
+pragma solidity ^0.8.16;
+contract Multicall {
+    bool public initialized;
+    address public owner;
+    function initialize(address o) external {
+        require(!initialized, "init");
+        initialized = true;
+        owner = o;
+    }
+    function multicall(bytes[] calldata data) external returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            (bool ok, bytes memory r) = address(this).delegatecall(data[i]);
+            require(ok);
+            results[i] = r;
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn fires_on_delegatecall_proxy_with_one_shot_flag() {
+        let fs = run(PROXY_FLAG_ONLY);
+        assert!(
+            fs.iter().any(|f| f.detector == "unprotected-initializer"
+                && f.function == "initialise"),
+            "Stader VaultProxy: a delegatecall proxy whose `initialise` is guarded only by a one-shot \
+             `isInitialized` flag (no access control) is front-runnable on first init and MUST fire: {:?}",
+            fs.iter().filter(|f| f.detector == "unprotected-initializer").collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn silent_on_delegatecall_proxy_with_access_control() {
+        let fs = run(PROXY_GUARDED);
+        assert!(
+            !fs.iter().any(|f| f.detector == "unprotected-initializer"),
+            "a delegatecall proxy whose init enforces real access control (`require(msg.sender == ...)`) \
+             cannot be front-run and must stay silent: {:?}",
+            fs.iter().filter(|f| f.detector == "unprotected-initializer").collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn silent_on_self_delegatecall_multicall_with_one_shot_flag() {
+        let fs = run(SELF_DELEGATECALL_MULTICALL);
+        assert!(
+            !fs.iter().any(|f| f.detector == "unprotected-initializer"),
+            "self-delegatecall (multicall) is not a forwarding proxy; a one-shot-flag init must stay \
+             suppressed: {:?}",
+            fs.iter().filter(|f| f.detector == "unprotected-initializer").collect::<Vec<_>>()
         );
     }
 }

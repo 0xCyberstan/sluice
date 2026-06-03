@@ -20,6 +20,7 @@
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
+use sluice_ir::FunctionId;
 
 pub struct OracleStalenessDetector;
 
@@ -46,9 +47,14 @@ impl Detector for OracleStalenessDetector {
                 continue;
             }
             // The feed read can sit in a `view` price-getter, so unlike most
-            // detectors we do not require `is_state_mutating()` — only that the
-            // function is externally reachable (the integration surface).
-            if !f.is_externally_reachable() {
+            // detectors we do not require `is_state_mutating()`. We require only
+            // that the read is on the *integration surface* an external actor can
+            // drive: either the function is itself externally reachable, or it is
+            // an `internal`/`private` helper transitively called from a public /
+            // external entry point (e.g. Stader's `updateERFromPORFeed` ->
+            // `getPORFeedData`, which performs the `latestRoundData` read). A
+            // helper that no entry point reaches is dead code and carries no risk.
+            if !f.is_externally_reachable() && !reachable_from_entrypoint(cx, f.id) {
                 continue;
             }
             // Pure feed-interface declarations (no concrete consumer) carry no risk.
@@ -130,6 +136,40 @@ impl Detector for OracleStalenessDetector {
     }
 }
 
+/// True if `start` is transitively invoked by some externally-reachable
+/// (`public`/`external`/fallback/receive) function, walking the resolved
+/// caller graph (`Function::callers`, populated by `sluice-parse`).
+///
+/// This lets the detector follow a Chainlink read from a public entry point
+/// down into an `internal`/`private` helper that actually performs it. The walk
+/// is bounded by the visited set, so cycles (mutually-recursive helpers)
+/// terminate. We stop and return `true` the moment any reachable function is
+/// itself externally reachable. Unresolved/indirect calls simply mean a helper
+/// looks unreachable and is conservatively skipped (no false positive).
+fn reachable_from_entrypoint(cx: &AnalysisContext, start: FunctionId) -> bool {
+    use rustc_hash::FxHashSet;
+    let mut seen: FxHashSet<FunctionId> = FxHashSet::default();
+    let mut stack: Vec<FunctionId> = vec![start];
+    while let Some(fid) = stack.pop() {
+        if !seen.insert(fid) {
+            continue;
+        }
+        let Some(f) = cx.scir.function(fid) else { continue };
+        // A direct caller that is externally reachable proves the chain. We skip
+        // `start` itself: this helper is only consulted when `start` is *not*
+        // externally reachable, so reaching it again proves nothing.
+        if fid != start && f.is_externally_reachable() {
+            return true;
+        }
+        for &caller in &f.callers {
+            if !seen.contains(&caller) {
+                stack.push(caller);
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -176,6 +216,72 @@ mod tests {
         }
     "#;
 
+    // Vulnerable (Stader M-14 shape): the Chainlink `latestRoundData` read lives
+    // in an `internal view` helper (`getPORFeedData`) that discards
+    // `updatedAt`/`answeredInRound`; the helper is reached from an `external`
+    // entry point (`updateERFromPORFeed`). The read is on the integration
+    // surface even though it is not directly external.
+    const VULN_INTERNAL_HELPER: &str = r#"
+        interface AggregatorV3Interface {
+            function latestRoundData()
+                external view
+                returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+        }
+        contract Oracle {
+            AggregatorV3Interface internal feed;
+            uint256 public rate;
+            function updateRate() external {
+                rate = getPORFeedData();
+            }
+            function getPORFeedData() internal view returns (uint256) {
+                (, int256 answer, , , ) = feed.latestRoundData();
+                return uint256(answer);
+            }
+        }
+    "#;
+
+    // Safe: same internal-helper-reached-from-external shape, but the helper
+    // enforces round completeness and a freshness window before trusting it.
+    const SAFE_INTERNAL_HELPER: &str = r#"
+        interface AggregatorV3Interface {
+            function latestRoundData()
+                external view
+                returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+        }
+        contract Oracle {
+            AggregatorV3Interface internal feed;
+            uint256 internal constant MAX_DELAY = 3600;
+            uint256 public rate;
+            function updateRate() external {
+                rate = getPORFeedData();
+            }
+            function getPORFeedData() internal view returns (uint256) {
+                (uint80 roundId, int256 answer, , uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
+                require(answer > 0, "price");
+                require(answeredInRound >= roundId, "stale round");
+                require(block.timestamp - updatedAt <= MAX_DELAY, "stale price");
+                return uint256(answer);
+            }
+        }
+    "#;
+
+    // A `latestRoundData` read in an internal helper that NO entry point reaches
+    // (dead code) must stay silent — it is not on any attacker-drivable surface.
+    const UNREACHABLE_HELPER: &str = r#"
+        interface AggregatorV3Interface {
+            function latestRoundData()
+                external view
+                returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+        }
+        contract Oracle {
+            AggregatorV3Interface internal feed;
+            function _dead() private view returns (uint256) {
+                (, int256 answer, , , ) = feed.latestRoundData();
+                return uint256(answer);
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_vuln() {
         let fs = run(VULN);
@@ -186,5 +292,32 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "oracle-staleness"));
+    }
+
+    // Stader M-14 regression: read in an internal helper reached from an
+    // external entry point fires.
+    #[test]
+    fn fires_on_internal_helper_reached_from_entrypoint() {
+        let fs = run(VULN_INTERNAL_HELPER);
+        assert!(
+            fs.iter().any(|f| f.detector == "oracle-staleness"),
+            "expected oracle-staleness on the internal-helper read, got {:?}",
+            fs
+        );
+    }
+
+    // The same internal-helper shape stays silent when the helper validates
+    // freshness — confirms the broadening did not drop the precision guard.
+    #[test]
+    fn silent_on_safe_internal_helper() {
+        let fs = run(SAFE_INTERNAL_HELPER);
+        assert!(!fs.iter().any(|f| f.detector == "oracle-staleness"), "{:?}", fs);
+    }
+
+    // A genuinely unreachable internal helper must not fire (precision).
+    #[test]
+    fn silent_on_unreachable_helper() {
+        let fs = run(UNREACHABLE_HELPER);
+        assert!(!fs.iter().any(|f| f.detector == "oracle-staleness"), "{:?}", fs);
     }
 }

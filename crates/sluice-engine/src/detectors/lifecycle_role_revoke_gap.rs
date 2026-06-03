@@ -53,7 +53,9 @@ use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::report;
 use sluice_findings::{Category, Dimension, Finding, Severity};
-use sluice_ir::{Contract, Function};
+use sluice_ir::{
+    AssignOp, Builtin, CallKind, Contract, Expr, ExprKind, Function, Lit, Stmt, StmtKind, UnOp,
+};
 
 pub struct LifecycleRoleRevokeGapDetector;
 
@@ -79,57 +81,449 @@ impl Detector for LifecycleRoleRevokeGapDetector {
                 continue;
             }
 
-            // ---- Cardinal suppression: a revoke exists anywhere in the contract.
-            // If teardown can undo the grant (even from a different function), the
-            // lifecycle is paired — not this class. This silences the standard
-            // role-admin shape (Olympus `RolesAdmin.grantRole` + `.revokeRole`).
-            if contract_has_revoke(cx, contract) {
-                continue;
+            // (1) Role-CALL lifecycle: a `grantRole`/`saveRole`-style call in an
+            //     activation path with no paired revoke call anywhere. (Original.)
+            if let Some(f) = self.role_call_gap(cx, contract) {
+                out.push(f);
             }
 
-            // ---- Find the lifecycle-activation grant, if any. ------------------
-            // Walk the contract's own functions for a real grant call living in a
-            // repeatable activation path (not a one-shot constructor/initializer).
-            let Some((grant_fn, grant_span, grant_callee)) =
-                cx.scir.functions_of(contract.id).find_map(|f| {
-                    if !f.has_body || is_one_shot_setup(f) || !is_lifecycle_activation(&f.name) {
-                        return None;
-                    }
-                    first_grant_call(f).map(|(span, name)| (f, span, name))
-                })
-            else {
-                continue;
-            };
-
-            out.push(finish_at(
-                cx,
-                report!(self, Category::LifecycleRoleRevokeGap,
-                    title = "Role granted in an activation path is never revoked on deactivation",
-                    severity = Severity::Medium,
-                    confidence = 0.5,
-                    dimensions = [Dimension::Invariant],
-                    message = format!(
-                        "`{}.{}` grants a role/permission (`{}`) in a lifecycle-activation path, but \
-                         `{}` defines no matching revoke (`removeRole`/`revokeRole`/`_revokeRole`/\
-                         `renounceRole`) in any deactivation/teardown path. After the policy/module \
-                         is deactivated the grantee keeps the role, so it can still call the \
-                         role-gated functions — a stale standing privilege (access-control lifecycle \
-                         asymmetry).",
-                        contract.name, grant_fn.name, grant_callee, contract.name
-                    ),
-                    recommendation =
-                        "Pair the activation grant with a revoke in the deactivation/teardown path: \
-                         call the matching `removeRole`/`revokeRole`/`_revokeRole` (or have the \
-                         grantee `renounceRole`) when the policy/module is deactivated, so a \
-                         deactivated component holds no standing privilege.",
-                ),
-                grant_fn.id,
-                grant_span,
-            ));
+            // (2) Mapping-PRIVILEGE lifecycle: a bespoke address→activation mapping
+            //     (the Frankencoin `minters` shape) whose grant has no
+            //     post-activation removal path. (Broadening.)
+            if let Some(f) = self.mapping_privilege_gap(cx, contract) {
+                out.push(f);
+            }
         }
 
         out
     }
+}
+
+impl LifecycleRoleRevokeGapDetector {
+    /// Original class: a role/permission **grant call** in a repeatable
+    /// activation path with **no** revoke call anywhere in the contract.
+    fn role_call_gap(&self, cx: &AnalysisContext, contract: &Contract) -> Option<Finding> {
+        // ---- Cardinal suppression: a revoke exists anywhere in the contract.
+        // If teardown can undo the grant (even from a different function), the
+        // lifecycle is paired — not this class. This silences the standard
+        // role-admin shape (Olympus `RolesAdmin.grantRole` + `.revokeRole`).
+        if contract_has_revoke(cx, contract) {
+            return None;
+        }
+
+        // ---- Find the lifecycle-activation grant, if any. ------------------
+        // Walk the contract's own functions for a real grant call living in a
+        // repeatable activation path (not a one-shot constructor/initializer).
+        let (grant_fn, grant_span, grant_callee) =
+            cx.scir.functions_of(contract.id).find_map(|f| {
+                if !f.has_body || is_one_shot_setup(f) || !is_lifecycle_activation(&f.name) {
+                    return None;
+                }
+                first_grant_call(f).map(|(span, name)| (f, span, name))
+            })?;
+
+        Some(finish_at(
+            cx,
+            report!(self, Category::LifecycleRoleRevokeGap,
+                title = "Role granted in an activation path is never revoked on deactivation",
+                severity = Severity::Medium,
+                confidence = 0.5,
+                dimensions = [Dimension::Invariant],
+                message = format!(
+                    "`{}.{}` grants a role/permission (`{}`) in a lifecycle-activation path, but \
+                     `{}` defines no matching revoke (`removeRole`/`revokeRole`/`_revokeRole`/\
+                     `renounceRole`) in any deactivation/teardown path. After the policy/module \
+                     is deactivated the grantee keeps the role, so it can still call the \
+                     role-gated functions — a stale standing privilege (access-control lifecycle \
+                     asymmetry).",
+                    contract.name, grant_fn.name, grant_callee, contract.name
+                ),
+                recommendation =
+                    "Pair the activation grant with a revoke in the deactivation/teardown path: \
+                     call the matching `removeRole`/`revokeRole`/`_revokeRole` (or have the \
+                     grantee `renounceRole`) when the policy/module is deactivated, so a \
+                     deactivated component holds no standing privilege.",
+            ),
+            grant_fn.id,
+            grant_span,
+        ))
+    }
+
+    /// Broadening for the Frankencoin M-13 shape: a bespoke address-keyed
+    /// **privilege mapping** (`minters`) granted as a *time-activated* entry
+    /// (`minters[m] = block.timestamp + period`), gating a powerful action
+    /// (`mint`/`burn`), whose **only** removal path is reachable **only before
+    /// activation** (`denyMinter`: `if (block.timestamp > minters[m]) revert;
+    /// delete minters[m]`) — so once the minter activates it can never be
+    /// removed. See [`mapping_privilege_gap`] for the full predicate.
+    fn mapping_privilege_gap(&self, cx: &AnalysisContext, contract: &Contract) -> Option<Finding> {
+        let (gate, grant_fn, grant_span) = find_activation_mapping_gap(cx, contract)?;
+        Some(finish_at(
+            cx,
+            report!(self, Category::LifecycleRoleRevokeGap,
+                title = "Time-activated privilege mapping has no post-activation revoke path",
+                severity = Severity::Medium,
+                confidence = 0.5,
+                dimensions = [Dimension::Invariant],
+                message = format!(
+                    "`{}.{}` grants a standing privilege by writing the activation-mapping \
+                     `{}[...]` (a `block.timestamp`-based approval that gates a powerful action \
+                     such as mint/burn). The only path that clears `{}[...]` is reachable **only \
+                     before** the entry activates (its removal is guarded by a comparison against \
+                     `block.timestamp`/`{}` itself, i.e. an application-window veto), and there is \
+                     no unconditional removal. Once the entry activates, the privilege can never be \
+                     paused or revoked — a malicious/compromised grantee is permanent (access-control \
+                     lifecycle asymmetry, CWE-284).",
+                    contract.name, grant_fn.name, gate.mapping, gate.mapping, gate.mapping
+                ),
+                recommendation =
+                    "Add an unconditional, access-controlled removal path for an already-activated \
+                     entry (a deny/remove/pause that works after the application window — e.g. clears \
+                     the mapping entry or sets a paused flag the action gate also checks), so a \
+                     compromised or misbehaving grantee can be stopped after activation, not only \
+                     vetoed beforehand.",
+            ),
+            grant_fn.id,
+            grant_span,
+        ))
+    }
+}
+
+/// A recognised address-keyed privilege mapping plus the facts that make its
+/// lifecycle asymmetric. Built by [`find_activation_mapping_gap`].
+struct ActivationGate {
+    /// Name of the privilege mapping state var (`minters`).
+    mapping: String,
+}
+
+/// Detect the Frankencoin minter-lifecycle shape on `contract` and, if present,
+/// return `(gate, grant_fn, grant_span)`.
+///
+/// Fires iff a **settable** state mapping `M` keyed by `address`/`bytes32`
+/// exists for which ALL of the following hold:
+///
+///   1. **Grant.** Some externally-reachable, state-mutating, non-one-shot
+///      function writes `M[k] = <rhs>` where the granted value is a
+///      *time-activation* (`rhs` mentions `block.timestamp`). This is the
+///      "turn it on at/after time T" approval write.
+///   2. **Privilege.** `M` gates a powerful action — `M` (directly, or through a
+///      same-contract reader function it is read in, e.g. `isMinter`) is read by
+///      the access guard of a state-mutating action that mints/burns/moves value.
+///   3. **No post-activation removal.** Every function that *clears* an `M[k]`
+///      entry (a `delete M[k]` or an `M[k] = 0`) is reachable **only before
+///      activation** — its body is guarded by a comparison against
+///      `block.timestamp` / `M[..]` (the application-window veto) — OR there is
+///      **no** clearing function at all. (An *unconditional* clear — a plain
+///      `removeMinter`/`revoke` with no such time gate — is a real teardown and
+///      suppresses the finding.)
+///
+/// The time-gated/absent removal in (3) is the discriminator: an OpenZeppelin
+/// `AccessControl` role mapping is cleared by an unconditional `revokeRole`, so
+/// it is suppressed; only a privilege whose removal is *itself* gated to the
+/// pre-activation window (or missing) is a genuine "can grant, can never revoke"
+/// asymmetry.
+fn find_activation_mapping_gap<'a>(
+    cx: &'a AnalysisContext,
+    contract: &'a Contract,
+) -> Option<(ActivationGate, &'a Function, sluice_ir::Span)> {
+    for var in &contract.state_vars {
+        if !is_privilege_mapping(var) {
+            continue;
+        }
+
+        // (1) Grant: an external, state-mutating, non-one-shot function that
+        //     writes a *time-activation* entry into this mapping.
+        let Some((grant_fn, grant_span)) = cx
+            .scir
+            .functions_of(contract.id)
+            .find_map(|f| time_activation_grant(f, &var.name).map(|s| (f, s)))
+        else {
+            continue;
+        };
+
+        // (2) Privilege: the mapping must gate a powerful action.
+        if !mapping_gates_action(cx, contract, &var.name) {
+            continue;
+        }
+
+        // (3) No post-activation removal: every clear of this mapping is
+        //     activation-window-gated (or there is none). An unconditional clear
+        //     is a real teardown and disqualifies the finding.
+        if has_unconditional_clear(cx, contract, &var.name) {
+            continue;
+        }
+
+        return Some((ActivationGate { mapping: var.name.clone() }, grant_fn, grant_span));
+    }
+    None
+}
+
+/// Is `var` a **settable** (non-constant/immutable) state **mapping** keyed by an
+/// identity type (`address` / `bytes32`) — the shape of a bespoke
+/// role/minter/whitelist map? The key type is read from the declared mapping
+/// text `mapping(K => V)`.
+fn is_privilege_mapping(var: &sluice_ir::StateVar) -> bool {
+    if var.constant || var.immutable || !var.is_mapping() {
+        return false;
+    }
+    let key = mapping_key_type(&var.ty);
+    key == "address" || key == "bytes32"
+}
+
+/// Extract the key type `K` from a `mapping(K => V)` declared type (best-effort).
+fn mapping_key_type(ty: &str) -> &str {
+    let t = ty.trim();
+    let Some(rest) = t.strip_prefix("mapping") else { return "" };
+    let rest = rest.trim_start().strip_prefix('(').unwrap_or(rest);
+    let key = rest.split("=>").next().unwrap_or("").trim();
+    // Strip a trailing storage keyword / name the parser may keep.
+    key.split_whitespace().next().unwrap_or(key)
+}
+
+/// If `f` is an externally-reachable, state-mutating, non-one-shot function that
+/// writes a **time-activation** entry into mapping `var` — i.e. an assignment
+/// `var[k] = <rhs>` whose right-hand side mentions `block.timestamp` — return the
+/// span of that assignment. This is the "approval that turns on at/after a
+/// timestamp" grant (`minters[_minter] = block.timestamp + _applicationPeriod`).
+fn time_activation_grant(f: &Function, var: &str) -> Option<sluice_ir::Span> {
+    if !f.has_body
+        || is_one_shot_setup(f)
+        || !f.is_externally_reachable()
+        || !f.is_state_mutating()
+    {
+        return None;
+    }
+    // Must actually write the mapping (cheap effect-summary pre-filter).
+    if !f.effects.writes_var(var) {
+        return None;
+    }
+    let mut hit: Option<sluice_ir::Span> = None;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if hit.is_some() {
+                return;
+            }
+            if let ExprKind::Assign { target, value, .. } = &e.kind {
+                if assign_target_indexes_var(target, var) && expr_mentions_block_time(value) {
+                    hit = Some(e.span);
+                }
+            }
+        });
+        if hit.is_some() {
+            break;
+        }
+    }
+    hit
+}
+
+/// Is `target` an index expression `var[...]` (an assignment to a mapping entry),
+/// after peeling casts on the base? Matches the lvalue of `minters[_minter] = …`.
+fn assign_target_indexes_var(target: &Expr, var: &str) -> bool {
+    matches!(&target.kind, ExprKind::Index { base, .. }
+        if root_ident_str(peel_casts(base)) == Some(var))
+}
+
+/// Does `e` reference `block.timestamp` / `block.number` / `now` anywhere — the
+/// marker that a written mapping value is a *time activation*?
+fn expr_mentions_block_time(e: &Expr) -> bool {
+    let mut found = false;
+    e.visit(&mut |sub| match &sub.kind {
+        ExprKind::Member { base, member } => {
+            if matches!(&base.kind, ExprKind::Ident(b) if b == "block")
+                && (member == "timestamp" || member == "number")
+            {
+                found = true;
+            }
+        }
+        ExprKind::Ident(n) if n == "now" => found = true,
+        _ => {}
+    });
+    found
+}
+
+/// Does mapping `var` gate a **powerful action** in `contract`? True when some
+/// externally-reachable, state-mutating function that performs a value action
+/// (mint/burn/transfer — by `_mint`/`_burn`/`_transfer` internal call or a
+/// mint/burn-named entry) is access-guarded by a check that reads `var` —
+/// directly, or through a same-contract *reader* function (e.g. `isMinter`) whose
+/// body reads `var`. This is the "the mapping is what authorises minting" link.
+fn mapping_gates_action(cx: &AnalysisContext, contract: &Contract, var: &str) -> bool {
+    // Same-contract reader functions whose body reads `var` (e.g. `isMinter`,
+    // `minterOnly`). The action's guard usually goes through one of these.
+    let readers: Vec<&str> = cx
+        .scir
+        .functions_of(contract.id)
+        .filter(|f| f.effects.reads_var(var))
+        .map(|f| f.name.as_str())
+        .collect();
+
+    cx.scir.functions_of(contract.id).any(|f| {
+        if !f.has_body || !f.is_externally_reachable() || !f.is_state_mutating() {
+            return false;
+        }
+        if !performs_value_action(f) {
+            return false;
+        }
+        // The function must be access-gated, and that gate must reference `var`
+        // or one of its reader functions (the modifier/`require` text, or a
+        // direct read of `var` inside the body of a function gated on it).
+        f.effects.guards.iter().any(|g| {
+            guard_references(g, var, &readers)
+        }) || f.effects.reads_var(var)
+    })
+}
+
+/// Does the function perform a value action — mint / burn / token transfer — by
+/// either calling a `_mint`/`_burn`/`mint`/`burn`/`_transfer`-style internal
+/// helper or being itself named like one?
+fn performs_value_action(f: &Function) -> bool {
+    let acts = |n: &str| {
+        let l = n.to_ascii_lowercase();
+        l.contains("mint") || l.contains("burn") || l.contains("transfer")
+    };
+    f.effects.internal_calls.iter().any(|c| acts(c)) || acts(&f.name)
+}
+
+/// Does guard `g` reference the privilege mapping `var` or one of its reader
+/// function names (so the guard is the one that consults the mapping)? The guard
+/// text is the modifier name (`minterOnly`) or the `require`/`if` source.
+fn guard_references(g: &sluice_ir::Guard, var: &str, readers: &[&str]) -> bool {
+    let t = g.text.to_ascii_lowercase();
+    if t.contains(&var.to_ascii_lowercase()) {
+        return true;
+    }
+    readers.iter().any(|r| {
+        let r = r.to_ascii_lowercase();
+        // A bare modifier name like `minterOnly` is the whole guard text; a
+        // reader like `isMinter` shows up as `isminter(...)` in a require.
+        !r.is_empty() && t.contains(&r)
+    })
+}
+
+/// Does `contract` have an **unconditional** clear of mapping `var` — a function
+/// that clears an `var[k]` entry (`delete var[k]` or `var[k] = 0`) WITHOUT being
+/// gated to the pre-activation window? "Pre-activation-gated" means the function
+/// has an entry guard that compares against `block.timestamp` / `var[..]` (the
+/// `denyMinter` "`if (block.timestamp > minters[m]) revert TooLate()`" veto).
+///
+/// If such an unconditional clear exists, the privilege *can* be revoked after
+/// activation, so the lifecycle is paired and the finding is suppressed. A clear
+/// that exists only behind the application-window guard does NOT count (it cannot
+/// run post-activation), and so does not suppress.
+fn has_unconditional_clear(cx: &AnalysisContext, contract: &Contract, var: &str) -> bool {
+    cx.scir.functions_of(contract.id).any(|f| {
+        f.has_body && function_clears_mapping(f, var) && !is_activation_window_gated(f, var)
+    })
+}
+
+/// Does `f` clear an entry of mapping `var` — `delete var[k]` or an assignment
+/// `var[k] = 0`?
+fn function_clears_mapping(f: &Function, var: &str) -> bool {
+    let mut found = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            match &e.kind {
+                // `delete var[k]`
+                ExprKind::Unary { op: UnOp::Delete, operand } => {
+                    if assign_target_indexes_var(operand, var) {
+                        found = true;
+                    }
+                }
+                // `var[k] = 0`
+                ExprKind::Assign { op: AssignOp::Assign, target, value } => {
+                    if assign_target_indexes_var(target, var) && is_zero_lit(value) {
+                        found = true;
+                    }
+                }
+                _ => {}
+            }
+        });
+        if found {
+            break;
+        }
+    }
+    found
+}
+
+/// Is `e` the integer literal `0` (decimal or `0x0`)?
+fn is_zero_lit(e: &Expr) -> bool {
+    match &peel_casts(e).kind {
+        ExprKind::Lit(Lit::Number(n)) => n.trim() == "0",
+        ExprKind::Lit(Lit::HexNumber(h)) => {
+            let s = h.trim().trim_start_matches("0x").trim_start_matches("0X");
+            !s.is_empty() && s.bytes().all(|b| b == b'0')
+        }
+        _ => false,
+    }
+}
+
+/// Is `f` gated to the **pre-activation window** for mapping `var`? True when an
+/// entry guard (a leading `require` / `if (...) revert`) compares against
+/// `block.timestamp` *and* references `var` — the `denyMinter` shape
+/// `if (block.timestamp > minters[m]) revert TooLate();`, which makes the body
+/// reachable only while the entry has not yet activated.
+fn is_activation_window_gated(f: &Function, var: &str) -> bool {
+    // Scan the guards' text first (cheap, already extracted).
+    for g in &f.effects.guards {
+        let t = g.text.to_ascii_lowercase();
+        if t.contains("block.timestamp") && t.contains(&var.to_ascii_lowercase()) {
+            return true;
+        }
+    }
+    // Fall back to the body: any `if (<cmp involving block.timestamp and var>)`
+    // whose then-branch reverts.
+    let mut gated = false;
+    for s in &f.body {
+        s.visit(&mut |st| {
+            if gated {
+                return;
+            }
+            if let StmtKind::If { cond, then_branch, .. } = &st.kind {
+                if cond_compares_blocktime_and_var(cond, var) && branch_reverts(then_branch) {
+                    gated = true;
+                }
+            }
+        });
+        if gated {
+            break;
+        }
+    }
+    gated
+}
+
+/// Does `cond` contain an ordering/equality comparison whose operands together
+/// reference both `block.timestamp` and the mapping `var`? (`block.timestamp >
+/// minters[_minter]`.)
+fn cond_compares_blocktime_and_var(cond: &Expr, var: &str) -> bool {
+    let mut hit = false;
+    cond.visit(&mut |sub| {
+        if hit {
+            return;
+        }
+        if let ExprKind::Binary { op, lhs, rhs } = &sub.kind {
+            if op.is_comparison()
+                && ((expr_mentions_block_time(lhs) && expr_mentions_ident(rhs, var))
+                    || (expr_mentions_block_time(rhs) && expr_mentions_ident(lhs, var)))
+            {
+                hit = true;
+            }
+        }
+    });
+    hit
+}
+
+/// Does a statement list (a branch) contain a `revert` / `require(false)`-style
+/// terminator at its top level?
+fn branch_reverts(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        StmtKind::Revert { .. } => true,
+        StmtKind::Expr(e) => matches!(&e.kind,
+            ExprKind::Call(c) if matches!(c.kind, CallKind::Builtin(Builtin::Revert))),
+        _ => false,
+    })
 }
 
 /// Resolved-name set of a role/permission **grant** call.
@@ -336,5 +730,135 @@ mod tests {
     #[test]
     fn silent_on_role_admin_api_with_revoke_sibling() {
         assert!(!fired(&run(SAFE_ADMIN_API)), "should not fire when a sibling revoke exists");
+    }
+
+    // ---- Mapping-privilege lifecycle path (Frankencoin M-13) ---------------
+
+    /// Fired specifically by the *mapping-privilege* path (not the role-call one).
+    fn fired_mapping(fs: &[sluice_findings::Finding]) -> bool {
+        fs.iter().any(|f| {
+            f.detector == "lifecycle-role-revoke-gap"
+                && f.title.contains("Time-activated privilege mapping")
+        })
+    }
+
+    // VULN: the Frankencoin minter shape. `minters[m] = block.timestamp + period`
+    // grants a time-activated privilege that gates `mint` (via the `minterOnly`
+    // guard → `isMinter` reading `minters`); the only path that clears the entry
+    // (`denyMinter`) is gated to the pre-activation window
+    // (`if (block.timestamp > minters[m]) revert`), so an activated minter is
+    // permanent. Must fire on the mapping-privilege path.
+    const VULN_MINTER: &str = r#"
+        contract Stable {
+            mapping(address => uint256) public minters;
+            uint256 immutable APPLY;
+            constructor(uint256 a){ APPLY = a; }
+
+            function suggestMinter(address _minter, uint256 _period) external {
+                if (minters[_minter] != 0) revert();
+                minters[_minter] = block.timestamp + _period;
+            }
+
+            function denyMinter(address _minter) external {
+                if (block.timestamp > minters[_minter]) revert();
+                delete minters[_minter];
+            }
+
+            function isMinter(address _m) public view returns (bool) {
+                return minters[_m] != 0 && block.timestamp >= minters[_m];
+            }
+
+            modifier minterOnly() {
+                if (!isMinter(msg.sender)) revert();
+                _;
+            }
+
+            function mint(address to, uint256 amt) external minterOnly {
+                _mint(to, amt);
+            }
+            function _mint(address to, uint256 amt) internal {}
+        }
+    "#;
+
+    // SAFE: same time-activated minter grant + a pre-activation `denyMinter`, BUT
+    // also an UNCONDITIONAL `removeMinter` that clears an activated entry. The
+    // privilege can be revoked after activation, so the lifecycle is paired and
+    // the mapping-privilege path must stay silent.
+    const SAFE_MINTER_REMOVABLE: &str = r#"
+        contract Stable {
+            mapping(address => uint256) public minters;
+            address public admin;
+
+            function suggestMinter(address _minter, uint256 _period) external {
+                minters[_minter] = block.timestamp + _period;
+            }
+
+            function denyMinter(address _minter) external {
+                if (block.timestamp > minters[_minter]) revert();
+                delete minters[_minter];
+            }
+
+            // Unconditional teardown of an already-activated minter.
+            function removeMinter(address _minter) external {
+                require(msg.sender == admin);
+                delete minters[_minter];
+            }
+
+            function isMinter(address _m) public view returns (bool) {
+                return minters[_m] != 0 && block.timestamp >= minters[_m];
+            }
+
+            modifier minterOnly() {
+                if (!isMinter(msg.sender)) revert();
+                _;
+            }
+
+            function mint(address to, uint256 amt) external minterOnly {
+                _mint(to, amt);
+            }
+            function _mint(address to, uint256 amt) internal {}
+        }
+    "#;
+
+    // SAFE: an address mapping that is NOT a time-activated approval — it is a
+    // plain balance/bookkeeping map written with a value, not `block.timestamp`.
+    // Not a privilege-activation lifecycle, so it must not fire.
+    const SAFE_NOT_TIME_GATED: &str = r#"
+        contract Vault {
+            mapping(address => uint256) public balances;
+            function deposit(address who, uint256 amt) external {
+                balances[who] = amt;
+            }
+            function mint(address to, uint256 amt) external {
+                _mint(to, amt);
+            }
+            function _mint(address to, uint256 amt) internal {}
+        }
+    "#;
+
+    #[test]
+    fn fires_on_time_activated_minter_without_post_activation_revoke() {
+        let fs = run(VULN_MINTER);
+        assert!(
+            fired_mapping(&fs),
+            "expected mapping-privilege lifecycle finding on the minter shape, got {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_when_minter_has_unconditional_removal() {
+        assert!(
+            !fired_mapping(&run(SAFE_MINTER_REMOVABLE)),
+            "should not fire when an unconditional removeMinter can revoke an activated minter"
+        );
+    }
+
+    #[test]
+    fn silent_on_non_time_activated_mapping() {
+        assert!(
+            !fired_mapping(&run(SAFE_NOT_TIME_GATED)),
+            "should not fire on a plain bookkeeping mapping (no time-activation grant)"
+        );
     }
 }

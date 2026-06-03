@@ -827,3 +827,35 @@ can never affect detector tests. Run: `cargo run -p sluice-bench --release`.
   **LoopFi 100%/33%**. (NB the earlier "0→20%" was on the 2-seed corpus, 1/5; on 7 contests it is the honest 1/37=3%.)
 - 133 detectors, **930 workspace tests / 0 fail**, 0 warnings, corpus `precision_recall` + real_hacks r1–r4 green.
   Next: continue closing the in-class class-mismatch gaps + PHASE B2 (TrackedVars + conservation, tighten co-update). _done._
+
+### NORTH STAR — in-class recall wave (5 agents, existing-detector under-fire fixes): 43% → 63%
+Diagnostic-driven: the scoreboard's per-finding "location ceiling" detail (SCOREBOARD.md) split every in-class miss into
+*class-mismatch / detector-blind*; the richest, safest targets were **detectors Sluice already ships that under-fired on a
+real instance** (the proven 0-FP trigger-tightening pattern). 5 worktree-isolated agents, one disjoint detector file each,
+each self-gated (target fires + `cargo test -p sluice-engine` green + **0 new Crit/High on the 6-repo dogfood set**):
+- **oracle_staleness.rs → Stader M-14.** Root cause: the visibility gate `is_externally_reachable()` skipped INTERNAL
+  helpers; `getPORFeedData` is `internal` (reached from external `updateER...`). Fix: also accept a helper transitively
+  reachable from an external entrypoint (bounded BFS over the callers graph; dead helpers stay silent). Tigris still fires.
+- **unprotected_initializer.rs → Stader H-01 (High→Crit).** Root cause: a hand-rolled `isInitialized` one-shot flag was
+  treated as sufficient protection. Fix: a one-shot flag does NOT suppress when the contract is a delegatecall proxy
+  (an attacker can still front-run the FIRST init). OZ `initializer`/access-controlled inits stay silent.
+- **lifecycle_role_revoke_gap.rs → Frankencoin M-13.** Root cause: grant recognized only as a `grantRole`-style CALL;
+  Frankencoin confers minter via a `minters[m] = block.timestamp+period` MAPPING write. Fix: added a mapping-privilege
+  path — a time-activated privilege mapping whose only clear path is gated to the pre-activation window (or none) → no
+  post-activation revoke. An unconditional `removeMinter`/`revokeRole` suppresses (keeps OZ AccessControl silent). Medium.
+- **signature.rs → Tigris sig-replay + Caviar missing-deadline (one file, two detectors).** SignatureReplay missed
+  `verifyPrice` (it's in a `library`, `view`, recovers via OZ `.recover` not literal `ecrecover`): added a design-level
+  loop — ECDSA recovery + timestamp freshness window + NO nonce + NO single-use marker. MissingDeadline had no standalone
+  path: added an AMM-trade loop (a `reserves`+`price`/`quote` pool whose value-transferring swaps take no deadline param).
+  Both dual-guarded: dogfood EIP-712 permits (consume a nonce) + deadline'd swaps + owner setters all stay silent.
+- **integer_issues.rs → Frankencoin H-05 (High).** Root cause: under ^0.8 the detector ignores `*` (compiler-checked) and
+  taint can't reach a `StorageState price` written in an `onlyHub` fn. Fix: structural trigger — an unbounded settable
+  `price`-like storage var (setter has no upper-bound check) used as a factor of a `Mul` with a non-constant other factor
+  → guaranteed-overflow revert-DoS. Conservative (FP-prone class): bounded/immutable/constant/oracle-local all silent.
+- **Integration:** each worktree changed EXACTLY its one file (verified); copied back, ONE authoritative gate on the
+  combined state. **952 workspace tests / 0 fail** (engine 867→889), 0 warnings, corpus + real_hacks green.
+- **SCOREBOARD MOVED:** in-class **43% → 63% (19/30)**; out-of-class held 3% (1/37). Per-contest: **Tigris 100% (5/5)**,
+  Reserve 80%, **Caviar 67% (2/3)**, **Frankencoin 50% (4/8)**, **Stader 50% (2/4)**, Basin 0%, LoopFi 100%. **PRECISION
+  HELD:** unmatched Crit/High flat at **17** (the +2 Crit/High vs last round are both *matched* legit catches — Stader
+  H-01, Frankencoin H-05); zero new candidate FPs. 138 detectors-worth of triggers (still 133 registered detectors).
+  Next: Basin (0/3 — AMM/Well twap+timestamp+rounding, fully blind) + remaining Frankencoin/Stader misses + PHASE B2. _done._

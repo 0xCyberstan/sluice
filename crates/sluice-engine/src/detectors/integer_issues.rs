@@ -38,6 +38,18 @@ impl Detector for IntegerIssuesDetector {
         // into a single pass. Loop-invariant, so findings are byte-identical.
         let fields = struct_field_widths(cx);
 
+        // Per-contract set of `price`-like state-variable names that an external
+        // setter can drive to an *unbounded* value (no upper-bound check, no
+        // `min` clamp). These are the factors that turn a plain `price * amount`
+        // product into a guaranteed-overflow revert-DoS — see section (4). Built
+        // lazily and memoized per contract (the scan is O(contract functions), so
+        // computing it once per contract instead of once per function matters on
+        // large files). Loop-invariant ⇒ findings are unaffected by the caching.
+        let mut unbounded_price_vars: std::collections::HashMap<
+            sluice_ir::ContractId,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
+
         for f in cx.functions() {
             if !f.has_body {
                 continue;
@@ -406,6 +418,104 @@ impl Detector for IntegerIssuesDetector {
                             );
                         out.push(cx.finish(b, f.id, e.span));
                     });
+                }
+            }
+
+            // ---- (4) guaranteed-overflow product of an unbounded settable price ----
+            // On >=0.8 a plain `a * b` is *checked*, so it cannot silently wrap — but
+            // it still REVERTS on overflow. That revert is itself the weapon when one
+            // factor is a `price`-like storage variable a privileged setter can drive
+            // to an arbitrary value with no upper bound: the owner sets `price =
+            // type(uint256).max`, and from then on every `price * amount` product
+            // reverts, permanently freezing whatever path performs it (challenge
+            // resolution, a bid, a collateralization check). This is the Frankencoin
+            // H-05 shape (`price * _collateralAmount` in `tryAvertChallenge`, and
+            // `collateralReserve * atPrice` in `checkCollateral`): a guaranteed-overflow
+            // griefing/DoS rather than a value-corruption wrap.
+            //
+            // It is deliberately *not* keyed on `is_attacker_controlled` of the
+            // operands. The dangerous factor is a STORAGE `price` (provenance
+            // StorageState, never attacker-tainted) and the multiply lives in an
+            // access-gated (`onlyHub`) function whose params are not taint-seeded, so
+            // the existing attacker-flow tests would never see it. The precise signal
+            // is structural: a multiplication by a price-like state var that an
+            // external setter can make unbounded, with no upper-bound guard before the
+            // product. The unbounded-settable gate (computed in
+            // `unbounded_settable_price_vars`) is what keeps this off ordinary bounded
+            // `a * b` math — an oracle-read local or a capped/immutable price never
+            // qualifies.
+            if cx.scir.solidity_ge_0_8() {
+                let names = unbounded_price_vars
+                    .entry(f.contract)
+                    .or_insert_with(|| unbounded_settable_price_vars(cx, f.contract));
+                if !names.is_empty() {
+                    // Names of price-like factors already guarded by an upper bound
+                    // earlier in *this* function (`require(price <= cap)` / `if (price
+                    // > cap) revert`). Such a product cannot reach the overflow, so we
+                    // do not flag it. Computed once per function.
+                    let capped_here = upper_bounded_names(f);
+                    // One finding per (function, price-var): a function that multiplies
+                    // the same unbounded price in several places is a single review item.
+                    let mut reported: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for s in &f.body {
+                        s.visit_exprs(&mut |e| {
+                            let ExprKind::Binary { op: BinOp::Mul, lhs, rhs } = &e.kind else {
+                                return;
+                            };
+                            // Identify which side (if any) is an unbounded price var,
+                            // and require the *other* side to be a non-constant
+                            // (user/protocol) amount — `price * 1e18` scaling by a
+                            // literal is not the unbounded-amount product we mean.
+                            let (price_name, other) =
+                                match (price_factor(lhs, names), price_factor(rhs, names)) {
+                                    (Some(n), _) => (n, rhs.as_ref()),
+                                    (None, Some(n)) => (n, lhs.as_ref()),
+                                    (None, None) => return,
+                                };
+                            if capped_here.contains(price_name) {
+                                return;
+                            }
+                            if !is_unbounded_amount_factor(other) {
+                                return;
+                            }
+                            if !reported.insert(price_name.to_string()) {
+                                return;
+                            }
+                            let b = FindingBuilder::new(self.id(), Category::IntegerOverflow)
+                                .title(
+                                    "Multiplication by an unbounded settable price reverts on overflow (DoS)",
+                                )
+                                .severity(Severity::High)
+                                // High structural confidence: the trigger requires a
+                                // price-like state var that an external setter can make
+                                // *unbounded* AND a product of it with a non-constant
+                                // amount AND no upper-bound guard before the multiply —
+                                // a narrow conjunction, not a bare `*`. Set high enough
+                                // that the corroboration score (`70·(0.5+0.5·conf)`)
+                                // clears the High label threshold, since H-05 is a
+                                // genuine High-severity griefing DoS.
+                                .confidence(0.9)
+                                .dimension(Dimension::ValueFlow)
+                                .message(format!(
+                                    "`{}` computes a product with `{price_name}`, a price-like state variable \
+                                     that a setter can drive to an arbitrary value with no upper bound. Under \
+                                     Solidity >=0.8 the multiplication is checked, so a price near \
+                                     `type(uint256).max` makes the product overflow and REVERT. An owner (or \
+                                     whoever controls the setter) can therefore set the price so high that this \
+                                     path always reverts — permanently bricking challenge resolution / bidding / \
+                                     the collateralization check (a griefing DoS), not merely corrupting a value.",
+                                    f.name
+                                ))
+                                .recommendation(
+                                    "Bound the settable price (`require(newPrice <= MAX_PRICE)`), or compute the \
+                                     product with a mul-div that cannot overflow for in-range collateral (e.g. \
+                                     `Math.mulDiv` / scale the price down first), so a maliciously huge price \
+                                     cannot turn the multiply into a guaranteed revert.",
+                                );
+                            out.push(cx.finish(b, f.id, e.span));
+                        });
+                    }
                 }
             }
         }
@@ -1298,6 +1408,214 @@ fn is_plain_param(f: &sluice_ir::Function, name: &str) -> bool {
     f.params.iter().any(|p| p.name.as_deref() == Some(name))
 }
 
+// --------------- section (4): unbounded settable price products ------------
+
+/// True if `name` reads as a `price`-like quantity (a `price`, `*Price`,
+/// `*price`, or a `*PerShare`/`liqPrice`-style rate). These are the storage
+/// values whose product with a user amount can be turned into a guaranteed
+/// overflow. Matched on the lowercased name so `price`, `liqPrice`,
+/// `pricePerUnit`, `_collateralPrice` all hit while an unrelated `principal`
+/// (which merely starts with `pri`) does not.
+fn is_price_like_name(name: &str) -> bool {
+    let lc = name.to_ascii_lowercase();
+    lc == "price" || lc.ends_with("price") || lc.starts_with("price") || lc.contains("pershare")
+}
+
+/// The `price`-var name if `e` is a bare read of one of the contract's
+/// unbounded-settable price-like state variables, else `None`. Deliberately
+/// only a *bare identifier* (`price`), not a derived expression — a value that
+/// has already been scaled/divided down is no longer the unbounded factor.
+fn price_factor<'a>(
+    e: &'a Expr,
+    names: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    match &e.kind {
+        ExprKind::Ident(n) if names.contains(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// True if `e` is a plausible *unbounded amount* factor — anything that is not a
+/// compile-time constant. A `price * 1e18` decimal-scaling by a literal is not
+/// the user-amount product we target (the literal cannot push the price-side
+/// magnitude), so we require the co-factor to be non-constant: an identifier
+/// (a collateral / size / amount), a member, an index, a call result, or an
+/// arithmetic combination thereof. This keeps the finding to genuine
+/// `price * collateral` shapes.
+fn is_unbounded_amount_factor(e: &Expr) -> bool {
+    !is_constant_expr(e)
+}
+
+/// Names that an upper-bound guard pins in *this* function: a `require(x <= n)` /
+/// `require(x < n)` (the surviving comparison) or an `if (x > n) revert` /
+/// `if (x >= n) revert` (the revert prunes the over-limit branch). A product
+/// using such a name cannot reach the overflow, so it is not flagged. We record
+/// the constrained name regardless of the limit's value (any upper bound on the
+/// price defeats the `type(uint256).max` attack).
+fn upper_bounded_names(f: &sluice_ir::Function) -> std::collections::HashSet<String> {
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // `x <= n` / `x < n` (and the swapped `n >= x` / `n > x`) prove an upper
+    // bound on `x` when they are the surviving condition of a require/assert.
+    fn collect_le(cond: &Expr, names: &mut std::collections::HashSet<String>) {
+        match &cond.kind {
+            ExprKind::Binary { op: BinOp::Le | BinOp::Lt, lhs, .. } => {
+                if let Some(n) = lhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            ExprKind::Binary { op: BinOp::Ge | BinOp::Gt, rhs, .. } => {
+                if let Some(n) = rhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            ExprKind::Binary { op: BinOp::And, lhs, rhs } => {
+                collect_le(lhs, names);
+                collect_le(rhs, names);
+            }
+            _ => {}
+        }
+    }
+    // `if (x > n) revert` / `if (x >= n) revert` — the revert prunes the
+    // over-limit path, so `x <= n` survives. Only credit a then-branch that is
+    // exclusively an abort.
+    fn collect_if_revert(cond: &Expr, names: &mut std::collections::HashSet<String>) {
+        match &cond.kind {
+            ExprKind::Binary { op: BinOp::Gt | BinOp::Ge, lhs, .. } => {
+                if let Some(n) = lhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            ExprKind::Binary { op: BinOp::Lt | BinOp::Le, rhs, .. } => {
+                if let Some(n) = rhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for s in &f.body {
+        s.visit(&mut |st| {
+            if let sluice_ir::StmtKind::If { cond, then_branch, else_branch } = &st.kind {
+                if else_branch.is_empty() && branch_only_aborts(then_branch) {
+                    collect_if_revert(cond, &mut names);
+                }
+            }
+        });
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Call(c) = &e.kind {
+                if matches!(
+                    c.kind,
+                    CallKind::Builtin(sluice_ir::Builtin::Require)
+                        | CallKind::Builtin(sluice_ir::Builtin::Assert)
+                ) {
+                    if let Some(cond) = c.args.first() {
+                        collect_le(cond, &mut names);
+                    }
+                }
+            }
+        });
+    }
+    names
+}
+
+/// Compute the contract's set of `price`-like state-variable names that an
+/// externally-reachable setter can drive to an *unbounded* value. A name
+/// qualifies when ALL hold:
+///   * it is a `price`-like, numeric (`uintN`/`intN`), NON-`constant`,
+///     NON-`immutable`, non-mapping state variable (an immutable/constant price
+///     is fixed at construction, so it cannot be weaponized post-deploy);
+///   * some externally-reachable function in the contract assigns it (`price =
+///     <expr>` / `price += ...`) from a value that is NOT a compile-time
+///     constant — i.e. a caller-chosen input rather than a hard-coded reset; and
+///   * that setter does NOT clamp the new value: no `min(` in the assignment's
+///     RHS and no upper-bound guard (`require(_p <= cap)` / `if (_p > cap)
+///     revert`) on the assigned name or the price variable.
+///
+/// Conservative by construction: a price with any clamp/bound on its write, an
+/// immutable/constant price, or a price only ever set to a constant is excluded,
+/// so an oracle-read local or a capped configuration value never qualifies.
+fn unbounded_settable_price_vars(
+    cx: &AnalysisContext,
+    cid: sluice_ir::ContractId,
+) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(contract) = cx.scir.contract(cid) else { return out };
+
+    // Candidate price-like state vars: numeric, mutable (settable) storage.
+    let candidates: Vec<&str> = contract
+        .state_vars
+        .iter()
+        .filter(|v| {
+            !v.constant
+                && !v.immutable
+                && !v.is_mapping()
+                && is_price_like_name(&v.name)
+                && {
+                    let t = v.ty.trim();
+                    t.starts_with("uint") || t.starts_with("int")
+                }
+        })
+        .map(|v| v.name.as_str())
+        .collect();
+    if candidates.is_empty() {
+        return out;
+    }
+
+    for f in cx.scir.functions_of(cid) {
+        if !f.has_body || !f.is_externally_reachable() {
+            continue;
+        }
+        // Names this setter pins with an upper bound (so a write under such a
+        // guard is bounded, not weaponizable).
+        let bounded = upper_bounded_names(f);
+        for s in &f.body {
+            s.visit_exprs(&mut |e| {
+                let ExprKind::Assign { op, target, value } = &e.kind else { return };
+                // Plain `=` or arithmetic-compound writes both let the caller pick
+                // the resulting magnitude; bitwise compounds do not grow it.
+                if matches!(
+                    op,
+                    sluice_ir::AssignOp::BitAnd
+                        | sluice_ir::AssignOp::BitOr
+                        | sluice_ir::AssignOp::BitXor
+                        | sluice_ir::AssignOp::Shl
+                        | sluice_ir::AssignOp::Shr
+                ) {
+                    return;
+                }
+                let ExprKind::Ident(var) = &target.kind else { return };
+                if !candidates.contains(&var.as_str()) {
+                    return;
+                }
+                // A write that only ever stores a compile-time constant cannot be
+                // pushed to `type(uint256).max` by a caller.
+                if is_constant_expr(value) {
+                    return;
+                }
+                // A clamp in the RHS (`min(_p, CAP)`) or an upper-bound guard on the
+                // price var (or the source identifier) means the stored value is
+                // bounded — not weaponizable.
+                let rhs_src = cx.source_text(value.span);
+                if rhs_src.contains("min(") {
+                    return;
+                }
+                if bounded.contains(var.as_str()) {
+                    return;
+                }
+                if let Some(src_name) = value.simple_name() {
+                    if bounded.contains(src_name) {
+                        return;
+                    }
+                }
+                out.insert(var.clone());
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -2061,5 +2379,170 @@ contract C {
 }
 "#;
         assert!(fires(src), "access-gated downcast of a non-param local must still fire");
+    }
+
+    // ------------------------------------------------------------------
+    // (4) UNBOUNDED-SETTABLE-PRICE PRODUCT regressions (Frankencoin H-05).
+    // A `price * amount` product where `price` is a state var an external setter
+    // can drive to `type(uint256).max` is a guaranteed-overflow revert-DoS on
+    // >=0.8. The trigger must fire on that shape (as High) and stay silent when
+    // the price is immutable, capped, only-constant-set, or oracle-derived — and
+    // when the co-factor is a constant scale.
+    // ------------------------------------------------------------------
+
+    // True if the unbounded-settable-price finding is present.
+    fn fires_unbounded_price(src: &str) -> bool {
+        run(src)
+            .iter()
+            .any(|f| f.detector == "integer-issues" && f.title.contains("unbounded settable price"))
+    }
+
+    // POSITIVE: the exact Frankencoin H-05 shape. `price` is owner-settable with
+    // no upper bound (`adjustPrice`), and `tryAvertChallenge` computes `price *
+    // _collateralAmount`. On >=0.8 the checked multiply reverts for a huge price,
+    // so the owner can brick challenge resolution — a High-severity griefing DoS.
+    #[test]
+    fn fires_on_unbounded_price_times_collateral() {
+        let src = r#"
+pragma solidity ^0.8.0;
+contract Position {
+    uint256 public price;
+    uint256 public minted;
+    uint256 constant ONE_DEC18 = 1e18;
+    function adjustPrice(uint256 newPrice) public {
+        // owner setter, no upper bound on newPrice
+        price = newPrice;
+    }
+    function tryAvertChallenge(uint256 _collateralAmount, uint256 _bidAmountZCHF) external returns (bool) {
+        if (_bidAmountZCHF * ONE_DEC18 >= price * _collateralAmount) {
+            return true;
+        }
+        return false;
+    }
+}
+"#;
+        let fs: Vec<_> = run(src)
+            .into_iter()
+            .filter(|f| f.detector == "integer-issues" && f.title.contains("unbounded settable price"))
+            .collect();
+        assert_eq!(fs.len(), 1, "must flag the price*collateral product exactly once: {:?}", fs);
+        assert_eq!(
+            fs[0].severity,
+            sluice_findings::Severity::High,
+            "unbounded-price product DoS must surface as High"
+        );
+    }
+
+    // SAFE (bounded factor): the same product, but the setter caps the price with
+    // a `require(newPrice <= MAX_PRICE)`. A bounded price cannot overflow the
+    // multiply, so the finding must stay SILENT.
+    #[test]
+    fn silent_on_capped_price_times_collateral() {
+        let src = r#"
+pragma solidity ^0.8.0;
+contract Position {
+    uint256 public price;
+    uint256 constant MAX_PRICE = 1e30;
+    uint256 constant ONE_DEC18 = 1e18;
+    function adjustPrice(uint256 newPrice) public {
+        require(newPrice <= MAX_PRICE, "too high");
+        price = newPrice;
+    }
+    function check(uint256 _collateralAmount, uint256 _bid) external returns (bool) {
+        return _bid * ONE_DEC18 >= price * _collateralAmount;
+    }
+}
+"#;
+        assert!(!fires_unbounded_price(src), "capped (require <= MAX) price product must be silent");
+    }
+
+    // SAFE (immutable price): an `immutable` price is fixed at construction and
+    // cannot be weaponized post-deploy, so the product is not a settable-DoS.
+    #[test]
+    fn silent_on_immutable_price_times_collateral() {
+        let src = r#"
+pragma solidity ^0.8.0;
+contract Position {
+    uint256 public immutable price;
+    uint256 constant ONE_DEC18 = 1e18;
+    constructor(uint256 p) { price = p; }
+    function check(uint256 _collateralAmount, uint256 _bid) external returns (bool) {
+        return _bid * ONE_DEC18 >= price * _collateralAmount;
+    }
+}
+"#;
+        assert!(!fires_unbounded_price(src), "immutable price product must be silent");
+    }
+
+    // SAFE (no settable price var): an oracle-read price held in a LOCAL (not a
+    // mutable storage var with a setter) is the dogfood shape (Comet/Morpho/Aave).
+    // There is no settable price state variable, so it must stay SILENT.
+    #[test]
+    fn silent_on_oracle_local_price_times_amount() {
+        let src = r#"
+pragma solidity ^0.8.0;
+interface IOracle { function getPrice() external view returns (uint256); }
+contract Vault {
+    IOracle oracle;
+    function value(uint256 amount) external view returns (uint256) {
+        uint256 price = oracle.getPrice();
+        return price * amount;
+    }
+}
+"#;
+        assert!(!fires_unbounded_price(src), "oracle-read local price product must be silent");
+    }
+
+    // SAFE (constant-only setter): a price var that is only ever reset to a
+    // compile-time constant cannot be driven to type(uint256).max by a caller.
+    #[test]
+    fn silent_on_constant_only_settable_price() {
+        let src = r#"
+pragma solidity ^0.8.0;
+contract C {
+    uint256 public price;
+    function reset() external { price = 1e18; }
+    function value(uint256 amount) external view returns (uint256) {
+        return price * amount;
+    }
+}
+"#;
+        assert!(!fires_unbounded_price(src), "price only ever set to a constant must be silent");
+    }
+
+    // SAFE (constant co-factor): `price * 1e18` is a decimal-scaling by a literal,
+    // not a product with an unbounded user amount — the literal cannot push the
+    // magnitude, and on its own this is ordinary scaling, so it must stay SILENT.
+    #[test]
+    fn silent_on_unbounded_price_times_constant_scale() {
+        let src = r#"
+pragma solidity ^0.8.0;
+contract C {
+    uint256 public price;
+    function setPrice(uint256 p) external { price = p; }
+    function scaled() external view returns (uint256) {
+        return price * 1e18;
+    }
+}
+"#;
+        assert!(!fires_unbounded_price(src), "price * <constant> scaling must be silent");
+    }
+
+    // PRECISION: a non-price unbounded settable storage var multiplied by an
+    // amount must NOT fire — the trigger is scoped to PRICE-like factors (the
+    // distinguishing FP-control signal), not every settable storage multiplicand.
+    #[test]
+    fn silent_on_unbounded_nonprice_var_times_amount() {
+        let src = r#"
+pragma solidity ^0.8.0;
+contract C {
+    uint256 public multiplier;
+    function setMultiplier(uint256 m) external { multiplier = m; }
+    function value(uint256 amount) external view returns (uint256) {
+        return multiplier * amount;
+    }
+}
+"#;
+        assert!(!fires_unbounded_price(src), "non-price settable factor must be silent (scoped to price)");
     }
 }

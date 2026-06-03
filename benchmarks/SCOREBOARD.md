@@ -8,14 +8,14 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 
 | Contest | In-class recall | Out-of-class recall | Crit/High | Unmatched C/H | Total findings |
 |---|---|---|---|---|---|
-| `2022-12-tigris` | 80% (4/5) | 0% (0/3) | 3 | 3 | 153 |
+| `2022-12-tigris` | 100% (5/5) | 0% (0/3) | 3 | 3 | 155 |
 | `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 84 |
-| `2023-04-caviar` | 33% (1/3) | 0% (0/3) | 0 | 0 | 38 |
-| `2023-04-frankencoin` | 25% (2/8) | 0% (0/13) | 1 | 1 | 60 |
-| `2023-06-stader` | 0% (0/4) | 0% (0/11) | 2 | 2 | 27 |
+| `2023-04-caviar` | 67% (2/3) | 0% (0/3) | 0 | 0 | 41 |
+| `2023-04-frankencoin` | 50% (4/8) | 0% (0/13) | 2 | 1 | 62 |
+| `2023-06-stader` | 50% (2/4) | 0% (0/11) | 3 | 2 | 29 |
 | `2023-07-basin` | 0% (0/3) | 0% (0/2) | 0 | 0 | 33 |
 | `2024-05-loop` | 100% (2/2) | 33% (1/3) | 1 | 0 | 4 |
-| **AGGREGATE** | **43% (13/30)** | **3% (1/37)** | **20** | **17** | **399** |
+| **AGGREGATE** | **63% (19/30)** | **3% (1/37)** | **22** | **17** | **408** |
 
 ## Per-finding detail
 
@@ -27,7 +27,7 @@ Repo `code-423n4/2022-12-tigris` @ `a2896b60eec8815409d946580ce0ce0392851f00`.
 |---|---|---|---|---|---|---|
 | H-verifyprice-chainlink-staleness | High | `oracle-staleness` | yes | ✅ caught | OracleStaleness @ tradinglibrary.sol:91 | verifyPrice uses Chainlink latestAnswer() only as a ±2% sanity band and never checks updatedAt/round freshness, so a stale Chainlink price (or a node price wit… |
 | H-bridgemint-public | High | `access-control` | yes | ✅ caught | Centralization @ govnft.sol:64 | _bridgeMint is declared public with no access control, so anyone can mint GovNFTs directly instead of only the LayerZero receive path, inflating governance/rew… |
-| H-verifyprice-sig-replay | High | `signature-replay` | yes | 🟡 near (class mismatch) | — | The node-signed PriceData (recovered via ECDSA) has no nonce or single-use binding; within the _validSignatureTimer window the same signature can be replayed a… |
+| H-verifyprice-sig-replay | High | `signature-replay` | yes | ✅ caught | SignatureReplay @ tradinglibrary.sol:91 | The node-signed PriceData (recovered via ECDSA) has no nonce or single-use binding; within the _validSignatureTimer window the same signature can be replayed a… |
 | H-addtoposition-price-manip | High | `accounting-invariant` | no | 🟡 near (class mismatch) | — | addToPosition recomputes the entry price as a margin-weighted average of the old position price and the new verified price; this protocol-specific averaging ca… |
 | H-handleopenfees-referral | High | `economic-fee-accounting` | no | ❌ missed | — | Open-fee / referral-fee accounting in _handleOpenFees can be manipulated (self-referral, fee-multiplier interactions) to reduce or redirect fees — a protocol-s… |
 | M-stablevault-decimals | Medium | `decimals-assumption` | yes | ✅ caught | DecimalsAssumption @ stablevault.sol:49 | deposit/withdraw scale by 10**(18 - token.decimals()); a margin token with more than 18 decimals underflows the exponent (and the assumption breaks for non-18-… |
@@ -58,7 +58,7 @@ Repo `code-423n4/2023-04-caviar` @ `5c87f7d69c6fac29eb253b5c7b2fb4a9f23f8750`.
 | H-flashloan-fee | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | flashLoan pulls the ERC20 fee from msg.sender after the callback and only checks msg.value for the ETH case; the flashloaned NFT is removed from the pool's eff… |
 | M-execute-arbitrary-call | Medium | `access-control` | yes | ✅ caught | Centralization @ privatepool.sol:459 | execute() lets the owner make an arbitrary target.call{value:msg.value}(data); the owner can approve/transfer NFTs or tokens held by the pool (including users'… |
 | M-setvirtualreserves-reprice | Medium | `centralization` | yes | ❌ missed | — | setVirtualReserves lets the pool owner reprice the AMM at will with no bound or timelock, so the owner can front-run a pending buy/sell to extract value — an o… |
-| M-missing-deadline | Medium | `missing-deadline` | yes | 🟡 near (class mismatch) | — | PrivatePool.buy/sell/change accept no deadline parameter (only the EthRouter wrappers do); a transaction can sit in the mempool and execute later at a stale pr… |
+| M-missing-deadline | Medium | `missing-deadline` | yes | ✅ caught | MissingDeadline @ privatepool.sol:385 | PrivatePool.buy/sell/change accept no deadline parameter (only the EthRouter wrappers do); a transaction can sit in the mempool and execute later at a stale pr… |
 | M-ethrouter-royalty-recipient | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | EthRouter royalty payment trusts the royalty recipient/amount returned for each NFT; a malicious NFT/registry can direct or inflate the royalty leg of a sell, … |
 
 ### `2023-04-frankencoin`
@@ -71,7 +71,7 @@ Repo `code-423n4/2023-04-frankencoin` @ `0761a287999fa3efac5c9fa9b70fcef5eeecc21
 | H-02 | High | `double-entry-token` | yes | ✅ caught | UnsafeErc20 @ position.sol:253 | A double-entrypoint collateral token lets the owner withdraw the underlying via the legacy address (token != address(collateral)) without repaying ZCHF, steali… |
 | H-03 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | Owner sends collateral directly to the position before a challenge finishes so balance>=minimum, avoiding the cooldown extension and re-minting profitably. |
 | H-04 | High | `dos-on-revert` | no | 🟡 near (class mismatch) | — | Transferring position ownership to address(0) makes the owner payout transfer in end() revert, permanently locking challenger collateral and bidder funds. |
-| H-05 | High | `integer-overflow` | yes | ❌ missed | — | Setting price to type(uint256).max overflows price*_collateralAmount in the bid/avert check (and the analogous adjustPrice path), reverting challenge resolutio… |
+| H-05 | High | `integer-overflow` | yes | ✅ caught | IntegerOverflow @ position.sol:307 | Setting price to type(uint256).max overflows price*_collateralAmount in the bid/avert check (and the analogous adjustPrice path), reverting challenge resolutio… |
 | H-06 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | Self-challenging a position created at an inflated price lets an attacker extract the 2% CHALLENGER_REWARD from reserves repeatedly, draining the protocol / mi… |
 | M-01 | Medium | `loop-index-logic` | no | ❌ missed | — | Loop burns addressesToWipe[0] every iteration instead of addressesToWipe[i], so only the first address is wiped. |
 | M-02 | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | Cloning with _minimum equal to the remaining limit reduces the original position's limit to zero, denying the owner further minting. |
@@ -85,7 +85,7 @@ Repo `code-423n4/2023-04-frankencoin` @ `0761a287999fa3efac5c9fa9b70fcef5eeecc21
 | M-10 | Medium | `slippage` | yes | ❌ missed | — | FPS mint (onTokenTransfer) and redeem provide no minimum-out / slippage bound, so users can be sandwiched on the bonding-curve price. |
 | M-11 | Medium | `frontrunning-ordering` | no | 🟡 near (class mismatch) | — | A later challenger can bid on an earlier challenge to bump its end time, ordering their own challenge to settle first and claim the reward. |
 | M-12 | Medium | `design-economic` | no | 🟡 near (class mismatch) | — | Fixed challenge period ignores network congestion / volatility, so auctions can settle at unfair prices. |
-| M-13 | Medium | `lifecycle-role-revoke-gap` | yes | ❌ missed | — | Once a minter passes its application period (isMinter true) there is no path to pause or remove it; denyMinter only works during the window. |
+| M-13 | Medium | `lifecycle-role-revoke-gap` | yes | ✅ caught | LifecycleRoleRevokeGap @ frankencoin.sol:88 | Once a minter passes its application period (isMinter true) there is no path to pause or remove it; denyMinter only works during the window. |
 | M-14 | Medium | `reorg-create` | no | ❌ missed | — | Factory creates positions without nonce/salt binding, so a chain reorg can let a position address be reused / re-pointed. |
 | M-15 | Medium | `frontrunning-ordering` | no | ❌ missed | — | notifyLoss can be frontrun by redeem, letting FPS holders exit before the loss is booked and dumping the loss on remaining holders. |
 
@@ -95,7 +95,7 @@ Repo `code-423n4/2023-06-stader` @ `86c27eb6b1fb6e0928aaa906614a2d1c6e7543e3`.
 
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
-| H-01 | High | `unprotected-initializer` | yes | ❌ missed | — | initialise() has no access control (only an isInitialized flag); an attacker can initialise a fresh proxy and, because the proxy delegatecalls the vault implem… |
+| H-01 | High | `unprotected-initializer` | yes | ✅ caught | UnprotectedInitializer @ vaultproxy.sol:20 | initialise() has no access control (only an isInitialized flag); an attacker can initialise a fresh proxy and, because the proxy delegatecalls the vault implem… |
 | M-01 | Medium | `logic-role-revoke` | no | ❌ missed | — | updateAdmin revokes DEFAULT_ADMIN_ROLE then grants it; setting the same address loses admin access (protocol-specific role lifecycle). |
 | M-02 | Medium | `missing-implementation` | no | ❌ missed | — | Several Pausable contracts (SocializingPool, StaderOracle, OperatorRewardsCollector, Auction) never expose pause()/unpause(), so pausing is impossible. |
 | M-03 | Medium | `centralization` | yes | ❌ missed | — | A single Stader OPERATOR unilaterally validates validators (markValidatorReadyToDeposit) with no appeal path — a centralization / single-point-of-failure on a … |
@@ -105,11 +105,11 @@ Repo `code-423n4/2023-06-stader` @ `86c27eb6b1fb6e0928aaa906614a2d1c6e7543e3`.
 | M-07 | Medium | `design-pause-asymmetry` | no | ❌ missed | — | When Auction is paused, addBid is blocked but the lot still closes, letting a last-minute MEV bidder win all lots. |
 | M-08 | Medium | `oracle-data-corruption` | no | ❌ missed | — | SD price median is built from submissions across different reporting blocks, corrupting the aggregated value (protocol-specific oracle aggregation logic). |
 | M-09 | Medium | `accounting-state-advance` | no | 🟡 near (class mismatch) | — | poolIdArrayIndexForExcessDeposit / lastExcessETHDepositBlock advance even when balance is insufficient, letting deposits be mis-routed. |
-| M-10 | Medium | `logic-zero-owner` | no | ❌ missed | — | initialise sets owner = staderConfig.getAdmin(); if the admin mapping is unset, owner becomes address(0) (protocol-specific init dependency, distinct from the … |
+| M-10 | Medium | `logic-zero-owner` | no | 🟡 near (class mismatch) | — | initialise sets owner = staderConfig.getAdmin(); if the admin mapping is unset, owner becomes address(0) (protocol-specific init dependency, distinct from the … |
 | M-11 | Medium | `access-control` | yes | ❌ missed | — | distributeRewards is permissionless and can be front-run to push a validator's balance below threshold, making it slashable. |
 | M-12 | Medium | `accounting-error` | no | ❌ missed | — | settleFunds ignores the NodeELRewardVault balance when computing penalty coverage, over-charging the operator. |
 | M-13 | Medium | `design-fixed-endblock` | no | ❌ missed | — | Fixed endBlock with no extension gives no incentive to bid early; only last-block MEV bids. |
-| M-14 | Medium | `oracle-staleness` | yes | ❌ missed | — | getPORFeedData uses latestRoundData() and discards updatedAt/answeredInRound, accepting stale/incorrect Proof-of-Reserve data. |
+| M-14 | Medium | `oracle-staleness` | yes | ✅ caught | OracleStaleness @ staderoracle.sol:637 | getPORFeedData uses latestRoundData() and discards updatedAt/answeredInRound, accepting stale/incorrect Proof-of-Reserve data. |
 
 ### `2023-07-basin`
 
