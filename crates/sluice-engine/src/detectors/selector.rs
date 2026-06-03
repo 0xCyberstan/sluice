@@ -1,12 +1,34 @@
-//! Selector / hash collision: `abi.encodePacked` with two or more *adjacent*
-//! dynamic arguments whose packed bytes feed a hash/selector sink. Packed
-//! encoding does not insert length prefixes or padding, so two variable operands
-//! sitting next to each other share an ambiguous byte boundary
-//! (`encodePacked("a","bc") == encodePacked("ab","c")`). When the result feeds a
-//! `keccak256`/`sha256` digest or an `abi.encodeWithSignature`/`Selector`
-//! preimage — a signature payload, a merkle leaf, or a mapping key — distinct
-//! logical inputs collapse to the same hash. This is the Poly-Network /
-//! signature-collision class.
+//! Hash-digest collision: `abi.encodePacked` with two or more *adjacent*
+//! dynamic arguments whose packed bytes feed a **`keccak256`/`sha256` digest**.
+//! Packed encoding does not insert length prefixes or padding, so two variable
+//! operands sitting next to each other share an ambiguous byte boundary
+//! (`encodePacked("a","bc") == encodePacked("ab","c")`). When the result becomes
+//! a `keccak256`/`sha256` digest used as an identity — a signature payload, a
+//! merkle leaf, or a mapping/id key — distinct logical inputs collapse to the
+//! same hash. This is the Poly-Network / signature-collision class.
+//!
+//! ## Disjoint from `encodepacked-collision` (partition by sink builtin)
+//!
+//! This detector and [`encodepacked-collision`] previously co-fired on the
+//! *same* `encodePacked → hash` line (one Medium + one Low on an identical span —
+//! e.g. Lido `DepositSecurityModule.unvetSigningKeys`, `keccak256(abi.encodePacked(
+//! …, nodeOperatorIds, vettedSigningKeysCounts))`), because both keyed off the
+//! same proven-dynamic-adjacency primitive and this one's sink set was a strict
+//! superset. They are now partitioned by **sink builtin** so a single packed call
+//! can match at most one of them:
+//!
+//! * **`selector-collision` (this detector)** owns the `keccak256` / `sha256`
+//!   *digest* sink — the on-chain identity / merkle-leaf / signature-digest
+//!   shape. Medium severity, ValueFlow.
+//! * **`encodepacked-collision`** owns the `abi.encodeWithSignature` /
+//!   `abi.encodeWithSelector` *function-selector preimage* sink. Low severity,
+//!   Invariant.
+//!
+//! The two sink sets `{keccak256, sha256}` and `{encodeWithSignature,
+//! encodeWithSelector}` are disjoint, so a given `(file, line, span)` now yields
+//! exactly one collision finding instead of a Medium+Low duplicate.
+//!
+//! [`encodepacked-collision`]: super::encodepacked_collision
 //!
 //! Two guards keep this precise:
 //!
@@ -17,10 +39,10 @@
 //!   boundary, and an `Unknown` operand is not proof of dynamism, so none of
 //!   them can stand in as a collision partner. A fixed field between two strings
 //!   or an init-code-hash tail (`..., keccak256(...), initCodeHash`) is silent.
-//! * **Security-sensitive sink.** The packed bytes must flow into a hash /
-//!   selector preimage. Packing dynamic operands into a *display / return*
-//!   `string` (the NFT-SVG / token-descriptor idiom) is not a collision attack
-//!   surface and stays silent.
+//! * **Digest sink.** The packed bytes must flow into a `keccak256`/`sha256`
+//!   digest. Packing dynamic operands into a *display / return* `string` (the
+//!   NFT-SVG / token-descriptor idiom) is not a collision attack surface and
+//!   stays silent.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -56,7 +78,7 @@ impl Detector for SelectorCollisionDetector {
         Category::SelectorCollision
     }
     fn description(&self) -> &'static str {
-        "abi.encodePacked with multiple dynamic args (hash/selector collision)"
+        "abi.encodePacked with multiple adjacent dynamic args feeding a keccak256/sha256 digest (hash collision)"
     }
 
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
@@ -91,8 +113,10 @@ impl Detector for SelectorCollisionDetector {
             let length_pinned = length_pinned_names(f);
 
             // First pass: spans of every `encodePacked` call that sits inside a
-            // hashing / signature-building builtin's argument subtree, i.e. the
-            // packed bytes flow into a digest/selector. Higher confidence there.
+            // `keccak256`/`sha256` builtin's argument subtree, i.e. the packed
+            // bytes flow into a digest. (The `abi.encodeWithSignature`/`Selector`
+            // selector-preimage sink is owned by `encodepacked-collision`, so the
+            // two detectors never co-fire on the same span.)
             let hashed = encode_packed_spans_feeding_hash(f);
 
             // Main pass: inspect each `encodePacked` call directly.
@@ -141,10 +165,12 @@ impl Detector for SelectorCollisionDetector {
 
                 // Only a security-sensitive sink makes the boundary ambiguity
                 // exploitable: the packed bytes must flow into a `keccak256` /
-                // `sha256` digest, an `abi.encodeWithSignature`/`Selector`
-                // preimage, or a mapping/id key. Packing dynamic operands into a
-                // *display / return* `string` (the NFT-SVG / token-descriptor
-                // idiom) is not a collision attack surface, so it stays silent.
+                // `sha256` digest (signature payload, merkle leaf, or mapping/id
+                // key). Packing dynamic operands into a *display / return*
+                // `string` (the NFT-SVG / token-descriptor idiom) is not a
+                // collision attack surface, so it stays silent. The
+                // `abi.encodeWithSignature`/`Selector` preimage is the disjoint
+                // sink owned by `encodepacked-collision`.
                 if !hashed.contains(&span) {
                     return;
                 }
@@ -154,17 +180,17 @@ impl Detector for SelectorCollisionDetector {
                     .severity(Severity::Medium)
                     // Honest heuristic confidence: type inference is best-effort and
                     // a real collision still requires a meaningful pair of inputs,
-                    // but the packed bytes are proven to reach a hash/selector sink.
+                    // but the packed bytes are proven to reach a keccak256/sha256 sink.
                     .confidence(0.6)
                     // ValueFlow: the (potentially attacker-supplied) packed values
-                    // flow into a hash/selector sink where the boundary ambiguity
-                    // becomes exploitable. That is the value-flow evidence; no
-                    // invariant or trust-frontier claim is made here.
+                    // flow into a keccak256/sha256 digest where the boundary
+                    // ambiguity becomes exploitable. That is the value-flow
+                    // evidence; no invariant or trust-frontier claim is made here.
                     .dimension(Dimension::ValueFlow)
                     .message(format!(
                         "`{}` calls `abi.encodePacked` with {} adjacent dynamic-length arguments \
-                         (string/bytes/array) and the result feeds a `keccak256`/`sha256` digest or \
-                         selector (signature payload, merkle leaf, or mapping key), so two distinct \
+                         (string/bytes/array) and the result feeds a `keccak256`/`sha256` digest \
+                         (signature payload, merkle leaf, or mapping key), so two distinct \
                          inputs can forge the same hash. Packed encoding omits length prefixes, so \
                          adjacent dynamic values share an ambiguous boundary \
                          (`encodePacked(\"a\",\"bc\") == encodePacked(\"ab\",\"c\")`).",
@@ -347,9 +373,14 @@ fn is_fixed_bytes(base: &str) -> bool {
 }
 
 /// Collect the spans of every `abi.encodePacked` call that appears inside the
-/// argument subtree of a hashing / signature-building builtin (`keccak256`,
-/// `sha256`, `abi.encodeWithSignature/Selector`). These are the high-signal
-/// cases where the packed bytes become a digest, merkle leaf, or selector.
+/// argument subtree of a `keccak256` / `sha256` builtin. These are the
+/// high-signal cases where the packed bytes become a digest, merkle leaf, or
+/// mapping/id key.
+///
+/// The `abi.encodeWithSignature` / `abi.encodeWithSelector` selector-preimage
+/// sink is deliberately **excluded** here: it is owned by the sibling
+/// `encodepacked-collision` detector, which keeps the two detectors' sink sets
+/// disjoint so they cannot both fire on the same packed call.
 fn encode_packed_spans_feeding_hash(f: &Function) -> HashSet<Span> {
     let mut spans = HashSet::new();
     for s in &f.body {
@@ -357,10 +388,7 @@ fn encode_packed_spans_feeding_hash(f: &Function) -> HashSet<Span> {
             if let ExprKind::Call(c) = &e.kind {
                 let is_hash_sink = matches!(
                     c.kind,
-                    CallKind::Builtin(Builtin::Keccak256)
-                        | CallKind::Builtin(Builtin::Sha256)
-                        | CallKind::Builtin(Builtin::AbiEncodeWithSignature)
-                        | CallKind::Builtin(Builtin::AbiEncodeWithSelector)
+                    CallKind::Builtin(Builtin::Keccak256) | CallKind::Builtin(Builtin::Sha256)
                 );
                 if is_hash_sink {
                     for a in &c.args {
@@ -592,5 +620,30 @@ mod tests {
     fn silent_on_svg_display_string() {
         let fs = run(FP_SVG_DISPLAY_STRING);
         assert!(!fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
+    }
+
+    // Adjacent dynamic operands packed into an `abi.encodeWithSelector` preimage.
+    // After the sink partition this is the *selector-preimage* shape owned by
+    // `encodepacked-collision`, NOT this detector: `selector-collision` now keys
+    // only off the `keccak256`/`sha256` digest sink, so it must stay silent here
+    // (and `encodepacked-collision` fires instead — see that module's tests). This
+    // is the de-dup guarantee: no Medium+Low pair on a single packed call.
+    const SELECTOR_PREIMAGE: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Router {
+            function callIt(address t, string memory a, string memory b) external {
+                t.call(abi.encodeWithSelector(bytes4(0x12345678), abi.encodePacked(a, b)));
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_selector_preimage_now_owned_by_encodepacked() {
+        let fs = run(SELECTOR_PREIMAGE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "selector-collision"),
+            "selector-collision must no longer fire on the abi.encodeWithSelector preimage \
+             (now owned by encodepacked-collision): {fs:?}",
+        );
     }
 }

@@ -386,6 +386,96 @@ fn blank_transient_keyword(src: &str) -> Option<String> {
     out.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
+/// The three data-location keywords solang-parser 0.3.5 reserves for the
+/// Polkadot/Substrate "Sophia" storage model — `persistent`, `temporary`, and
+/// `instance` (see its `lexer.rs`: each is a hard `Token`, alongside `transient`).
+/// On Ethereum-Solidity these are perfectly ordinary identifiers, and pre-0.8
+/// code uses them freely as variable / parameter names (Lido's 0.4.24
+/// `LidoTemplate` has `address instance = address(_dao.newAppInstance(...));`).
+/// Because the lexer turns the *word itself* into a keyword token, solang rejects
+/// it **anywhere it appears as a plain identifier** — a declaration name, a bare
+/// expression (`instance = x;`), a `return instance;`, an argument
+/// (`emit Ev(instance, …)`) — and drops the **entire file** from analysis.
+const RESERVED_STORAGE_IDENTS: [&[u8]; 3] = [b"persistent", b"temporary", b"instance"];
+
+/// Recover the [`RESERVED_STORAGE_IDENTS`] used as ordinary identifiers, the way
+/// [`blank_transient_keyword`] recovers `transient` — but here the word *is* a
+/// referenced name, so it cannot be blanked away; it must stay a usable
+/// identifier. We rename it in place to an equal-length identifier by replacing
+/// only its **first byte** with `$` (a legal Solidity/solang identifier byte that
+/// is never the start of any of these keywords): `instance` → `$nstance`,
+/// `persistent` → `$ersistent`, `temporary` → `$emporary`. The substitution is:
+///   * **offset-preserving** — same byte length, so every later byte (and thus
+///     every `Span` / finding line number) is unmoved, exactly like the existing
+///     `layout at` / `transient` recoveries;
+///   * **consistent within the file** — every occurrence of a given keyword maps
+///     to the same `$`-prefixed name, so a variable's writes/reads/returns still
+///     match by string equality in the effect analysis;
+///   * **collision-safe in practice** — a real identifier literally spelled
+///     `$nstance` / `$ersistent` / `$emporary` does not occur, and even if one
+///     did the only effect would be harmless name aliasing.
+///
+/// Discrimination — leave the *genuine* 0.8.29 data-location keyword form
+/// untouched. In `uint256 instance private x;` (and the `persistent` / `temporary`
+/// analogues) the word is the storage location, immediately followed by another
+/// word (the visibility or the variable name): solang already parses that as
+/// `StorageType::Instance`, so we must not rewrite it. The identifier usages we
+/// *do* fix are instead followed by `=`, `;`, `,`, `)`, `.`, `[`, an operator, etc.
+/// — i.e. the next significant token does **not** start an identifier byte. So,
+/// the exact inverse of the `transient` rule: rename only when the next
+/// significant token is *not* an identifier start. Comments and string/char
+/// literals are skipped (via [`skip_comment_or_string`]) so a keyword mentioned in
+/// a doc-comment or string is never rewritten.
+///
+/// Returns `None` when none of the three words appears (the common case → no
+/// allocation).
+fn rename_reserved_storage_idents(src: &str) -> Option<String> {
+    if !RESERVED_STORAGE_IDENTS.iter().any(|kw| {
+        // `kw` is pure ASCII, so a byte-substring check is a valid UTF-8 prefilter.
+        src.as_bytes()
+            .windows(kw.len())
+            .any(|w| w == *kw)
+    }) {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        // Never match a keyword inside a comment or string/char literal.
+        if let Some(next) = skip_comment_or_string(bytes, i) {
+            i = next;
+            continue;
+        }
+        // Match at most one of the (mutually exclusive) keywords at `i`.
+        let matched = RESERVED_STORAGE_IDENTS.iter().find(|kw| {
+            i + kw.len() <= bytes.len()
+                && &bytes[i..i + kw.len()] == **kw
+                && word_boundary_before(bytes, i)
+                && (i + kw.len() == bytes.len() || !is_ident_byte(bytes[i + kw.len()]))
+        });
+        if let Some(kw) = matched {
+            let after = i + kw.len();
+            // Data-location keyword form iff the next significant token starts an
+            // identifier (a visibility keyword or the variable name) — solang
+            // already parses that, so leave it. Otherwise it is an identifier use
+            // we must rename. (At EOF / no following token, treat as an identifier
+            // use: a dangling keyword can only be a name.)
+            let is_data_location =
+                next_significant(bytes, after).is_some_and(|n| is_ident_byte(bytes[n]));
+            if !is_data_location {
+                let buf = out.get_or_insert_with(|| bytes.to_vec());
+                buf[i] = b'$'; // equal-length rename: keep the tail, swap the head.
+                i = after;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // Only ASCII bytes (`$`) were written over ASCII bytes → still valid UTF-8.
+    out.map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 /// Parse in-memory `(path, content)` sources into an [`Scir`].
 pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     let mut scir = Scir::new();
@@ -424,19 +514,28 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
                     "skipped: bracket-nesting depth {depth} exceeds limit {MAX_NESTING_DEPTH} (possible DoS input)"
                 ))
             } else {
-                // Recover Solidity-syntax that solang-parser 0.3.5 predates and would
-                // otherwise reject *for the whole file* (dropping every contract in it):
+                // Recover Solidity-syntax that solang-parser 0.3.5 predates/mis-reserves
+                // and would otherwise reject *for the whole file* (dropping every
+                // contract in it):
                 //   - 0.8.29 `contract X layout at <slot> is ...` storage-layout headers
                 //   - 0.8.28 `<type> transient <vis> <name>;` transient storage vars
-                // Each recovery blanks only the offending keyword/directive to spaces,
-                // so byte offsets are preserved and every `Span` still indexes the
-                // original `content` we store below for reporting. They compose: a file
-                // may use both, so we feed the output of one into the next (each is a
-                // no-op allocation-free `None` when its keyword is absent).
+                //   - `persistent` / `temporary` / `instance` used as ordinary
+                //     identifiers (solang reserves them as Substrate storage-location
+                //     keywords; pre-0.8 code like Lido's `LidoTemplate` uses them as
+                //     plain variable names)
+                // Each recovery rewrites only the offending keyword/directive in place
+                // (blanking to spaces, or — for the reserved identifiers, which must stay
+                // referenceable — an equal-length `$`-rename), so byte offsets are
+                // preserved and every `Span` still indexes the original `content` we
+                // store below for reporting. They compose: a file may use several, so we
+                // feed the output of one into the next (each is a no-op allocation-free
+                // `None` when its keyword is absent).
                 let blanked_layout = blank_layout_directive(&content);
                 let after_layout: &str = blanked_layout.as_deref().unwrap_or(&content);
                 let blanked_transient = blank_transient_keyword(after_layout);
-                let parse_input: &str = blanked_transient.as_deref().unwrap_or(after_layout);
+                let after_transient: &str = blanked_transient.as_deref().unwrap_or(after_layout);
+                let renamed_reserved = rename_reserved_storage_idents(after_transient);
+                let parse_input: &str = renamed_reserved.as_deref().unwrap_or(after_transient);
                 match solang_parser::parse(parse_input, file_no as usize) {
                     Ok((unit, _comments)) => Parsed::Ok(unit),
                     Err(diags) => Parsed::Err(
@@ -1398,5 +1497,153 @@ mod tests {
         assert!(set.effects.writes_var("x"));
         assert!(set.effects.writes_var("slotGuard"));
         assert!(scir.span_text(set.span).contains("x = v"));
+    }
+
+    #[test]
+    fn recovers_reserved_instance_identifier_lido_0_4_24() {
+        // Lido's 0.4.24 `LidoTemplate._installApp`: `instance` is a solang-0.3.5
+        // reserved Substrate storage-keyword, so the *whole file* was dropped. The
+        // recovery renames it to a usable identifier so the contract parses, and the
+        // local's writes/reads/return still resolve consistently.
+        let scir = parse_one(
+            r#"
+            pragma solidity 0.4.24;
+            contract Tmpl {
+                event Installed(address inst);
+                function installApp(address _dao) internal returns (address) {
+                    address instance = address(_dao);
+                    emit Installed(instance);
+                    return instance;
+                }
+            }
+            "#,
+        );
+        let c = scir
+            .contract_named("Tmpl")
+            .expect("Tmpl recovered despite reserved `instance` identifier");
+        let f = scir
+            .functions_of(c.id)
+            .find(|f| f.name == "installApp")
+            .expect("installApp");
+        // The function body parsed (non-empty) and the span still indexes the real,
+        // un-rewritten source (offset preservation).
+        assert!(f.has_body, "body parsed");
+        assert!(
+            scir.span_text(f.span).contains("address instance = address(_dao)"),
+            "span reads the ORIGINAL source (the keyword was not blanked, offsets intact)"
+        );
+    }
+
+    #[test]
+    fn recovers_persistent_and_temporary_identifiers() {
+        // `persistent` and `temporary` are reserved by solang 0.3.5 the same way;
+        // both must recover when used as plain identifiers.
+        let scir = parse_one(
+            r#"
+            pragma solidity 0.4.24;
+            contract R {
+                function f(uint256 z) internal returns (uint256) {
+                    uint256 persistent = z + 1;
+                    uint256 temporary = persistent * 2;
+                    return temporary;
+                }
+            }
+            "#,
+        );
+        let c = scir.contract_named("R").expect("R recovered");
+        assert!(scir.functions_of(c.id).any(|f| f.name == "f"));
+    }
+
+    #[test]
+    fn reserved_storage_keyword_as_data_location_is_left_untouched() {
+        // The *genuine* 0.8.29 data-location forms (`<type> instance|persistent|
+        // temporary <vis> <name>;`) are already parsed by solang as a StorageType,
+        // so the recovery must leave them alone (next token is an identifier).
+        // `rename_reserved_storage_idents` returns `None` (no rewrite) here.
+        let src = concat!(
+            "pragma solidity 0.8.29;\n",
+            "contract C {\n",
+            "    uint256 instance private a;\n",
+            "    uint256 persistent public b;\n",
+            "    function f() external { a = 1; b = 2; }\n",
+            "}\n",
+        );
+        assert!(
+            rename_reserved_storage_idents(src).is_none(),
+            "data-location keyword form must not be rewritten"
+        );
+        let scir = parse_one(src);
+        assert!(scir.contract_named("C").is_some(), "data-location form still parses");
+    }
+
+    #[test]
+    fn reserved_keyword_in_comment_or_string_is_not_rewritten() {
+        // A reserved word mentioned only in a comment or string literal must not be
+        // touched — it is not an identifier in those positions.
+        let src = concat!(
+            "pragma solidity 0.4.24;\n",
+            "// instance persistent temporary are reserved by solang but used here only in prose\n",
+            "contract S {\n",
+            "    string public note = \"create an instance, persistent or temporary\";\n",
+            "    function f() external pure returns (uint256) { return 1; }\n",
+            "}\n",
+        );
+        assert!(
+            rename_reserved_storage_idents(src).is_none(),
+            "keywords in comments/strings must not be rewritten"
+        );
+        let scir = parse_one(src);
+        let c = scir.contract_named("S").expect("S parses");
+        assert!(scir.functions_of(c.id).any(|f| f.name == "f"));
+    }
+
+    #[test]
+    fn reserved_ident_recovery_preserves_byte_offsets_and_line_numbers() {
+        // Exact offset preservation: the `$`-rename is byte-for-byte equal length, so
+        // a finding's line number is identical to a control where `instance` is
+        // pre-renamed to the recovery's own output (`$nstance`).
+        let with_kw = concat!(
+            "pragma solidity 0.4.24;\n",
+            "contract C {\n",
+            "    function f(address d) internal returns (address) {\n",
+            "        address instance = address(d);\n",
+            "        return instance;\n",
+            "    }\n",
+            "}\n",
+        );
+        // The recovery rewrites only the FIRST byte of each `instance` to `$`.
+        let control = with_kw.replace("instance", "$nstance");
+        assert_eq!(with_kw.len(), control.len(), "rename is equal-length");
+
+        let scir_kw = parse_one(with_kw);
+        let scir_ctl = parse_one(&control);
+
+        let line_kw = {
+            let c = scir_kw.contract_named("C").expect("C (instance) parses");
+            let f = scir_kw.functions_of(c.id).find(|f| f.name == "f").unwrap();
+            scir_kw.line_of(f.span)
+        };
+        let line_ctl = {
+            let c = scir_ctl.contract_named("C").expect("C (control) parses");
+            let f = scir_ctl.functions_of(c.id).find(|f| f.name == "f").unwrap();
+            scir_ctl.line_of(f.span)
+        };
+        assert_eq!(line_kw, line_ctl, "reserved-ident recovery must not shift line numbers");
+        assert_eq!(line_kw, 3, "function f is on source line 3 in both");
+    }
+
+    #[test]
+    fn reserved_ident_recovery_is_noop_when_absent() {
+        // No reserved word → no transform (None, no allocation) → zero offset drift
+        // for the overwhelmingly common case (and every existing corpus file).
+        let src = "pragma solidity ^0.8.20;\ncontract A { uint256 x; function f() external { x = 1; } }\n";
+        assert!(rename_reserved_storage_idents(src).is_none(), "no keyword → no transform");
+        // A reserved word as a pure substring of a longer identifier is ignored
+        // (word boundary): `newAppInstance` / `instanceId` must not be rewritten.
+        let ident = "contract B { function newAppInstance() public {} uint256 instanceId; }";
+        assert!(
+            rename_reserved_storage_idents(ident).is_none(),
+            "`newAppInstance` / `instanceId` are identifiers that merely contain the keyword"
+        );
     }
 }

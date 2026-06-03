@@ -734,3 +734,33 @@ verified the combined state):
   re-triage (defensible — decide TP vs over-flag); integer-issues local-copy-bound residuals; parser Solidity-0.4.24
   (`LidoTemplate.sol`); selector/encodepacked de-dup. + the STRATEGIC recall frontier (invariant-prover, not pattern
   matcher — the deep, high-value direction). _done._
+
+### Real-code precision wave 5 — residual fixes + Balancer/Reserve triage (incl. a FAIR recall benchmark)
+3 residual fixes (worktree-isolated, disjoint) + 2 read-only triages.
+- **erc777-reentrancy** — ported the wave-4 CEI-downgrade (post-hook write must be a value var, after the hook, not
+  settled-before). **LoopFi 2→0**; Lendf.me + Grim retained.
+- **selector/encodepacked-collision de-dup** — partitioned sink sets disjoint (selector-collision = keccak/sha digest;
+  encodepacked-collision = encodeWithSignature/Selector preimage) → never co-fire. Lido `:604` 2→1; both sinks still detected.
+- **parser Solidity-0.4.x** — solang hard-reserves `instance`/`persistent`/`temporary` (Substrate keywords, siblings of
+  `transient`) as identifiers → dropped 0.4.x files. Offset-preserving `$`-rename recovery → LidoTemplate 0→1 contract/39 fns.
+- **Integrated:** 132 detectors, 0 warnings, gate green. **ALL 6 benchmark protocols now 0 Crit / defensible-only High:**
+  Aave/Lido/Morpho/Uniswap-universal-router/LoopFi **0/0**; Compound Comet **0/9** (defensible).
+
+### Balancer V2 + Reserve-C4 triage → WAVE-6 backlog (precision residuals + a tractable recall track)
+- **Balancer V2 Vault (clean): 0 Crit/0 High** — wave-1..4 fixes held on a high-density target (reentrancy silent under
+  nonReentrant+CEI, oracle silent on `balanceOf`, unchecked-return silent on SafeERC20, access-control silent on
+  `authenticate`). 3 Medium-tier FP classes: **array-length-mismatch blind to validation-HELPER calls**
+  (`ensureInputLengthMatch` — also hit Lido `_validateEqualArrayLengths`); **bridge-verification** fires on a fn named
+  `execute` + external call with no cross-chain primitive; **gas-griefing** treats `address(this).call` self-call as untrusted.
+- **Reserve C4 (FAIR RECALL benchmark): in-class recall ~20-30% (caught M-10 unsafe-downcast; missed M-07/M-02/M-14/M-18).**
+  CRUCIAL — the misses are detector **UNDER-FIRING, not missing capability**: Sluice SHIPS the exactly-named detector but
+  its trigger didn't fire on the real instance — `signed-cast` doesn't key on `int8(decimals())` (M-14);
+  `cached-domain-separator` doesn't key on OZ `EIP712Upgradeable` + a `setName` mutator (M-18);
+  `internal-share-pricing-rounding` didn't fire on StRSR stake-rate (M-02); `erc777-reentrancy` fired on `issue` not
+  `redeem` (M-07). PRECISION: 0/6 clean TP at High (oracle/twap misfired on `balanceOf`/transfer that aren't price feeds);
+  severity INVERTED (the true catch M-10 at Medium, the FPs at High).
+- **WAVE-6 — two tractable tracks:** PRECISION — array-length helper-aware; bridge-verification require a real
+  cross-chain primitive; gas-griefing exclude self-calls; oracle/twap Reserve residual misfires; severity calibration.
+  RECALL (trigger-tightening of EXISTING detectors — NOT the hard invariant frontier) — `signed-cast` on
+  `int8(decimals())`; `cached-domain-separator` on `EIP712Upgradeable`+mutator; `erc777-reentrancy` on `redeem`;
+  `internal-share-pricing-rounding` on stake-rate. _done._

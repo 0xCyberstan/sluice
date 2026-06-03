@@ -1,5 +1,5 @@
-//! Hash-id collision via `abi.encodePacked` with adjacent dynamic arguments
-//! (SWC-133).
+//! Function-selector-preimage collision via `abi.encodePacked` with adjacent
+//! dynamic arguments (SWC-133).
 //!
 //! `abi.encodePacked` concatenates its operands with **no length prefixes and no
 //! padding**. When two *variable-length* operands (`string` / `bytes` /
@@ -7,15 +7,16 @@
 //! boundary between them is ambiguous: moving a character from the end of the
 //! first into the start of the second yields the identical byte string —
 //! `encodePacked("a","bc") == encodePacked("ab","c")`. If those packed bytes are
-//! then fed to a hash that is used as an **identity** — a `keccak256`/`sha256`
-//! merkle leaf, a signature digest, or a mapping/id key — two logically distinct
-//! inputs collapse to the same hash, which lets one input impersonate another
-//! (the Poly-Network / signature-collision class).
+//! then folded into a function call's **selector preimage / calldata** —
+//! `abi.encodeWithSignature(...)` or `abi.encodeWithSelector(...)` — two
+//! logically distinct argument tuples collapse to the same encoded calldata, so
+//! one can impersonate another (the Poly-Network / signature-collision class).
 //!
 //! This is a deliberately narrow, lint-style (SWC-133) detector. It fires only
-//! on the *hash-id* shape:
+//! on the *selector-preimage* shape:
 //!
-//! * the packed result flows into a `keccak256` / `sha256` argument subtree, and
+//! * the packed result flows into an `abi.encodeWithSignature` /
+//!   `abi.encodeWithSelector` argument subtree, and
 //! * the packed call has **two or more ADJACENT dynamic-typed operands**.
 //!
 //! ## Why "adjacent" and not just "two dynamic somewhere"
@@ -29,15 +30,29 @@
 //! operands, or dynamic operands kept apart by a fixed-width delimiter are all
 //! suppressed — those are the documented safe constructions for this class.
 //!
-//! ## Relationship to `selector-collision`
+//! ## Disjoint from `selector-collision` (partition by sink builtin)
 //!
-//! `selector-collision` (`Category::SelectorCollision`, ValueFlow, Medium) covers
-//! the broader "two not-provably-fixed operands packed, with the EIP-712
-//! allow-list" angle and fires whether or not the bytes reach a hash. This
-//! detector is the tighter SWC-133 lint: it demands **proven-dynamic adjacency**
-//! *and* a hash-id sink, ships Low severity on the Invariant dimension (the
-//! broken assumption is "this hash uniquely identifies its inputs"), and stays
-//! silent on the fixed-width-separated and length-pinned safe forms.
+//! This detector and [`selector-collision`] previously co-fired on the *same*
+//! `encodePacked → keccak256/sha256` line (one Medium + one Low on an identical
+//! span — e.g. Lido `DepositSecurityModule.unvetSigningKeys`), because both keyed
+//! off the same proven-dynamic-adjacency primitive over the keccak/sha sink. They
+//! are now partitioned by **sink builtin** so a single packed call matches at most
+//! one of them:
+//!
+//! * **`selector-collision`** (`Category::SelectorCollision`, ValueFlow, Medium)
+//!   owns the `keccak256` / `sha256` *digest* sink — on-chain identity, merkle
+//!   leaf, signature digest, mapping/id key.
+//! * **`encodepacked-collision`** (this detector, Invariant, Low) owns the
+//!   `abi.encodeWithSignature` / `abi.encodeWithSelector` *function-selector
+//!   preimage* sink. The broken assumption is "these encoded args uniquely
+//!   identify their tuple". It stays silent on the fixed-width-separated and
+//!   length-pinned safe forms.
+//!
+//! Because the two sink sets `{encodeWithSignature, encodeWithSelector}` and
+//! `{keccak256, sha256}` are disjoint, a given `(file, line, span)` now yields
+//! exactly one collision finding instead of a Medium+Low duplicate.
+//!
+//! [`selector-collision`]: super::selector
 
 use super::prelude::*;
 use crate::context::AnalysisContext;
@@ -72,7 +87,7 @@ impl Detector for EncodePackedCollisionDetector {
         Category::EncodePackedCollision
     }
     fn description(&self) -> &'static str {
-        "abi.encodePacked with >=2 adjacent dynamic args feeding a keccak256/sha256 id, leaf, or digest (SWC-133)"
+        "abi.encodePacked with >=2 adjacent dynamic args feeding an abi.encodeWithSignature/Selector calldata preimage (SWC-133)"
     }
 
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
@@ -105,9 +120,12 @@ impl Detector for EncodePackedCollisionDetector {
             let length_pinned = length_pinned_names(f);
 
             // The only sink we care about: an `abi.encodePacked` call sitting
-            // inside the argument subtree of a `keccak256`/`sha256` hash. That is
-            // the "result feeds a hash used as an id / merkle leaf / digest" shape.
-            for (packed, span) in encode_packed_calls_feeding_hash(f) {
+            // inside the argument subtree of an `abi.encodeWithSignature` /
+            // `abi.encodeWithSelector` call. That is the "packed bytes become a
+            // function-selector preimage / calldata" shape. (The keccak256/sha256
+            // digest sink is owned by `selector-collision`, so the two detectors
+            // never co-fire on the same packed call.)
+            for (packed, span) in encode_packed_calls_feeding_selector(f) {
                 if packed.args.len() < 2 {
                     continue; // a single operand has no internal boundary
                 }
@@ -130,26 +148,28 @@ impl Detector for EncodePackedCollisionDetector {
                 let dynamic_count = classes.iter().filter(|k| **k == ArgClass::Dynamic).count();
 
                 let b = report!(self, Category::EncodePackedCollision,
-                    title = "abi.encodePacked with adjacent dynamic arguments feeds a hash used as an id",
+                    title = "abi.encodePacked with adjacent dynamic arguments feeds a function-selector preimage",
                     severity = Severity::Low,
                     confidence = 0.5,
-                    // Invariant: the broken assumption is that this `keccak256`/
-                    // `sha256` value *uniquely identifies* its inputs. Adjacent
-                    // packed dynamic operands violate that — distinct inputs map
-                    // to one digest, so an id / merkle leaf / signature can be
-                    // forged. (selector-collision carries the ValueFlow angle.)
+                    // Invariant: the broken assumption is that this
+                    // `abi.encodeWithSignature`/`Selector` calldata *uniquely
+                    // identifies* its argument tuple. Adjacent packed dynamic
+                    // operands violate that — distinct inputs map to one encoded
+                    // preimage, so one call can be substituted for another.
+                    // (selector-collision carries the keccak256/sha256 angle.)
                     dimensions = [Dimension::Invariant],
                     message = format!(
-                        "`{}` hashes `abi.encodePacked(...)` containing {} adjacent dynamic-length arguments \
+                        "`{}` builds an `abi.encodeWithSignature`/`abi.encodeWithSelector` preimage from \
+                         `abi.encodePacked(...)` containing {} adjacent dynamic-length arguments \
                          (string/bytes/dynamic array). Packed encoding omits length prefixes, so the boundary \
                          between two adjacent dynamic operands is ambiguous \
-                         (`encodePacked(\"a\",\"bc\") == encodePacked(\"ab\",\"c\")`). Because the result is used \
-                         as an id / merkle leaf / signature digest, two distinct inputs collapse to the same hash \
-                         and one can impersonate the other (SWC-133).",
+                         (`encodePacked(\"a\",\"bc\") == encodePacked(\"ab\",\"c\")`). Because the packed bytes \
+                         become the encoded calldata / selector preimage, two distinct inputs collapse to the \
+                         same preimage and one call can impersonate the other (SWC-133).",
                         f.name, dynamic_count,
                     ),
                     recommendation =
-                        "Hash with `abi.encode` (length-prefixed) instead of `abi.encodePacked`, or place a \
+                        "Encode with `abi.encode` (length-prefixed) instead of `abi.encodePacked`, or place a \
                          fixed-width separator / length field between the dynamic arguments so distinct inputs \
                          cannot produce the same packed bytes.",
                 );
@@ -280,20 +300,30 @@ fn length_eq_name(len_side: &Expr, k_side: &Expr) -> Option<String> {
     None
 }
 
-/// Every `abi.encodePacked` call that appears inside the argument subtree of a
-/// `keccak256` / `sha256` builtin, paired with the packed call's span. These are
-/// the hash-id sinks: the packed bytes become a digest, merkle leaf, or id key.
-/// Returns each inner `Call` so the caller can classify its operands.
-fn encode_packed_calls_feeding_hash(f: &Function) -> Vec<(&sluice_ir::Call, sluice_ir::Span)> {
+/// Every `abi.encodePacked` call that appears inside the argument subtree of an
+/// `abi.encodeWithSignature` / `abi.encodeWithSelector` builtin, paired with the
+/// packed call's span. These are the selector-preimage sinks: the packed bytes
+/// become a function call's encoded calldata. Returns each inner `Call` so the
+/// caller can classify its operands.
+///
+/// The `keccak256` / `sha256` digest sink is deliberately **excluded** here: it
+/// is owned by the sibling `selector-collision` detector, which keeps the two
+/// detectors' sink sets disjoint so they cannot both fire on the same packed call.
+fn encode_packed_calls_feeding_selector(f: &Function) -> Vec<(&sluice_ir::Call, sluice_ir::Span)> {
     let mut out: Vec<(&sluice_ir::Call, sluice_ir::Span)> = Vec::new();
     let mut seen: HashSet<sluice_ir::Span> = HashSet::new();
     for s in &f.body {
         s.visit_exprs(&mut |e: &Expr| {
             let ExprKind::Call(c) = &e.kind else { return };
-            // Only keccak256/sha256 — the hashes used as on-chain identities. (The
-            // selector-collision detector covers the abi.encodeWithSignature/
-            // Selector preimage angle; this one is the keccak/sha id/leaf/digest.)
-            if !matches!(c.kind, CallKind::Builtin(Builtin::Keccak256) | CallKind::Builtin(Builtin::Sha256)) {
+            // Only abi.encodeWithSignature/abi.encodeWithSelector — the
+            // function-selector preimages. (The selector-collision detector
+            // covers the keccak256/sha256 digest angle; this one is the
+            // selector/calldata preimage.)
+            if !matches!(
+                c.kind,
+                CallKind::Builtin(Builtin::AbiEncodeWithSignature)
+                    | CallKind::Builtin(Builtin::AbiEncodeWithSelector)
+            ) {
                 return;
             }
             for a in &c.args {
@@ -320,34 +350,42 @@ mod tests {
         fs.iter().any(|f| f.detector == "encodepacked-collision")
     }
 
-    // FIRES: two adjacent dynamic `string` operands packed and hashed into a
-    // keccak256 id — the canonical SWC-133 ambiguous-boundary collision.
+    // Helper: does `selector-collision` fire? Used to assert the de-dup — the two
+    // detectors must never co-fire on the same packed call.
+    fn selector_fired(fs: &[sluice_findings::Finding]) -> bool {
+        fs.iter().any(|f| f.detector == "selector-collision")
+    }
+
+    // FIRES: two adjacent dynamic `string` operands packed into an
+    // `abi.encodeWithSignature` calldata preimage — the canonical SWC-133
+    // ambiguous-boundary collision on the function-selector sink owned by this
+    // detector.
     const VULN: &str = r#"
         pragma solidity ^0.8.20;
         contract Sig {
-            function id(string memory a, string memory b) public pure returns (bytes32) {
-                return keccak256(abi.encodePacked(a, b));
+            function fwd(address t, string memory a, string memory b) public {
+                t.call(abi.encodeWithSignature("f(bytes)", abi.encodePacked(a, b)));
             }
         }
     "#;
 
-    // FIRES: two adjacent dynamic `bytes` operands hashed with sha256 (merkle
-    // leaf shape).
-    const VULN_BYTES_SHA: &str = r#"
+    // FIRES: two adjacent dynamic `bytes` operands packed into an
+    // `abi.encodeWithSelector` preimage.
+    const VULN_BYTES_SELECTOR: &str = r#"
         pragma solidity ^0.8.20;
-        contract Leaf {
-            function leaf(bytes calldata a, bytes calldata b) external pure returns (bytes32) {
-                return sha256(abi.encodePacked(a, b));
+        contract Router {
+            function fwd(address t, bytes calldata a, bytes calldata b) external {
+                t.call(abi.encodeWithSelector(bytes4(0x12345678), abi.encodePacked(a, b)));
             }
         }
     "#;
 
-    // FIRES: a dynamic array adjacent to a string, hashed.
+    // FIRES: a dynamic array adjacent to a string, packed into a selector preimage.
     const VULN_ARRAY: &str = r#"
         pragma solidity ^0.8.20;
         contract Arr {
-            function key(uint256[] memory xs, string memory tag) public pure returns (bytes32) {
-                return keccak256(abi.encodePacked(xs, tag));
+            function fwd(address t, uint256[] memory xs, string memory tag) public {
+                t.call(abi.encodeWithSignature("g(bytes)", abi.encodePacked(xs, tag)));
             }
         }
     "#;
@@ -357,20 +395,20 @@ mod tests {
     const SAFE_ONE_DYNAMIC: &str = r#"
         pragma solidity ^0.8.20;
         contract Ok {
-            function leaf(address user, uint256 amount, string memory note) public pure returns (bytes32) {
-                return keccak256(abi.encodePacked(user, amount, note));
+            function fwd(address t, address user, uint256 amount, string memory note) public {
+                t.call(abi.encodeWithSignature("f(bytes)", abi.encodePacked(user, amount, note)));
             }
         }
     "#;
 
     // SILENT (safe form 2): two dynamic operands SEPARATED by a fixed-width
-    // delimiter (`uint256(i)`). The fixed field pins the boundary, so distinct
+    // delimiter (`uint256 sep`). The fixed field pins the boundary, so distinct
     // inputs cannot collide — the documented mitigation.
     const SAFE_SEPARATED: &str = r#"
         pragma solidity ^0.8.20;
         contract Ok {
-            function id(string memory a, uint256 sep, string memory b) public pure returns (bytes32) {
-                return keccak256(abi.encodePacked(a, sep, b));
+            function fwd(address t, string memory a, uint256 sep, string memory b) public {
+                t.call(abi.encodeWithSignature("f(bytes)", abi.encodePacked(a, sep, b)));
             }
         }
     "#;
@@ -379,15 +417,15 @@ mod tests {
     const SAFE_ALL_FIXED: &str = r#"
         pragma solidity ^0.8.20;
         contract Ok {
-            function id(address a, uint256 b, bytes32 c) public pure returns (bytes32) {
-                return keccak256(abi.encodePacked(a, b, c));
+            function fwd(address t, address a, uint256 b, bytes32 c) public {
+                t.call(abi.encodeWithSignature("f(bytes)", abi.encodePacked(a, b, c)));
             }
         }
     "#;
 
-    // SILENT (safe form 4): two dynamic operands packed but NOT fed to a hash —
-    // out of this detector's hash-id scope.
-    const SAFE_NO_HASH: &str = r#"
+    // SILENT (safe form 4): two dynamic operands packed but NOT fed to a selector
+    // preimage — out of this detector's selector scope (returned bytes).
+    const SAFE_NO_SELECTOR: &str = r#"
         pragma solidity ^0.8.20;
         contract Ok {
             function pack(string memory a, string memory b) public pure returns (bytes memory) {
@@ -403,10 +441,10 @@ mod tests {
     const SAFE_PINNED: &str = r#"
         pragma solidity ^0.8.20;
         contract Deposit {
-            function root(bytes calldata pubkey, bytes calldata sig) external pure returns (bytes32) {
+            function fwd(address t, bytes calldata pubkey, bytes calldata sig) external {
                 require(pubkey.length == 48, "bad pubkey");
                 require(sig.length == 96, "bad sig");
-                return sha256(abi.encodePacked(pubkey, sig));
+                t.call(abi.encodeWithSignature("f(bytes)", abi.encodePacked(pubkey, sig)));
             }
         }
     "#;
@@ -416,8 +454,20 @@ mod tests {
     const SAFE_ENCODE: &str = r#"
         pragma solidity ^0.8.20;
         contract Ok {
+            function fwd(address t, string memory a, string memory b) public {
+                t.call(abi.encodeWithSignature("f(bytes)", abi.encode(a, b)));
+            }
+        }
+    "#;
+
+    // SILENT (sink partition): adjacent dynamic operands packed into a
+    // `keccak256` digest. That is the digest sink owned by `selector-collision`,
+    // so THIS detector must stay silent there (no double-fire on a single line).
+    const KECCAK_DIGEST_NOT_OURS: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Sig {
             function id(string memory a, string memory b) public pure returns (bytes32) {
-                return keccak256(abi.encode(a, b));
+                return keccak256(abi.encodePacked(a, b));
             }
         }
     "#;
@@ -428,8 +478,8 @@ mod tests {
     }
 
     #[test]
-    fn fires_on_two_dynamic_bytes_sha256() {
-        assert!(fired(&run(VULN_BYTES_SHA)));
+    fn fires_on_two_dynamic_bytes_selector() {
+        assert!(fired(&run(VULN_BYTES_SELECTOR)));
     }
 
     #[test]
@@ -455,8 +505,8 @@ mod tests {
     }
 
     #[test]
-    fn silent_when_not_hashed() {
-        assert!(!fired(&run(SAFE_NO_HASH)));
+    fn silent_when_not_in_selector() {
+        assert!(!fired(&run(SAFE_NO_SELECTOR)));
     }
 
     #[test]
@@ -468,6 +518,30 @@ mod tests {
     #[test]
     fn silent_on_abi_encode() {
         assert!(!fired(&run(SAFE_ENCODE)));
+    }
+
+    // De-dup guarantee, half 1: the keccak256 digest shape is owned solely by
+    // `selector-collision`; this detector stays silent on it (so a single
+    // `keccak256(abi.encodePacked(a, b))` line is NOT a Medium+Low pair).
+    #[test]
+    fn silent_on_keccak_digest_owned_by_selector() {
+        let fs = run(KECCAK_DIGEST_NOT_OURS);
+        assert!(!fired(&fs), "encodepacked-collision must not fire on the keccak256 sink: {fs:?}");
+        // sanity: selector-collision DOES own that shape (the detection is not lost).
+        assert!(selector_fired(&fs), "selector-collision should still own the keccak256 shape: {fs:?}");
+    }
+
+    // De-dup guarantee, half 2: the selector-preimage shape is owned solely by
+    // this detector; `selector-collision` stays silent on it. Together with the
+    // half above, a given packed call yields exactly ONE collision finding.
+    #[test]
+    fn disjoint_selector_collision_silent_on_our_sink() {
+        let fs = run(VULN);
+        assert!(fired(&fs), "encodepacked-collision should fire on the selector preimage: {fs:?}");
+        assert!(
+            !selector_fired(&fs),
+            "selector-collision must not also fire on the selector-preimage sink: {fs:?}",
+        );
     }
 
     // The Low-severity lint must score into the Low/Info band, not higher.

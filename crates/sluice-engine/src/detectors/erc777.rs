@@ -37,6 +37,25 @@ const HOOK_BEARING_TOKEN_OPS: &[&str] = &[
     "operatorSend",      // ERC777 operator send
 ];
 
+/// True iff `name` reads like a VALUE / balance / accounting state variable — the
+/// only storage whose post-hook corruption is the actual ERC777-reentrancy payday
+/// (inflate a credited supply, double-count a share, drain a balance). Every
+/// genuine fixture writes such a var after the hook-bearing transfer
+/// (`supplyBalance`, `totalSupply`, `shares`, `balances`). A write to an unrelated
+/// bool/flag/registry/status var is bookkeeping, not value at risk, and is not the
+/// dForce/Lendf.me shape. Mirrors the generic reentrancy detector's value-state
+/// gate so the two agree on what a "vulnerable post-call update" is.
+fn is_value_state_var(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    const VALUE_KEYS: &[&str] = &[
+        "balance", "borrow", "supply", "deposit", "share", "underlying", "reserve",
+        "credit", "collateral", "amount", "stake", "debt", "principal", "asset",
+        "liquidity", "funds", "owed", "escrow", "withdraw", "redeem", "payout",
+        "vault", "token", "reward", "ledger", "accru",
+    ];
+    VALUE_KEYS.iter().any(|k| l.contains(k))
+}
+
 impl Detector for Erc777Detector {
     fn id(&self) -> &'static str {
         "erc777-reentrancy"
@@ -83,15 +102,37 @@ impl Detector for Erc777Detector {
                 None => continue,
             };
 
-            // Suppression: if no storage write follows the token op, the
-            // function already honors checks-effects-interactions — the hook
-            // can re-enter but finds fully-settled state, so there is nothing to
-            // exploit.
-            let write_after = f
+            // CEI-downgrade (mirrors the generic reentrancy detector's
+            // `has_qualifying_post_call_write`). A finding requires a VALUE/balance
+            // write positioned STRICTLY AFTER the hook-bearing transfer that was NOT
+            // already SETTLED (written) before that transfer.
+            //
+            // In a genuine ERC777-reentrancy (Lendf.me `supply`/`withdraw`, Grim
+            // `depositFor`) the credited slot is read before and written ONLY after
+            // the hook (`supplyBalance += amount` with no pre-hook write), so the
+            // hook re-enters while the balance is stale. When the SAME var is also
+            // written BEFORE the transfer, the function settles it before interacting
+            // on every path it actually transfers on; a later (cross-branch) write to
+            // it is the flat-order artifact of a sibling branch, not a stale-state
+            // window. LoopFi `_processLock` credits `totalSupply`/`balances` in its
+            // ETH branch (no call) before the non-ETH branch's `safeTransferFrom`, and
+            // `_claim` zeroes `balances` before its `safeTransfer` — both CEI-correct,
+            // so their post-hook writes are settled-before and must not fire.
+            //
+            // Restricting to VALUE/balance state also drops post-hook writes to
+            // unrelated flags/registries (not the dForce/Lendf.me payday).
+            let settled_before: rustc_hash::FxHashSet<&str> = f
                 .effects
                 .storage_writes
                 .iter()
-                .find(|w| w.order > token_op.order);
+                .filter(|w| w.order < token_op.order)
+                .map(|w| w.var.as_str())
+                .collect();
+            let write_after = f.effects.storage_writes.iter().find(|w| {
+                w.order > token_op.order
+                    && is_value_state_var(&w.var)
+                    && !settled_before.contains(w.var.as_str())
+            });
             let write_after = match write_after {
                 Some(w) => w,
                 None => continue,
@@ -175,6 +216,64 @@ mod tests {
         }
     "#;
 
+    // Lendf.me / dForce shape (the canonical ERC777 reentrancy): the ERC777
+    // `send` fires the recipient's `tokensReceived` hook BEFORE the balance is
+    // debited, and `supplyBalance` is written ONLY after the hook (never settled
+    // before it). This MUST still fire after the CEI-downgrade.
+    const LENDF: &str = r#"
+        interface IERC777 {
+            function send(address to, uint256 amount, bytes calldata data) external;
+            function safeTransferFrom(address from, address to, uint256 amount) external;
+        }
+        contract LendfMePool {
+            IERC777 public token;
+            mapping(address => uint256) public supplyBalance;
+            function supply(uint256 amount) external {
+                token.safeTransferFrom(msg.sender, address(this), amount); // hook -> attacker
+                supplyBalance[msg.sender] += amount;                       // effect, too late
+            }
+            function withdraw(uint256 amount) external {
+                require(supplyBalance[msg.sender] >= amount);
+                token.send(msg.sender, amount, "");  // hook -> attacker re-enters
+                supplyBalance[msg.sender] -= amount; // effect after reentry
+            }
+        }
+    "#;
+
+    // CEI-correct claim with a cross-branch settle (LoopFi `_claim` shape): the
+    // balance slot is SETTLED (written) before the real `safeTransfer` on the path
+    // that transfers, and the other branch's write to the same slot is just the
+    // flat-order artifact of a sibling branch. The CEI-downgrade must keep this
+    // silent even though a `balances` write trails the transfer in source order.
+    const CEI_CLAIM: &str = r#"
+        interface ILpETH {
+            function safeTransfer(address to, uint256 a) external;
+            function deposit(address r) external payable;
+        }
+        contract PrelaunchPoints {
+            mapping(address => mapping(address => uint256)) public balances;
+            uint256 public totalSupply;
+            uint256 public totalLpETH;
+            address public constant ETH = address(0xee);
+            ILpETH public lpETH;
+            function _fillQuote(address t, uint256 a) internal { (bool ok,) = t.call(""); require(ok); }
+            function _claim(address _token, address _receiver) internal returns (uint256 claimedAmount) {
+                uint256 userStake = balances[msg.sender][_token];
+                require(userStake != 0);
+                if (_token == ETH) {
+                    claimedAmount = userStake;
+                    balances[msg.sender][_token] = 0;            // settle BEFORE the transfer
+                    lpETH.safeTransfer(_receiver, claimedAmount); // hook-bearing call, last
+                } else {
+                    balances[msg.sender][_token] = userStake - 1; // settle BEFORE the calls
+                    _fillQuote(_token, 1);
+                    claimedAmount = address(this).balance;
+                    lpETH.deposit{value: claimedAmount}(_receiver);
+                }
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_vuln() {
         let fs = run(VULN);
@@ -185,5 +284,32 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "erc777-reentrancy"));
+    }
+
+    // HARD recall guard: the canonical Lendf.me ERC777 reentrancy (state write
+    // AFTER the hook, never settled before it) must STILL fire after the
+    // CEI-downgrade.
+    #[test]
+    fn fires_on_lendf_state_write_after_hook() {
+        let fs = run(LENDF);
+        assert!(
+            fs.iter().any(|f| f.detector == "erc777-reentrancy"),
+            "Lendf.me-shape (state write after the ERC777 transfer) must still fire: {:?}",
+            fs
+        );
+    }
+
+    // CEI-downgrade regression: a function that settles the balance slot BEFORE the
+    // hook-bearing transfer (the only post-hook write being a cross-branch artifact
+    // on the SAME, already-settled slot) is CEI-correct and must stay silent. Real
+    // site: LoopFi `PrelaunchPoints._claim`.
+    #[test]
+    fn silent_on_cei_settle_before_hook_transfer() {
+        let fs = run(CEI_CLAIM);
+        assert!(
+            !fs.iter().any(|f| f.detector == "erc777-reentrancy"),
+            "CEI-correct claim (balance settled before the hook transfer) must stay silent: {:?}",
+            fs
+        );
     }
 }
