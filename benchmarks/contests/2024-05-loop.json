@@ -5,6 +5,7 @@
   "local_path": "~/Data/bench/2024-05-loop",
   "scope_dirs": ["src"],
   "audit_url": "https://code4rena.com/reports/2024-05-loop",
+  "note": "LoopFi PrelaunchPoints (single contract). The official C4 report has exactly 1 High and 0 Medium; the remaining entries are pinned QA/Low items (used to exercise the MissingZeroCheck / MissingEventEmit detectors). IDs carry H-01 or QA finding numbers.",
   "known_findings": [
     {
       "id": "H-01",
@@ -15,10 +16,10 @@
       "line": 262,
       "bug_class": "value-source-discipline",
       "in_class": false,
-      "summary": "_claim sets claimedAmount = address(this).balance after the swap, so any pre-existing ETH balance (or a second claimer's funds) is credited to one user, over-minting lpETH 1:1 against an inflated balance. Should track the swap's actual output, not the contract balance."
+      "summary": "_claim sets claimedAmount = address(this).balance after the swap, so any pre-existing/donated ETH (or a second claimer's funds) is credited to one user, over-minting lpETH 1:1 against an inflated balance and bypassing the deposit-availability invariant (H-01). Should track the swap's actual output, not the contract balance."
     },
     {
-      "id": "QA-setOwner",
+      "id": "QA-03-setOwner",
       "severity": "Low",
       "contract": "PrelaunchPoints",
       "function": "setOwner",
@@ -26,10 +27,10 @@
       "line": 337,
       "bug_class": "missing-zero-check",
       "in_class": true,
-      "summary": "setOwner assigns owner = _owner with no address(0) check; a zero owner permanently bricks the privileged role."
+      "summary": "setOwner assigns owner = _owner in one step with no address(0) check (QA: critical privileges transferred in one step); a zero owner permanently bricks the privileged role."
     },
     {
-      "id": "QA-setEmergencyMode",
+      "id": "QA-04-setEmergencyMode",
       "severity": "Low",
       "contract": "PrelaunchPoints",
       "function": "setEmergencyMode",
@@ -37,29 +38,18 @@
       "line": 372,
       "bug_class": "missing-event-emit",
       "in_class": true,
-      "summary": "setEmergencyMode flips the emergencyMode flag without emitting an event, so the privileged state change is unobservable off-chain."
+      "summary": "setEmergencyMode flips the emergencyMode flag without emitting an event (QA Finding 04: no event emissions for setEmergencyMode and allowToken), so the privileged state change is unobservable off-chain."
     },
     {
-      "id": "M-lockToken-allowlist",
-      "severity": "Medium",
+      "id": "QA-06-validatedata-zero-recipient",
+      "severity": "Low",
       "contract": "PrelaunchPoints",
-      "function": "_processLock",
+      "function": "_validateData",
       "file": "src/PrelaunchPoints.sol",
-      "line": 172,
-      "bug_class": "logic-allowlist",
-      "in_class": false,
-      "summary": "Token allowlist / lock-token validation logic gap (protocol-specific): locked tokens are not constrained the way the design intends, allowing unsupported tokens to enter the accounting."
-    },
-    {
-      "id": "M-swap-router-data",
-      "severity": "Medium",
-      "contract": "PrelaunchPoints",
-      "function": "_claim",
-      "file": "src/PrelaunchPoints.sol",
-      "line": 256,
+      "line": 439,
       "bug_class": "logic-calldata-validation",
       "in_class": false,
-      "summary": "User-supplied 0x swap calldata is only loosely validated; a crafted _data lets the swap deviate from the intended token/route (protocol-specific exchange-data validation bug, not a modeled sink)."
+      "summary": "_validateData validates the user-supplied 0x swap calldata but its recipient check `recipient != address(this) && recipient != address(0)` accepts address(0) as a valid swap recipient (QA Finding 06), a gap in the exchange-data validation. Protocol-specific calldata-validation logic, not a modeled sink."
     }
   ]
 }

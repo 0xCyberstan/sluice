@@ -164,6 +164,17 @@ pub fn compatible_categories(bug_class: &str) -> &'static [&'static str] {
         // also tags two unrelated Tigris price/margin findings) so this detector
         // cannot spuriously "catch" those.
         "value-source-discipline" => &["ValueSourceDiscipline"],
+        // An obligation (penalty / debt) capped to a *partial* fund source while a
+        // recovery action is expected to make it whole — the recovered value never
+        // folds back, so the shortfall is silently dropped (PHASE B2, the invariant-
+        // engine conservation/accounting class). Mapped to the modeled `Conservation`
+        // detector so the catch scores as recall. Like `value-source-discipline`,
+        // this is orthogonal to the per-finding `in_class` flag — the corpus's two
+        // `accounting-error` findings (Stader M-06 / M-12) stay `in_class: false`, so
+        // catching one moves *out-of-class* recall. `accounting-error` is the precise
+        // label for these two genuine accounting bugs (no other corpus finding uses
+        // it), so this mapping cannot spuriously credit an unrelated class.
+        "accounting-error" => &["Conservation"],
         // ---- out-of-class (protocol-specific): no modeled category ----
         // accounting / economic / logic invariants the pattern set does not model.
         // Listed explicitly (rather than only via the `_` arm) so the corpus's
@@ -171,7 +182,6 @@ pub fn compatible_categories(bug_class: &str) -> &'static [&'static str] {
         // through silently.
         "accounting-invariant"
         | "accounting-logic"
-        | "accounting-error"
         | "accounting-state-advance"
         | "economic-invariant"
         | "economic-reward-accounting"

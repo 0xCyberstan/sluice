@@ -8,14 +8,15 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 
 | Contest | In-class recall | Out-of-class recall | Crit/High | Unmatched C/H | Total findings |
 |---|---|---|---|---|---|
-| `2022-12-tigris` | 100% (5/5) | 0% (0/3) | 3 | 3 | 155 |
+| `2022-12-tigris` | 100% (4/4) | 0% (0/2) | 3 | 3 | 155 |
 | `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 86 |
-| `2023-04-caviar` | 67% (2/3) | 0% (0/3) | 0 | 0 | 41 |
+| `2023-03-asymmetry` | 0% (0/5) | 0% (0/4) | 1 | 1 | 18 |
+| `2023-04-caviar` | 100% (1/1) | 0% (0/4) | 0 | 0 | 41 |
 | `2023-04-frankencoin` | 88% (7/8) | 0% (0/13) | 2 | 1 | 66 |
-| `2023-06-stader` | 50% (2/4) | 0% (0/11) | 3 | 2 | 29 |
-| `2023-07-basin` | 100% (3/3) | 0% (0/2) | 0 | 0 | 42 |
-| `2024-05-loop` | 100% (2/2) | 33% (1/3) | 1 | 0 | 4 |
-| **AGGREGATE** | **83% (25/30)** | **3% (1/37)** | **22** | **17** | **423** |
+| `2023-06-stader` | 67% (2/3) | 8% (1/12) | 3 | 2 | 30 |
+| `2023-07-basin` | 67% (2/3) | 0% (0/2) | 0 | 0 | 42 |
+| `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 4 |
+| **AGGREGATE** | **71% (22/31)** | **5% (2/41)** | **23** | **18** | **442** |
 
 ## Per-finding detail
 
@@ -25,14 +26,12 @@ Repo `code-423n4/2022-12-tigris` @ `a2896b60eec8815409d946580ce0ce0392851f00`.
 
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
-| H-verifyprice-chainlink-staleness | High | `oracle-staleness` | yes | ✅ caught | OracleStaleness @ tradinglibrary.sol:91 | verifyPrice uses Chainlink latestAnswer() only as a ±2% sanity band and never checks updatedAt/round freshness, so a stale Chainlink price (or a node price wit… |
-| H-bridgemint-public | High | `access-control` | yes | ✅ caught | Centralization @ govnft.sol:64 | _bridgeMint is declared public with no access control, so anyone can mint GovNFTs directly instead of only the LayerZero receive path, inflating governance/rew… |
-| H-verifyprice-sig-replay | High | `signature-replay` | yes | ✅ caught | SignatureReplay @ tradinglibrary.sol:91 | The node-signed PriceData (recovered via ECDSA) has no nonce or single-use binding; within the _validSignatureTimer window the same signature can be replayed a… |
-| H-addtoposition-price-manip | High | `accounting-invariant` | no | 🟡 near (class mismatch) | — | addToPosition recomputes the entry price as a margin-weighted average of the old position price and the new verified price; this protocol-specific averaging ca… |
-| H-handleopenfees-referral | High | `economic-fee-accounting` | no | ❌ missed | — | Open-fee / referral-fee accounting in _handleOpenFees can be manipulated (self-referral, fee-multiplier interactions) to reduce or redirect fees — a protocol-s… |
-| M-stablevault-decimals | Medium | `decimals-assumption` | yes | ✅ caught | DecimalsAssumption @ stablevault.sol:49 | deposit/withdraw scale by 10**(18 - token.decimals()); a margin token with more than 18 decimals underflows the exponent (and the assumption breaks for non-18-… |
-| M-checkdelay-blocknumber | Medium | `block-number-as-time` | yes | ✅ caught | BlockNumberTime @ trading.sol:861 | _checkDelay enforces the anti-front-run open/close delay using block.number + blockDelay; block production rate is chain-dependent and irregular (L2 sequencer)… |
-| M-removemargin-liqprice | Medium | `accounting-invariant` | no | 🟡 near (class mismatch) | — | removeMargin lets a trader withdraw margin and shift the liquidation price adversely relative to the protocol's solvency intent — a protocol-specific margin/li… |
+| H-03-pnl-overflow | High | `integer-overflow` | yes | ✅ caught | UncheckedMath @ tradinglibrary.sol:36 | pnl() runs entirely inside an unchecked block; with a user-controlled take-profit/current price the expression (1e18 * _currentPrice / _price - 1e18) and _init… |
+| H-06-addtoposition-price | High | `accounting-invariant` | no | 🟡 near (class mismatch) | — | addToPosition computes the blended entry price as _trade.price*_trade.margin/_newMargin + _price*_addMargin/_newMargin (a margin-weighted arithmetic average) i… |
+| M-11-handleopenfees-referral | Medium | `economic-fee-accounting` | no | ❌ missed | — | _handleOpenFees returns an incorrect _feePaid when a referral is set (the referral discount/credit is mis-accounted), so the margin actually deposited diverges… |
+| M-19-stablevault-decimals | Medium | `decimals-assumption` | yes | ✅ caught | DecimalsAssumption @ stablevault.sol:49 | deposit/withdraw scale the amount by 10**(18 - token.decimals()); a margin token with more than 18 decimals underflows the exponent (and the 18-decimal assumpt… |
+| M-15-checkdelay-blocknumber | Medium | `block-number-as-time` | yes | ✅ caught | BlockNumberTime @ trading.sol:861 | _checkDelay enforces the anti-front-run open/close delay using block.number + blockDelay; on Arbitrum/Optimism block.number reflects the L1 block, not the L2 b… |
+| M-24-verifyprice-staleness | Medium | `oracle-staleness` | yes | ✅ caught | OracleStaleness @ tradinglibrary.sol:91 | verifyPrice reads the Chainlink feed via latestAnswer() and uses it only as a +/-2% sanity band, never checking updatedAt/answeredInRound freshness, so a stale… |
 
 ### `2023-01-reserve`
 
@@ -45,8 +44,24 @@ Repo `code-423n4/2023-01-reserve` @ `5e89ca44a917c9bd0277d58849c3edbc6181ff9d`.
 | M-02 | Medium | `share-inflation` | yes | 🟡 near (class mismatch) | — | The RSR:stRSR exchange rate can be inflated by a first/early staker (donation / rounding) so later stakers receive fewer shares than fair value — an ERC4626-st… |
 | M-14 | Medium | `signed-cast` | yes | ✅ caught | SignedCast @ ctokenfiatcollateral.sol:46 | int8(referenceERC20Decimals) (and the analogous -int8(erc20Decimals) in Asset.bal) casts a uint8 decimals value to int8; a token with >127 decimals wraps negat… |
 | M-18 | Medium | `cached-domain-separator` | yes | ✅ caught | CachedDomainSeparator @ strsr.sol:803 | StRSR caches the EIP-2612 domain separator at init but setName/setSymbol change the token name without recomputing it, so the cached DOMAIN_SEPARATOR no longer… |
-| M-economic-rewards | Medium | `economic-reward-accounting` | no | 🟡 near (class mismatch) | — | Protocol-specific RSR-seizure / reward-distribution accounting edge (rounding of the seized amount across the era can leave dust or mis-split rewards) — an eco… |
-| M-economic-melt | Medium | `economic-invariant` | no | 🟡 near (class mismatch) | — | Furnace melt-rate / period accounting (protocol-specific): the RToken melt schedule can be gamed across period boundaries to alter the realized melt, an econom… |
+| M-23 | Medium | `economic-reward-accounting` | no | 🟡 near (class mismatch) | — | seizeRSR fails to update rsrRewardsAtLastPayout after seizing RSR, so the next payout computes rewards off a stale base and mis-distributes RSR rewards across … |
+| M-15 | Medium | `frontrunning-ordering` | no | 🟡 near (class mismatch) | — | Furnace.melt() pays out RToken.balanceOf(this) on a public refresher with no protection, so it can be sandwiched: an attacker mints/issues right before melt() … |
+
+### `2023-03-asymmetry`
+
+Repo `code-423n4/2023-03-asymmetry` @ `1fa78d2116405a9e186bafabd24080c52bc32875`.
+
+| Known | Sev | Class | In-class | Result | Matched by | Summary |
+|---|---|---|---|---|---|---|
+| H-01 | High | `first-depositor` | yes | 🟡 near (class mismatch) | — | stake() derives preDepositPrice = 10**18 * underlyingValue / totalSupply from live derivative balances; an early/sole staker can unstake down to a tiny supply … |
+| H-03 | High | `dos-on-revert` | no | 🟡 near (class mismatch) | — | unstake() loops every derivative and calls derivatives[i].withdraw(); there is no way to remove a broken/untrusted derivative, so if one withdraw reverts (e.g.… |
+| H-04 | High | `accounting-logic` | no | ❌ missed | — | SfrxEth.ethPerDerivative returns (10**18 * frxAmount) / price_oracle() — the price_oracle multiplication is inverted (should be frxAmount * price_oracle / 10**… |
+| H-05 | High | `integer-overflow` | yes | ❌ missed | — | Reth.poolPrice computes (sqrtPriceX96 * sqrtPriceX96 * 1e18) >> 192 with no overflow guard (unlike Uniswap's OracleLibrary); for large sqrtPriceX96 the multipl… |
+| H-06 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | WstEth.withdraw computes minOut = stEthBal * (1e18 - maxSlippage) / 1e18, implicitly assuming 1 stETH = 1 ETH; during a stETH de-peg the Curve exchange returns… |
+| M-04 | Medium | `missing-deadline` | yes | 🟡 near (class mismatch) | — | Reth.deposit performs a Uniswap V3 swapExactInputSingleHop with no deadline parameter, so a pending stake transaction can be held by validators and executed la… |
+| M-06 | Medium | `dos-on-revert` | no | 🟡 near (class mismatch) | — | unstake() sends the withdrawn ETH with a single address(msg.sender).call{value:...} and requires success; a contract caller whose receive reverts (or a push-pa… |
+| M-08 | Medium | `unbounded-loop` | yes | 🟡 near (class mismatch) | — | unstake() loops over all derivatives (for i < derivativeCount), each doing external balance/withdraw calls; as derivativeCount grows the loop can exceed the bl… |
+| M-12 | Medium | `slippage` | yes | 🟡 near (class mismatch) | — | stake() accepts no user-supplied minimum-output (min safETH) parameter; the per-derivative deposits swap on AMMs and the final mintAmount has no slippage bound… |
 
 ### `2023-04-caviar`
 
@@ -54,12 +69,11 @@ Repo `code-423n4/2023-04-caviar` @ `5c87f7d69c6fac29eb253b5c7b2fb4a9f23f8750`.
 
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
-| H-royalty-per-item | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | buy()/sell() compute the royalty using a single per-item sale price (salePrice = netAmount / tokenIds.length) even when NFTs have different weights, so royalti… |
-| H-flashloan-fee | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | flashLoan pulls the ERC20 fee from msg.sender after the callback and only checks msg.value for the ETH case; the flashloaned NFT is removed from the pool's eff… |
-| M-execute-arbitrary-call | Medium | `access-control` | yes | ✅ caught | Centralization @ privatepool.sol:459 | execute() lets the owner make an arbitrary target.call{value:msg.value}(data); the owner can approve/transfer NFTs or tokens held by the pool (including users'… |
-| M-setvirtualreserves-reprice | Medium | `centralization` | yes | ❌ missed | — | setVirtualReserves lets the pool owner reprice the AMM at will with no bound or timelock, so the owner can front-run a pending buy/sell to extract value — an o… |
-| M-missing-deadline | Medium | `missing-deadline` | yes | ✅ caught | MissingDeadline @ privatepool.sol:385 | PrivatePool.buy/sell/change accept no deadline parameter (only the EthRouter wrappers do); a transaction can sit in the mempool and execute later at a stale pr… |
-| M-ethrouter-royalty-recipient | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | EthRouter royalty payment trusts the royalty recipient/amount returned for each NFT; a malicious NFT/registry can direct or inflate the royalty leg of a sell, … |
+| H-01-royalty-drain | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | buy() computes royalties in a first loop, then refunds excess ETH to msg.sender via safeTransferETH, then re-reads _getRoyalty in a second loop to pay them. Th… |
+| H-02-execute-arbitrary | High | `access-control` | yes | ✅ caught | Centralization @ privatepool.sol:459 | execute() lets the owner make an arbitrary target.call{value:msg.value}(data); the owner can approve/transfer NFTs or tokens held by the pool (including users'… |
+| M-08-royalty-per-item | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | buy()/sell() compute royalties using a single per-item sale price (salePrice = netAmount / tokenIds.length) even when NFTs carry different weights, so royaltie… |
+| M-16-flashloan-fee | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | flashLoan's fee handling is inconsistent: flashFee() returns an unscaled value (unlike changeFeeQuote) and the fee is pulled from the wrong address / not route… |
+| M-14-ethrouter-royalty-recipient | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | EthRouter.sell pays each NFT's royalty via royaltyRecipient.safeTransferETH using the recipient/amount returned per NFT; a non-payable or reverting royalty rec… |
 
 ### `2023-04-frankencoin`
 
@@ -106,8 +120,8 @@ Repo `code-423n4/2023-06-stader` @ `86c27eb6b1fb6e0928aaa906614a2d1c6e7543e3`.
 | M-08 | Medium | `oracle-data-corruption` | no | ❌ missed | — | SD price median is built from submissions across different reporting blocks, corrupting the aggregated value (protocol-specific oracle aggregation logic). |
 | M-09 | Medium | `accounting-state-advance` | no | 🟡 near (class mismatch) | — | poolIdArrayIndexForExcessDeposit / lastExcessETHDepositBlock advance even when balance is insufficient, letting deposits be mis-routed. |
 | M-10 | Medium | `logic-zero-owner` | no | 🟡 near (class mismatch) | — | initialise sets owner = staderConfig.getAdmin(); if the admin mapping is unset, owner becomes address(0) (protocol-specific init dependency, distinct from the … |
-| M-11 | Medium | `access-control` | yes | ❌ missed | — | distributeRewards is permissionless and can be front-run to push a validator's balance below threshold, making it slashable. |
-| M-12 | Medium | `accounting-error` | no | ❌ missed | — | settleFunds ignores the NodeELRewardVault balance when computing penalty coverage, over-charging the operator. |
+| M-11 | Medium | `frontrunning-deleverage` | no | ❌ missed | — | distributeRewards has only a partial guard (a non-operator may call it whenever totalRewards <= rewardsThreshold); calling it before settleFunds manipulates th… |
+| M-12 | Medium | `accounting-error` | no | ✅ caught | Conservation @ validatorwithdrawalvault.sol:68 | settleFunds ignores the NodeELRewardVault balance when computing penalty coverage, over-charging the operator. |
 | M-13 | Medium | `design-fixed-endblock` | no | ❌ missed | — | Fixed endBlock with no extension gives no incentive to bid early; only last-block MEV bids. |
 | M-14 | Medium | `oracle-staleness` | yes | ✅ caught | OracleStaleness @ staderoracle.sol:637 | getPORFeedData uses latestRoundData() and discards updatedAt/answeredInRound, accepting stale/incorrect Proof-of-Reserve data. |
 
@@ -117,11 +131,11 @@ Repo `code-423n4/2023-07-basin` @ `73f7133b380ea027048f0b9aaa284b14f3ce43b4`.
 
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
-| H-storeuint128-odd-slot | High | `accounting-logic` | no | ❌ missed | — | storeUint128's odd-reserve branch re-reads the target slot's high 128 bits (shr(128, sload(...))) and re-packs them; with certain reserve counts/layouts this c… |
-| M-pump-twap-manip | Medium | `oracle-manipulation` | yes | ✅ caught | TwapManipulation @ multiflowpump.sol:171 | The MultiFlow geometric-mean pump derives reserves consumers use as an oracle; a single large swap right before reading (and the first/seeded update) can move … |
-| M-pump-update-timestamp | Medium | `timestamp-dependence` | yes | ✅ caught | TimestampDependence @ multiflowpump.sol:121 | update() drives the EMA/cumulative reserves off block.timestamp deltas cast to uint40; the weighting depends on the exact timing of updates, so a party control… |
-| M-calcreserve-rounding | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ constantproduct2.sol:53 | calcReserve recovers a reserve via an integer square root; the rounding direction of the sqrt/division can round in favor of the swapper rather than the pool, … |
-| M-pump-init-seeding | Medium | `accounting-logic` | no | ❌ missed | — | The pump's first update (_init) seeds lastReserves from whatever the well reserves are at that block; an attacker can set the initial cumulative/last reserves … |
+| H-01 | High | `oracle-manipulation` | yes | ❌ missed | — | Well.sync() (and shift()) call _setReserves directly without first pushing the previous-block reserves into the attached pump (unlike swapFrom), so the pump's … |
+| M-02 | Medium | `accounting-logic` | no | ❌ missed | — | storeUint128's odd-reserve branch re-reads the target slot's high 128 bits via shl(128, shr(128, sload(...))) and re-packs them; the slot/bit arithmetic mis-pr… |
+| M-01 | Medium | `accounting-logic` | no | ❌ missed | — | getBytes32FromBytes bounds-checks with `index > data.length` instead of `>=`, allowing an out-of-bounds memory read of the last word, which can return corrupte… |
+| M-06 | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ constantproduct2.sol:53 | calcLpTokenSupply computes the LP supply as sqrt(reserves[0]*reserves[1]*EXP_PRECISION); the integer sqrt loses precision asymmetrically versus the division us… |
+| M-08 | Medium | `block-number-as-time` | yes | ✅ caught | TimestampDependence @ multiflowpump.sol:121 | The pump treats the immutable BLOCK_TIME as a permanent constant (blocksPassed = deltaTimestamp / BLOCK_TIME in _capReserve), so if average block time changes … |
 
 ### `2024-05-loop`
 
@@ -129,9 +143,8 @@ Repo `code-423n4/2024-05-loop` @ `20d9013a93a1ba98154198d6cf3c63f73ab95658`.
 
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
-| H-01 | High | `value-source-discipline` | no | ✅ caught | ValueSourceDiscipline @ prelaunchpoints.sol:262 | _claim sets claimedAmount = address(this).balance after the swap, so any pre-existing ETH balance (or a second claimer's funds) is credited to one user, over-m… |
-| QA-setOwner | Low | `missing-zero-check` | yes | ✅ caught | MissingZeroCheck @ prelaunchpoints.sol:337 | setOwner assigns owner = _owner with no address(0) check; a zero owner permanently bricks the privileged role. |
-| QA-setEmergencyMode | Low | `missing-event-emit` | yes | ✅ caught | MissingEventEmit @ prelaunchpoints.sol:372 | setEmergencyMode flips the emergencyMode flag without emitting an event, so the privileged state change is unobservable off-chain. |
-| M-lockToken-allowlist | Medium | `logic-allowlist` | no | ❌ missed | — | Token allowlist / lock-token validation logic gap (protocol-specific): locked tokens are not constrained the way the design intends, allowing unsupported token… |
-| M-swap-router-data | Medium | `logic-calldata-validation` | no | 🟡 near (class mismatch) | — | User-supplied 0x swap calldata is only loosely validated; a crafted _data lets the swap deviate from the intended token/route (protocol-specific exchange-data … |
+| H-01 | High | `value-source-discipline` | no | ✅ caught | ValueSourceDiscipline @ prelaunchpoints.sol:262 | _claim sets claimedAmount = address(this).balance after the swap, so any pre-existing/donated ETH (or a second claimer's funds) is credited to one user, over-m… |
+| QA-03-setOwner | Low | `missing-zero-check` | yes | ✅ caught | MissingZeroCheck @ prelaunchpoints.sol:337 | setOwner assigns owner = _owner in one step with no address(0) check (QA: critical privileges transferred in one step); a zero owner permanently bricks the pri… |
+| QA-04-setEmergencyMode | Low | `missing-event-emit` | yes | ✅ caught | MissingEventEmit @ prelaunchpoints.sol:372 | setEmergencyMode flips the emergencyMode flag without emitting an event (QA Finding 04: no event emissions for setEmergencyMode and allowToken), so the privile… |
+| QA-06-validatedata-zero-recipient | Low | `logic-calldata-validation` | no | ❌ missed | — | _validateData validates the user-supplied 0x swap calldata but its recipient check `recipient != address(this) && recipient != address(0)` accepts address(0) a… |
 

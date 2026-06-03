@@ -63,7 +63,7 @@
       "summary": "StRSR caches the EIP-2612 domain separator at init but setName/setSymbol change the token name without recomputing it, so the cached DOMAIN_SEPARATOR no longer matches the current name and permit signatures break (or remain bound to the stale name)."
     },
     {
-      "id": "M-economic-rewards",
+      "id": "M-23",
       "severity": "Medium",
       "contract": "StRSR",
       "function": "seizeRSR",
@@ -71,18 +71,18 @@
       "line": 374,
       "bug_class": "economic-reward-accounting",
       "in_class": false,
-      "summary": "Protocol-specific RSR-seizure / reward-distribution accounting edge (rounding of the seized amount across the era can leave dust or mis-split rewards) — an economic invariant, not a modeled detector class."
+      "summary": "seizeRSR fails to update rsrRewardsAtLastPayout after seizing RSR, so the next payout computes rewards off a stale base and mis-distributes RSR rewards across stakers (M-23). Protocol-specific reward-accounting invariant, not a modeled detector class."
     },
     {
-      "id": "M-economic-melt",
+      "id": "M-15",
       "severity": "Medium",
       "contract": "Furnace",
       "function": "melt",
       "file": "protocol/contracts/p1/Furnace.sol",
       "line": 70,
-      "bug_class": "economic-invariant",
+      "bug_class": "frontrunning-ordering",
       "in_class": false,
-      "summary": "Furnace melt-rate / period accounting (protocol-specific): the RToken melt schedule can be gamed across period boundaries to alter the realized melt, an economic invariant outside the modeled detector classes."
+      "summary": "Furnace.melt() pays out RToken.balanceOf(this) on a public refresher with no protection, so it can be sandwiched: an attacker mints/issues right before melt() to capture a disproportionate share of the melt payout (M-15). Protocol-specific MEV/ordering issue, not a modeled detector class."
     }
   ]
 }

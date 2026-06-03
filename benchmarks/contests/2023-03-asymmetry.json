@@ -1,0 +1,110 @@
+{
+  "name": "2023-03-asymmetry",
+  "repo": "code-423n4/2023-03-asymmetry",
+  "commit": "1fa78d2116405a9e186bafabd24080c52bc32875",
+  "local_path": "~/Data/bench/2023-03-asymmetry",
+  "scope_dirs": ["contracts/SafEth"],
+  "audit_url": "https://code4rena.com/reports/2023-03-asymmetry",
+  "note": "Asymmetry safETH liquid staking (SafEth.sol + Reth/SfrxEth/WstEth derivatives). In scope: contracts/SafEth (4 contracts). A conservative, high-confidence subset of the official C4 report (8 High / 12 Medium), each pinned to a verified source line. IDs carry the report's H-/M- number.",
+  "known_findings": [
+    {
+      "id": "H-01",
+      "severity": "High",
+      "contract": "SafEth",
+      "function": "stake",
+      "file": "contracts/SafEth/SafEth.sol",
+      "line": 81,
+      "bug_class": "first-depositor",
+      "in_class": true,
+      "summary": "stake() derives preDepositPrice = 10**18 * underlyingValue / totalSupply from live derivative balances; an early/sole staker can unstake down to a tiny supply and donate derivative tokens to inflate underlyingValue, so the next depositor's mintAmount rounds to near-zero shares (first-depositor / share-price inflation, H-01)."
+    },
+    {
+      "id": "H-03",
+      "severity": "High",
+      "contract": "SafEth",
+      "function": "unstake",
+      "file": "contracts/SafEth/SafEth.sol",
+      "line": 118,
+      "bug_class": "dos-on-revert",
+      "in_class": false,
+      "summary": "unstake() loops every derivative and calls derivatives[i].withdraw(); there is no way to remove a broken/untrusted derivative, so if one withdraw reverts (e.g. WstEth's Curve pool killed) the whole unstake reverts and all users' ETH is locked (H-03). Protocol-specific DoS-on-revert, no modeled detector."
+    },
+    {
+      "id": "H-04",
+      "severity": "High",
+      "contract": "SfrxEth",
+      "function": "ethPerDerivative",
+      "file": "contracts/SafEth/derivatives/SfrxEth.sol",
+      "line": 115,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "SfrxEth.ethPerDerivative returns (10**18 * frxAmount) / price_oracle() — the price_oracle multiplication is inverted (should be frxAmount * price_oracle / 10**18), so the sfrxETH derivative is valued incorrectly, mispricing stake/unstake (H-04). Protocol-specific price-formula bug, no modeled detector."
+    },
+    {
+      "id": "H-05",
+      "severity": "High",
+      "contract": "Reth",
+      "function": "poolPrice",
+      "file": "contracts/SafEth/derivatives/Reth.sol",
+      "line": 241,
+      "bug_class": "integer-overflow",
+      "in_class": true,
+      "summary": "Reth.poolPrice computes (sqrtPriceX96 * sqrtPriceX96 * 1e18) >> 192 with no overflow guard (unlike Uniswap's OracleLibrary); for large sqrtPriceX96 the multiplication overflows and reverts under 0.8.x checked math, bricking the price path and thus stake/unstake (H-05)."
+    },
+    {
+      "id": "H-06",
+      "severity": "High",
+      "contract": "WstEth",
+      "function": "withdraw",
+      "file": "contracts/SafEth/derivatives/WstEth.sol",
+      "line": 60,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "WstEth.withdraw computes minOut = stEthBal * (1e18 - maxSlippage) / 1e18, implicitly assuming 1 stETH = 1 ETH; during a stETH de-peg the Curve exchange returns less than minOut and reverts, blocking withdrawals (H-06). Protocol-specific peg assumption, no modeled detector."
+    },
+    {
+      "id": "M-04",
+      "severity": "Medium",
+      "contract": "Reth",
+      "function": "deposit",
+      "file": "contracts/SafEth/derivatives/Reth.sol",
+      "line": 156,
+      "bug_class": "missing-deadline",
+      "in_class": true,
+      "summary": "Reth.deposit performs a Uniswap V3 swapExactInputSingleHop with no deadline parameter, so a pending stake transaction can be held by validators and executed later at an unfavorable rate (M-04)."
+    },
+    {
+      "id": "M-06",
+      "severity": "Medium",
+      "contract": "SafEth",
+      "function": "unstake",
+      "file": "contracts/SafEth/SafEth.sol",
+      "line": 124,
+      "bug_class": "dos-on-revert",
+      "in_class": false,
+      "summary": "unstake() sends the withdrawn ETH with a single address(msg.sender).call{value:...} and requires success; a contract caller whose receive reverts (or a push-payment failure) blocks the withdrawal even though every derivative withdraw succeeded (M-06). Protocol-specific DoS-on-revert, no modeled detector."
+    },
+    {
+      "id": "M-08",
+      "severity": "Medium",
+      "contract": "SafEth",
+      "function": "unstake",
+      "file": "contracts/SafEth/SafEth.sol",
+      "line": 113,
+      "bug_class": "unbounded-loop",
+      "in_class": true,
+      "summary": "unstake() loops over all derivatives (for i < derivativeCount), each doing external balance/withdraw calls; as derivativeCount grows the loop can exceed the block gas limit and make unstake permanently revert (M-08)."
+    },
+    {
+      "id": "M-12",
+      "severity": "Medium",
+      "contract": "SafEth",
+      "function": "stake",
+      "file": "contracts/SafEth/SafEth.sol",
+      "line": 63,
+      "bug_class": "slippage",
+      "in_class": true,
+      "summary": "stake() accepts no user-supplied minimum-output (min safETH) parameter; the per-derivative deposits swap on AMMs and the final mintAmount has no slippage bound, so a user can be sandwiched and minted fewer shares than expected (M-12)."
+    }
+  ]
+}

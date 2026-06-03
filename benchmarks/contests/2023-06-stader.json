@@ -135,9 +135,9 @@
       "function": "distributeRewards",
       "file": "contracts/ValidatorWithdrawalVault.sol",
       "line": 30,
-      "bug_class": "access-control",
-      "in_class": true,
-      "summary": "distributeRewards is permissionless and can be front-run to push a validator's balance below threshold, making it slashable."
+      "bug_class": "frontrunning-deleverage",
+      "in_class": false,
+      "summary": "distributeRewards has only a partial guard (a non-operator may call it whenever totalRewards <= rewardsThreshold); calling it before settleFunds manipulates the vault balance to push a validator below threshold and make it slashable (M-11). A front-runnable griefing bug, not a clean missing-access-control sink."
     },
     {
       "id": "M-12",

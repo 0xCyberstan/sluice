@@ -172,6 +172,8 @@ pub mod oi_cap_checked_before_fill_callout;
 pub mod mark_vs_index_price_inconsistency;
 // PHASE B1 — invariant engine: value-source discipline (LoopFi H-01 class).
 pub mod value_source_discipline;
+// PHASE B2 — invariant engine: conservation / accounting-invariant (Stader M-12 class).
+pub mod conservation;
 
 use crate::detector::Detector;
 
@@ -354,6 +356,8 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(mark_vs_index_price_inconsistency::MarkVsIndexPriceInconsistencyDetector),
         // PHASE B1 — invariant engine: value-source discipline (LoopFi H-01 class).
         Box::new(value_source_discipline::ValueSourceDisciplineDetector),
+        // PHASE B2 — invariant engine: conservation / accounting-invariant (Stader M-12 class).
+        Box::new(conservation::ConservationDetector),
     ]
 }
 

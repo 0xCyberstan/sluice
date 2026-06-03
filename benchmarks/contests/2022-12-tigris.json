@@ -5,43 +5,21 @@
   "local_path": "~/Data/bench/2022-12-tigris",
   "scope_dirs": ["contracts"],
   "audit_url": "https://code4rena.com/reports/2022-12-tigris",
-  "note": "Representative High/Medium set re-derived from the published report and grounded to the clone's source lines. Function names match the source (e.g. _bridgeMint, _checkDelay, verifyPrice).",
+  "note": "Findings verified against the official C4 report (11 High / 24 Medium) and grounded to the clone's source lines. IDs carry the report's H-/M- number. The matcher keys primarily on (contract, function); line is documented to the actual bug site.",
   "known_findings": [
     {
-      "id": "H-verifyprice-chainlink-staleness",
+      "id": "H-03-pnl-overflow",
       "severity": "High",
       "contract": "TradingLibrary",
-      "function": "verifyPrice",
+      "function": "pnl",
       "file": "contracts/utils/TradingLibrary.sol",
-      "line": 112,
-      "bug_class": "oracle-staleness",
+      "line": 46,
+      "bug_class": "integer-overflow",
       "in_class": true,
-      "summary": "verifyPrice uses Chainlink latestAnswer() only as a ±2% sanity band and never checks updatedAt/round freshness, so a stale Chainlink price (or a node price within 2% of a stale value) is accepted as a valid mark price."
+      "summary": "pnl() runs entirely inside an unchecked block; with a user-controlled take-profit/current price the expression (1e18 * _currentPrice / _price - 1e18) and _initPositionSize multiplication can overflow, producing an astronomically large _positionSize and letting a trader mint enough tigAsset to drain vaults (H-03)."
     },
     {
-      "id": "H-bridgemint-public",
-      "severity": "High",
-      "contract": "GovNFT",
-      "function": "_bridgeMint",
-      "file": "contracts/GovNFT.sol",
-      "line": 64,
-      "bug_class": "access-control",
-      "in_class": true,
-      "summary": "_bridgeMint is declared public with no access control, so anyone can mint GovNFTs directly instead of only the LayerZero receive path, inflating governance/reward NFT supply."
-    },
-    {
-      "id": "H-verifyprice-sig-replay",
-      "severity": "High",
-      "contract": "TradingLibrary",
-      "function": "verifyPrice",
-      "file": "contracts/utils/TradingLibrary.sol",
-      "line": 102,
-      "bug_class": "signature-replay",
-      "in_class": true,
-      "summary": "The node-signed PriceData (recovered via ECDSA) has no nonce or single-use binding; within the _validSignatureTimer window the same signature can be replayed across multiple orders/positions to pin a favorable price."
-    },
-    {
-      "id": "H-addtoposition-price-manip",
+      "id": "H-06-addtoposition-price",
       "severity": "High",
       "contract": "Trading",
       "function": "addToPosition",
@@ -49,21 +27,21 @@
       "line": 295,
       "bug_class": "accounting-invariant",
       "in_class": false,
-      "summary": "addToPosition recomputes the entry price as a margin-weighted average of the old position price and the new verified price; this protocol-specific averaging can be gamed to manipulate the effective entry/liquidation price (economic invariant, not a modeled sink)."
+      "summary": "addToPosition computes the blended entry price as _trade.price*_trade.margin/_newMargin + _price*_addMargin/_newMargin (a margin-weighted arithmetic average) instead of the correct harmonic combination, mispricing the merged position and miscalculating payout (H-06). Protocol-specific price-averaging invariant, not a modeled sink."
     },
     {
-      "id": "H-handleopenfees-referral",
-      "severity": "High",
+      "id": "M-11-handleopenfees-referral",
+      "severity": "Medium",
       "contract": "Trading",
       "function": "_handleOpenFees",
       "file": "contracts/Trading.sol",
       "line": 689,
       "bug_class": "economic-fee-accounting",
       "in_class": false,
-      "summary": "Open-fee / referral-fee accounting in _handleOpenFees can be manipulated (self-referral, fee-multiplier interactions) to reduce or redirect fees — a protocol-specific economic accounting bug."
+      "summary": "_handleOpenFees returns an incorrect _feePaid when a referral is set (the referral discount/credit is mis-accounted), so the margin actually deposited diverges from intent and a user can open with more effective margin than paid for (M-11/M-20). Protocol-specific fee accounting, not a modeled sink."
     },
     {
-      "id": "M-stablevault-decimals",
+      "id": "M-19-stablevault-decimals",
       "severity": "Medium",
       "contract": "StableVault",
       "function": "deposit",
@@ -71,29 +49,29 @@
       "line": 49,
       "bug_class": "decimals-assumption",
       "in_class": true,
-      "summary": "deposit/withdraw scale by 10**(18 - token.decimals()); a margin token with more than 18 decimals underflows the exponent (and the assumption breaks for non-18-decimal tokens), corrupting the tigAsset mint/redeem amount."
+      "summary": "deposit/withdraw scale the amount by 10**(18 - token.decimals()); a margin token with more than 18 decimals underflows the exponent (and the 18-decimal assumption breaks for other non-18 tokens), corrupting the tigAsset mint/redeem amount (M-19)."
     },
     {
-      "id": "M-checkdelay-blocknumber",
+      "id": "M-15-checkdelay-blocknumber",
       "severity": "Medium",
       "contract": "Trading",
       "function": "_checkDelay",
       "file": "contracts/Trading.sol",
-      "line": 861,
+      "line": 857,
       "bug_class": "block-number-as-time",
       "in_class": true,
-      "summary": "_checkDelay enforces the anti-front-run open/close delay using block.number + blockDelay; block production rate is chain-dependent and irregular (L2 sequencer), so the intended time delay is not enforced as designed."
+      "summary": "_checkDelay enforces the anti-front-run open/close delay using block.number + blockDelay; on Arbitrum/Optimism block.number reflects the L1 block, not the L2 block, so the intended per-second delay is not enforced as designed (M-15)."
     },
     {
-      "id": "M-removemargin-liqprice",
+      "id": "M-24-verifyprice-staleness",
       "severity": "Medium",
-      "contract": "Trading",
-      "function": "removeMargin",
-      "file": "contracts/Trading.sol",
-      "line": 413,
-      "bug_class": "accounting-invariant",
-      "in_class": false,
-      "summary": "removeMargin lets a trader withdraw margin and shift the liquidation price adversely relative to the protocol's solvency intent — a protocol-specific margin/liquidation accounting invariant, not a modeled detector class."
+      "contract": "TradingLibrary",
+      "function": "verifyPrice",
+      "file": "contracts/utils/TradingLibrary.sol",
+      "line": 113,
+      "bug_class": "oracle-staleness",
+      "in_class": true,
+      "summary": "verifyPrice reads the Chainlink feed via latestAnswer() and uses it only as a +/-2% sanity band, never checking updatedAt/answeredInRound freshness, so a stale Chainlink price (or a node price within 2% of a stale value) is accepted as a valid mark price (M-24)."
     }
   ]
 }

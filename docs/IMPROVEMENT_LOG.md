@@ -885,3 +885,33 @@ one held 0 new Crit/High on the 6-repo dogfood set** — the precision disciplin
   Tigris 100%, Reserve 80%, Caviar 67%, **Frankencoin 88% (7/8)**, Stader 50%, **Basin 0% → 100% (3/3)**, LoopFi 100%.
   **PRECISION FULLY HELD:** unmatched Crit/High back to **17** (Basin 0/0 after the Medium calibration); zero net precision cost.
   Next: out-of-class is now the frontier (3%) → **PHASE B2 (conservation invariant)** + remaining Stader/Caviar/Reserve in-class. _done._
+
+### NORTH STAR — PHASE B2 (conservation) + CORPUS AUDIT (integrity correction): honest 71% in-class / 5% out-of-class
+Two concurrent agents (engine + benchmarks, disjoint files). The headline is an **integrity correction**: the corpus
+audit found the SEED corpus contained fabricated/mislabeled findings that had been inflating recall.
+- **PHASE B2 — `conservation.rs` (new `Category::Conservation`, CWE-840/682), routed through the corroboration scorer.**
+  Caught **Stader M-12** (`ValidatorWithdrawalVault.settleFunds`): an obligation (`penaltyAmount`) is down-clamped to one
+  balance component inside `if (operatorShare < penaltyAmount)`, a recovery external call is made, but the shortfall is
+  never folded back — a conservation violation. Fires on exactly 1 site across all 7 prior repos; **0 dogfood Conservation
+  findings**; base Medium so it can't inflate Crit/High. Honest scope note: it models this one real accounting shape, not a
+  broad generic class (no other corpus out-of-class finding mapped cleanly to a generic conservation invariant). Per the
+  honesty clause — a precise +1 out-of-class catch beats a noisy generic detector. **Out-of-class 3% → 5% (2/41).**
+- **CORPUS AUDIT — verified every manifest against the official C4 reports + on-disk source; corrected the ground truth.**
+  Found and removed FABRICATED/mislabeled seed findings — **independently re-verified the key one: Tigris
+  `GovNFT._bridgeMint` (L64) HAS access control** (`require(msg.sender==address(this) || _msgSender()==owner())`), so the
+  seed `H-bridgemint-public` ("anyone can mint") was bogus and Sluice's Centralization "catch" was matching a non-finding.
+  Also removed Tigris `verifyPrice-sig-replay` + Caviar `missing-deadline`/`setvirtualreserves` (not judged findings —
+  `PrivatePool.buy` confirmed to have no deadline param, consistent), fixed severities to match the reports, reclassified
+  Stader M-11 (access-control→frontrunning, out-of-class) + Reserve economic findings, rewrote the Basin manifest to
+  canonical loci, trimmed LoopFi to its real 1 High/0 Med, and **added a new contest (2023-03-asymmetry, cloned read-only,
+  9 report-verified findings, currently 0/5 in-class — honest untuned gaps).**
+- **CONSEQUENCE (owned honestly):** the prior **"83% in-class" was inflated by the bad seed labels** — incl. two of last
+  wave's reported catches (Tigris sig-replay, Caviar deadline) that were against mislabeled ground truth (those detectors
+  still fire, at Medium, but now correctly count as unmatched, not recall). The trustworthy number is **71% in-class
+  (22/31)**. The benchmark is now audited against official reports → the metric the loop optimizes is finally reliable.
+- **Integration:** disjoint merge (B2 engine + `manifest.rs`; corpus contest JSONs); one authoritative gate. **979 workspace
+  tests / 0 fail**, 0 warnings, corpus + real_hacks green. 134 detectors.
+- **HONEST SCOREBOARD (8 contests): in-class 71% (22/31), out-of-class 5% (2/41), Crit/High 23 (18 unmatched).** The 83%→71%
+  drop is a fidelity gain, not a regression; out-of-class 3%→5% is the real PHASE-B capability gain. Next: deeper corpus
+  re-verification (the rewrite is the agent's report-verified work, one item independently confirmed) + PHASE B3 (monotonicity,
+  Reserve M-02) + close honest in-class gaps (asymmetry first-depositor/overflow/slippage; Basin sync; Stader). _done._

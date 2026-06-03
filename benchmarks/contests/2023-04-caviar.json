@@ -5,65 +5,54 @@
   "local_path": "~/Data/bench/2023-04-caviar",
   "scope_dirs": ["src"],
   "audit_url": "https://code4rena.com/reports/2023-04-caviar",
-  "note": "Caviar Private Pools (NFT AMM). Representative High/Medium set grounded to the clone's source lines.",
+  "note": "Caviar Private Pools (NFT AMM). Findings verified against the official C4 report (3 High / 17 Medium) and grounded to the clone's source lines. IDs carry the report's H-/M- number.",
   "known_findings": [
     {
-      "id": "H-royalty-per-item",
+      "id": "H-01-royalty-drain",
       "severity": "High",
       "contract": "PrivatePool",
       "function": "buy",
       "file": "src/PrivatePool.sol",
-      "line": 234,
+      "line": 267,
       "bug_class": "accounting-logic",
       "in_class": false,
-      "summary": "buy()/sell() compute the royalty using a single per-item sale price (salePrice = netAmount / tokenIds.length) even when NFTs have different weights, so royalties are mis-paid; with weighted NFTs an attacker can under/over-pay royalties (protocol-specific fee accounting)."
+      "summary": "buy() computes royalties in a first loop, then refunds excess ETH to msg.sender via safeTransferETH, then re-reads _getRoyalty in a second loop to pay them. The refund is an untrusted external call between the two reads, so a malicious buyer's receive() can raise the NFT's royalty (e.g. 0% -> 100%) and drain the pool's base tokens to the royalty recipient (H-01). A TOCTOU/read-after-external-call accounting bug over external state, not a modeled sink."
     },
     {
-      "id": "H-flashloan-fee",
+      "id": "H-02-execute-arbitrary",
       "severity": "High",
-      "contract": "PrivatePool",
-      "function": "flashLoan",
-      "file": "src/PrivatePool.sol",
-      "line": 623,
-      "bug_class": "accounting-logic",
-      "in_class": false,
-      "summary": "flashLoan pulls the ERC20 fee from msg.sender after the callback and only checks msg.value for the ETH case; the flashloaned NFT is removed from the pool's effective inventory for the duration, letting a borrower grief pricing / availability without proportional cost (protocol-specific fee/inventory accounting)."
-    },
-    {
-      "id": "M-execute-arbitrary-call",
-      "severity": "Medium",
       "contract": "PrivatePool",
       "function": "execute",
       "file": "src/PrivatePool.sol",
       "line": 459,
       "bug_class": "access-control",
       "in_class": true,
-      "summary": "execute() lets the owner make an arbitrary target.call{value:msg.value}(data); the owner can approve/transfer NFTs or tokens held by the pool (including users' flash-loaned or in-flight assets), an unrestricted privileged external-call sink."
+      "summary": "execute() lets the owner make an arbitrary target.call{value:msg.value}(data); the owner can approve/transfer NFTs or tokens held by the pool (including users' in-flight or flash-loaned assets), an unrestricted privileged external-call sink (H-02)."
     },
     {
-      "id": "M-setvirtualreserves-reprice",
+      "id": "M-08-royalty-per-item",
       "severity": "Medium",
       "contract": "PrivatePool",
-      "function": "setVirtualReserves",
+      "function": "buy",
       "file": "src/PrivatePool.sol",
-      "line": 538,
-      "bug_class": "centralization",
-      "in_class": true,
-      "summary": "setVirtualReserves lets the pool owner reprice the AMM at will with no bound or timelock, so the owner can front-run a pending buy/sell to extract value — an over-powerful privileged role (centralization)."
+      "line": 236,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "buy()/sell() compute royalties using a single per-item sale price (salePrice = netAmount / tokenIds.length) even when NFTs carry different weights, so royalties for heavier/lighter NFTs are mis-paid and traders/royalty recipients lose their fair share (M-07/M-08). Protocol-specific fee accounting."
     },
     {
-      "id": "M-missing-deadline",
+      "id": "M-16-flashloan-fee",
       "severity": "Medium",
       "contract": "PrivatePool",
-      "function": "change",
+      "function": "flashLoan",
       "file": "src/PrivatePool.sol",
-      "line": 385,
-      "bug_class": "missing-deadline",
-      "in_class": true,
-      "summary": "PrivatePool.buy/sell/change accept no deadline parameter (only the EthRouter wrappers do); a transaction can sit in the mempool and execute later at a stale price, with no user-supplied expiry to bound it."
+      "line": 623,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "flashLoan's fee handling is inconsistent: flashFee() returns an unscaled value (unlike changeFeeQuote) and the fee is pulled from the wrong address / not routed to the factory, so the flash-loan fee is mis-accounted (M-03/M-06/M-16). Protocol-specific fee accounting."
     },
     {
-      "id": "M-ethrouter-royalty-recipient",
+      "id": "M-14-ethrouter-royalty-recipient",
       "severity": "Medium",
       "contract": "EthRouter",
       "function": "sell",
@@ -71,7 +60,7 @@
       "line": 152,
       "bug_class": "accounting-logic",
       "in_class": false,
-      "summary": "EthRouter royalty payment trusts the royalty recipient/amount returned for each NFT; a malicious NFT/registry can direct or inflate the royalty leg of a sell, a protocol-specific external-data accounting issue."
+      "summary": "EthRouter.sell pays each NFT's royalty via royaltyRecipient.safeTransferETH using the recipient/amount returned per NFT; a non-payable or reverting royalty recipient (or an inflated royalty leg) makes the sell fail or mis-pays the royalty (M-14). Protocol-specific external-data accounting issue."
     }
   ]
 }

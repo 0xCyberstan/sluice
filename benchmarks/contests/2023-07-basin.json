@@ -5,62 +5,62 @@
   "local_path": "~/Data/bench/2023-07-basin",
   "scope_dirs": ["src"],
   "audit_url": "https://code4rena.com/reports/2023-07-basin",
-  "note": "Basin (Beanstalk Wells AMM + MultiFlow pump oracle). Representative High/Medium set grounded to the clone's source lines.",
+  "note": "Basin (Beanstalk Wells AMM + MultiFlow pump oracle). Findings verified against the official C4 report (1 High / 13 Medium) and grounded to the clone's source lines. IDs carry the report's H-/M- number.",
   "known_findings": [
     {
-      "id": "H-storeuint128-odd-slot",
+      "id": "H-01",
       "severity": "High",
+      "contract": "Well",
+      "function": "sync",
+      "file": "src/Well.sol",
+      "line": 596,
+      "bug_class": "oracle-manipulation",
+      "in_class": true,
+      "summary": "Well.sync() (and shift()) call _setReserves directly without first pushing the previous-block reserves into the attached pump (unlike swapFrom), so the pump's time-weighted reserves never capture the pre-change state; an attacker can move balances and sync/shift in the same block to manipulate the oracle reserves consumers read (H-01)."
+    },
+    {
+      "id": "M-02",
+      "severity": "Medium",
       "contract": "LibBytes",
       "function": "storeUint128",
       "file": "src/libraries/LibBytes.sol",
-      "line": 37,
+      "line": 68,
       "bug_class": "accounting-logic",
       "in_class": false,
-      "summary": "storeUint128's odd-reserve branch re-reads the target slot's high 128 bits (shr(128, sload(...))) and re-packs them; with certain reserve counts/layouts this clobbers or mis-preserves an adjacent packed reserve, corrupting stored well reserves (low-level packing logic, no modeled detector)."
+      "summary": "storeUint128's odd-reserve branch re-reads the target slot's high 128 bits via shl(128, shr(128, sload(...))) and re-packs them; the slot/bit arithmetic mis-preserves an adjacent packed reserve, corrupting stored well reserves and thus the pump's oracle values (M-02/M-03). Low-level packing logic, no modeled detector."
     },
     {
-      "id": "M-pump-twap-manip",
+      "id": "M-01",
       "severity": "Medium",
-      "contract": "MultiFlowPump",
-      "function": "readLastReserves",
-      "file": "src/pumps/MultiFlowPump.sol",
-      "line": 171,
-      "bug_class": "oracle-manipulation",
-      "in_class": true,
-      "summary": "The MultiFlow geometric-mean pump derives reserves consumers use as an oracle; a single large swap right before reading (and the first/seeded update) can move the reported reserves, so an integrating protocol reading the pump can be price-manipulated."
+      "contract": "LibBytes",
+      "function": "getBytes32FromBytes",
+      "file": "src/libraries/LibBytes.sol",
+      "line": 23,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "getBytes32FromBytes bounds-checks with `index > data.length` instead of `>=`, allowing an out-of-bounds memory read of the last word, which can return corrupted bytes and lead to loss of funds (M-01). Low-level memory-bounds logic, no modeled detector."
     },
     {
-      "id": "M-pump-update-timestamp",
+      "id": "M-06",
+      "severity": "Medium",
+      "contract": "ConstantProduct2",
+      "function": "calcLpTokenSupply",
+      "file": "src/functions/ConstantProduct2.sol",
+      "line": 53,
+      "bug_class": "rounding-direction",
+      "in_class": true,
+      "summary": "calcLpTokenSupply computes the LP supply as sqrt(reserves[0]*reserves[1]*EXP_PRECISION); the integer sqrt loses precision asymmetrically versus the division used elsewhere, so excess reserve tokens can be left in / leaked from the pool over many operations (M-06). Precision/rounding-direction."
+    },
+    {
+      "id": "M-08",
       "severity": "Medium",
       "contract": "MultiFlowPump",
       "function": "update",
       "file": "src/pumps/MultiFlowPump.sol",
-      "line": 72,
-      "bug_class": "timestamp-dependence",
+      "line": 113,
+      "bug_class": "block-number-as-time",
       "in_class": true,
-      "summary": "update() drives the EMA/cumulative reserves off block.timestamp deltas cast to uint40; the weighting depends on the exact timing of updates, so a party controlling when update() is called can bias the time-weighted reserves."
-    },
-    {
-      "id": "M-calcreserve-rounding",
-      "severity": "Medium",
-      "contract": "ConstantProduct2",
-      "function": "calcReserve",
-      "file": "src/functions/ConstantProduct2.sol",
-      "line": 58,
-      "bug_class": "rounding-direction",
-      "in_class": true,
-      "summary": "calcReserve recovers a reserve via an integer square root; the rounding direction of the sqrt/division can round in favor of the swapper rather than the pool, leaking small amounts from LPs over many swaps (precision/rounding-direction)."
-    },
-    {
-      "id": "M-pump-init-seeding",
-      "severity": "Medium",
-      "contract": "MultiFlowPump",
-      "function": "_init",
-      "file": "src/pumps/MultiFlowPump.sol",
-      "line": 146,
-      "bug_class": "accounting-logic",
-      "in_class": false,
-      "summary": "The pump's first update (_init) seeds lastReserves from whatever the well reserves are at that block; an attacker can set the initial cumulative/last reserves to a skewed value, biasing early TWA reads (protocol-specific initialization accounting)."
+      "summary": "The pump treats the immutable BLOCK_TIME as a permanent constant (blocksPassed = deltaTimestamp / BLOCK_TIME in _capReserve), so if average block time changes the per-block reserve-change cap is applied over the wrong number of blocks, biasing the time-weighted oracle (M-08/M-13). Block-time-as-elapsed-time assumption."
     }
   ]
 }
