@@ -127,6 +127,13 @@ pub mod interop_no_source_binding;
 pub mod prove_finalize_game_substitution;
 pub mod lzreceive_failure_silent;
 pub mod oft_decimal_supply_leak;
+// Round 17 — OP FaultDisputeGame depth-branched clock-extension class.
+pub mod clock_extension_depth_branch;
+// Round 17 — OP AnchorStateRegistry respected-game-type snapshot swap.
+pub mod respected_gametype_snapshot_swap;
+// Round 17 — OP fault-proof bond + L1->L2 aliasing.
+pub mod refund_credit_pre_verdict;
+pub mod conditional_sender_aliasing;
 
 use crate::detector::Detector;
 
@@ -265,6 +272,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(prove_finalize_game_substitution::ProveFinalizeGameSubstitutionDetector),
         Box::new(lzreceive_failure_silent::LzReceiveFailureSilentDetector),
         Box::new(oft_decimal_supply_leak::OftDecimalSupplyLeakDetector),
+        // Round 17 — OP FaultDisputeGame depth-branched clock-extension class.
+        Box::new(clock_extension_depth_branch::ClockExtensionDepthBranchDetector),
+        // Round 17 — OP AnchorStateRegistry respected-game-type snapshot swap.
+        Box::new(respected_gametype_snapshot_swap::RespectedGameTypeSnapshotSwapDetector),
+        // Round 17 — OP fault-proof bond + L1->L2 aliasing.
+        Box::new(refund_credit_pre_verdict::RefundCreditPreVerdictDetector),
+        Box::new(conditional_sender_aliasing::ConditionalSenderAliasingDetector),
     ]
 }
 

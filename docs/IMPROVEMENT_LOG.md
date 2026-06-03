@@ -398,7 +398,26 @@ PART B — corpus availability: **AA/ERC-4337 = NEEDS-CORPUS** (only a Safe `Tes
 **concentrated-liquidity AMM = NEEDS-CORPUS** (no TickMath/SwapMath/SqrtPriceMath/FullMath on disk). Per the R7 lesson, do NOT build either
 fixture-only — add a public EntryPoint/UniswapV3-core (or v4) repo first. R17 should build PART A (real OP targets) + tune any R16 dormant detectors.
 
-_NOTE: an R16 worktree agent left a stray debug `detectors/scratch_dump.rs` + `pub mod scratch_dump;` in main mod.rs — DELETE both at R16 integration._
+_NOTE: an R16 worktree agent left a stray debug `detectors/scratch_dump.rs` + `pub mod scratch_dump;` in main mod.rs — DELETE both at R16 integration._ (done in R16.)
+
+### Round 17 — 4 OP-Stack fault-proof detectors — completes the L2/bridge domain
+- **Result:** +4 → **104 active** (60 novel classes across 8 domains). Authored by 4 worktree agents via the prelude.
+  Independent dogfood: **all 4 fire on real OP Stack** — dispute dir 6 (refund-credit-pre-verdict ×3, clock-extension-depth-branch
+  ×2, respected-gametype-snapshot-swap ×1 on FaultDisputeGame/AnchorStateRegistry), L1 dir 1 (conditional-sender-aliasing on
+  OptimismPortal2 — the EIP-7702 aliasing angle); **0 R17 FPs on all 6 DeFi codebases** (olympus 92 / pendle 107 / etherfi 126 /
+  ethena 31 / symbiotic 41 / eigenlayer 24 — unchanged). 539 tests, 0 warnings, corpus 20/20 + 8/8. The OP fault-proof
+  surface (bonds / clocks / aliasing / respected-game-type) is now covered alongside the R16 LayerZero/messaging classes.
+
+#### R18 work-plan (R17 WF3 meta-quality audit at the 100-detector milestone — a PRECISION round, not new classes)
+Audit method: scanned 12 source roots (all exit 0, 0.06–4.9s, ≤290MB; olympus-v3 kitchen-sink vendored code excluded as a measurement artifact). 50/100 detectors fire on real code; of the 50 dormant: 37 fire 1–2× (healthy novel classes), 13 fire 0.
+- **A. Fix the 1 real bug:** `vesting-buffered-donation` REGRESSED — fired on the Ethena rate-donation Medium in R12, now 0 despite `StakedUSDe.totalAssets()` being on disk. Re-tune to the real `balanceOf(this) − vesting` shape + add the ethena site as a regression fixture. (highest priority)
+- **B. Tighten 4 over-eager detectors (the systematic noise):**
+  1. `centralization-risk` (double-digits on EVERY codebase — the #1 noise): apply the R5 inline-guard recognizer to its "privileged" test — if the only caller is a FIXED protocol contract (immutable/constant/`staking`-style storage) down-rank to Info; reclassify `mint(<protocol-contract>,…)` as not user-fund-flow. Clears the Low/0.4 bulk.
+  2. `reentrancy` (49× on Optimism, Critical over-ranks): use the R5/R6 per-call-site trust classifier to EXCLUDE trusted immutable/system callees (`weth()`/DelayedWETH/project view-pure) from the arming external call; do NOT count internal `_assertOnly*()` guard calls as the external call; CAP severity at High unless the callee is caller-supplied AND a value write strictly follows.
+  3. `integer-issues` (23 etherfi): add provenance — `uintN(x)` where x reads a `uintN`-or-narrower storage field, or `a-b` of two uintN, is width-safe; dedupe multi-cast-per-fn to one finding.
+  4. `solver-convergence-trust` (12 pendle, 0 elsewhere — target-overfit): require the guess to FLOW to a fund-moving sink in the same call.
+- **C. Leave the 9 correctly-rare dormant** (untrusted-call-target, unprotected-initializer, erc721-mint-reentrancy, unchecked-erc1155-receiver, lp-slippage, msg-value-in-loop, gap-not-shrunk, uninitialized-storage-pointer, delegated-signer-single-step) — audited code is genuinely clean of them; forcing them would repeat the R7 overfit mistake.
+- **D. Corpus to acquire (ranked):** #1 **Uniswap v3-core + v4-core/periphery** (unlocks the already-built-but-starved `feegrowth-accounting` on `Tick.getFeeGrowthInside` + concentrated-liquidity classes — largest AMM TVL/bounty surface); #2 a canonical ERC-4337 **EntryPoint** (AA paymaster/validation); #3 **MasterChef**-class staking (gives `reward-debt` a live target); #4 a **GMX-v2/Synthetix-perps** engine (unblocks the deferred perps classes). Per the R7 lesson, build the needs-corpus classes only AFTER the corpus is on disk.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector
