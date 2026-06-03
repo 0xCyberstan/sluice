@@ -1,50 +1,54 @@
-# Precision-round backlog (dogfood audit, post-R21)
+# Precision backlog
 
-> Source: R22-round dogfood/precision agent. Scanned 3 real codebases READ-ONLY with the
-> 124-detector binary: EigenLayer (106 .sol → 166 contracts/1199 fns, 1.31s, 128 findings),
-> Symbiotic Core (128 → 70/428, 0.60s, 64), Pendle V2 (205 → 230/1464, 0.70s, 308). 500 total
-> (Crit 2 / High 13 / Med 83 / Low 39 / Info 363). No crashes. Address in a dedicated precision round.
+## R24 — addressed (committed `ff357d3`)
+floating-pragma sub-classing; array-length full-body guard scan; upgradeable inheritance-chain `_disableInitializers`
++ staticDelegate mandatory-revert downgrade; centralization Info-tier suppression; parser `contract … layout at N is …`
+recovery; `is_file()` IO guard. (From the first dogfood.)
 
-## Detector precision targets (ranked)
+## R28 dogfood — OPEN (broad scan of 7 corpora with the 132-detector binary, 2026-06-03)
 
-1. **`floating-pragma` — 344 hits (69% of ALL output).** R21 lint; technically 0% FP but extreme
-   volume. **Fix:** split into sub-classes — keep full Info for genuinely-wide ranges (`>=`, `>`, `<`, `*`,
-   unbounded like `>=0.5.0`); demote near-pinned `^0.x.y` with `y>=20` to a quieter "near-pinned-pragma"
-   sub-class or suppress (near-zero real risk). Eliminates ~220 of 344 while keeping the wide ranges.
-   (Note: firing broadly at Info IS the lint's design — this is optional noise-reduction polish, not a bug.)
+**Headline (good):** the 9 R23/R26/R27 detectors (Uniswap-v4, ERC-4337 AA, perps) have **0 cross-domain false
+positives** across v4-core/v4-periphery/account-abstraction/gte-perps/eigenlayer/symbiotic/pendle. Well-contained;
+`funding-index-settle-ordering` fires only in gte-perps (6 plausible High in LiquidatorPanel/PerpManager).
 
-2. **`array-length-mismatch` — 6 hits, ~50% FP.** Only checks the loop header; misses a length guard
-   elsewhere in the body or a sibling fn. Real FPs: `LimitRouterBase.sol:476` (`require(len==lnFeeRateRoots.length)`
-   3 lines above), `PendleMultiTokenMerkleDistributor.sol:85`, `ActionMiscV3.sol:79` (three *independent* loops,
-   no cross-index). Real TPs: `ActionMiscV3.sol:184`, `DelegationManager.sol:220`. **Fix:** after collecting a
-   fn's array params, scan the WHOLE body for `require(a.length==b.length)` / `if(a.length!=b.length) revert`
-   on every cross-indexed pair; suppress if guarded.
+**Open precision targets (the OLDER core detectors — a precision round when the loop resumes):**
 
-3. **`centralization-risk` Info tier — ~16 Info hits, pure noise.** The detector's own message says "preset
-   destination, not an admin-can-rug risk — informational" (e.g. `RewardsCoordinator.sol:126`,
-   `PendleMsgSendEndpointUpg.sol:54`). **Fix:** suppress the Info sub-class entirely; reserve output for the
-   Medium/High external-address-reroute-without-timelock tier. (Medium TPs are correct: BackingEigen.mint,
-   StakedPendle.setFeeReceiver.)
+1. **`reentrancy` (~55–65% TP — highest priority; some messages are factually wrong).**
+   - Fires on pure `view` getters as "read-only reentrancy" when the fn has NO `call`/`staticcall` in body or direct
+     chain — e.g. `GTELaunchpadV2Pair.getReserves` (reads 3 slots, returns), `NetworkRestakeDelegator.
+     totalOperatorNetworkSharesAt` (single `upperLookupRecent`). The emitted message claims "performs an external
+     call" — FALSE. FIX: require a visible `call`/`send`/`transfer`/`delegatecall`/`staticcall` in the body (not just
+     an inherited superclass chain) before flagging read-only reentrancy.
+   - Classic reentrancy mis-attributes a CEI-compliant *pre-call guard read* as a post-call state write
+     (`v4-core ProtocolFees.collectProtocolFees` decrements `protocolFeesAccrued` BEFORE `currency.transfer` — it's
+     CEI-correct). FIX: require the storage WRITE to be after the call in the same fn scope, not a guard read.
+   - Also flags ERC20 `_update`/`setOperatorNetworkShares` (storage + emit only, no external call) — inherited-chain
+     mis-walk. FIX: don't attribute a parent-chain external call to a child with none of its own.
 
-4. **`upgradeable` `_disableInitializers` sub-class — 11 Med, ~36% FP.** Doesn't trace the inheritance chain.
-   FPs: Symbiotic `BaseDelegator`/`Vault` constructors (parents `Entity`/`MigratableEntity` DO call
-   `_disableInitializers()`). TPs: Pendle `AddressProvider` (no ctor at all), `PendlePrincipalToken`. **Fix:**
-   walk the full inheritance chain for an ancestor-constructor `_disableInitializers()` before emitting.
-   Also: Symbiotic `StaticDelegateCallable.staticDelegateCall` flagged **Critical** but it unconditionally
-   reverts after the call (a pure `eth_call` simulation hook) → downgrade to Medium/Info when the delegatecall
-   is followed by a mandatory `revert`.
+2. **`encodepacked-collision` / `selector-collision` (~1/7 TP).** Misclassifies FIXED ABI types (`address`, `uintN`,
+   `intN`, `bytesN`) as dynamic → fires on `abi.encodePacked(token0, token1)` (two addresses; `Launchpad.pairFor`) and
+   on SVG/Descriptor display-string concatenation (`v4-periphery SVG.generateSVGBorderText`, 8 string args, no hash).
+   FIX: (a) count only `string`/`bytes` as dynamic; (b) only flag when the packed result feeds `keccak256` / a
+   signature / a mapping key.
 
-## Engine bugs surfaced (worth fixing in the precision round)
+3. **`unchecked-return`.** Flags `permit2.transferFrom(...)` (Permit2's `IAllowanceTransfer.transferFrom` is `void` +
+   reverts on failure) as an unchecked ERC-20 transfer — e.g. `GTERouter.sol:139`. FIX: check the callee's return
+   type is `bool` before flagging; suppress known reverts-not-returns interfaces (Permit2). (Real TPs remain:
+   `BoringPtSeller` PT.transfer, `PendleMsgSendEndpointUpg` lzEndpoint.send.)
 
-- **Parser: `contract Foo layout at N is Bar` not handled.** EigenLayer `AllocationManagerView.sol` uses the
-  Solidity 0.8.29 inherited-layout form (`contract … layout at 151 is …`). The R5 `layout at` recovery handled
-  the standalone directive but NOT this `contract … layout at N is …` header form → file silently skipped, 1
-  contract missed. Extend `blank_layout_directive` (sluice-parse) to also recover this header position.
-- **IO: no `is_file()` pre-check.** Symbiotic `docs/autogen/` has 64 `.sol`-suffixed *directories* (Forge
-  autogen artifacts); Sluice fed them to the file reader → 64 "Is a directory (os error 21)" lines. Add a
-  `metadata().is_file()` guard before reading in the path-walk (sluice-parse / cli).
+4. **`twap-manipulation`.** Fires on view getters / NFT `tokenURI` (`StateView.getSlot0`, `PositionDescriptor.
+   tokenURI`) that aren't on-chain price consumers. FIX: require the read to flow into a swap/liquidation/borrow
+   calculation, not a pure view/metadata return.
 
-## Quick wins vs deeper
-- Quick (low-risk): centralization Info suppression; `is_file()` guard; staticDelegateCall mandatory-revert downgrade.
-- Medium: array-length full-body guard scan; upgradeable inheritance-chain `_disableInitializers` trace; floating-pragma sub-classing.
-- Parser: `contract … layout at N is …` recovery (needs offset-preserving care like the R5 fix).
+5. **`centralization-risk` (further refinement).** R24 removed the Info tier, but the Medium tier still conflates an
+   admin SETTER (no fund movement, e.g. `setFeeToSetter` — only reassigns the next admin) with a direct fund-reroute
+   (`BackingEigen.mint` to an arbitrary address — genuine). FIX: reserve Medium for fns with a `transfer`/`mint`/
+   `approve` to an externally-supplied address in the body; downgrade pure setters to Low.
+
+**Engine bug:**
+- **Parser: Solidity `transient` keyword (0.8.28+ transient storage) not handled** → `account-abstraction/
+  contracts/core/EntryPoint.sol` silently skipped (the AA reference EntryPoint/paymaster internals went unscanned, so
+  AA recall is currently understated). FIX: recover/skip `transient` storage declarations in sluice-parse (mirror the
+  R5 `layout at` / R24 comment-skip recovery — offset-preserving).
+
+_No crashes on any of the 7 corpora; scan times 0.02–0.30s per repo. Total 132 detectors, all corpora traversed._
