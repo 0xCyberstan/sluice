@@ -5,7 +5,14 @@ floating-pragma sub-classing; array-length full-body guard scan; upgradeable inh
 + staticDelegate mandatory-revert downgrade; centralization Info-tier suppression; parser `contract … layout at N is …`
 recovery; `is_file()` IO guard. (From the first dogfood.)
 
-## R28 dogfood — OPEN (broad scan of 7 corpora with the 132-detector binary, 2026-06-03)
+## R28 dogfood — RESOLVED in precision wave 1 (2026-06-03), except as noted
+> Wave 1 fixed all 5 detector FP classes below (reentrancy, encodepacked/selector, unchecked-return, twap,
+> centralization) + the Aave oracle-manipulation FP — each with a real-shape regression test + recall preserved
+> (real-hacks + corpus green). **STILL OPEN:** the `transient`-keyword parser gap (below); the upgradeable-proxy
+> over-severity (Aave's remaining Critical — `InitializableUpgradeabilityProxy.initialize` rated Critical on a
+> standard OZ proxy). Both queued for wave 2. Detail retained below for reference.
+
+## R28 dogfood — original findings (broad scan of 7 corpora with the 132-detector binary, 2026-06-03)
 
 **Headline (good):** the 9 R23/R26/R27 detectors (Uniswap-v4, ERC-4337 AA, perps) have **0 cross-domain false
 positives** across v4-core/v4-periphery/account-abstraction/gte-perps/eigenlayer/symbiotic/pendle. Well-contained;

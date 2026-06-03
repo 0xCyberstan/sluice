@@ -620,3 +620,30 @@ read-only Code4rena 2025-08 **GTE Perps** corpus (R7 anti-overfit). Opens the **
   PoC-template tests), 0 warnings; perps dogfood on real GTE = 6 funding-index findings + 0/0 (correct) for the
   other two. Each keeps its perps-shaped gate local (dedup to prelude in a future structure round). Deferred (need
   more corpus tuning): perps #4 PnlSettledBeforeFundingApplied, #5 ADL, #6 InsuranceFund, #7 SameBlockMarkPriceSnapshot. _done._
+
+### Real-code precision wave 1 — 5-agent FP fixes driven by the Aave-v3 benchmark + 7-corpus dogfood
+NEW LOOP METHOD ([[feedback-real-code-triage]]): validate on REAL untuned protocols, triage every finding, 5-agent
+fix waves, re-benchmark — no more home-field fixtures. The Aave v3 benchmark exposed top-severity FPs; 5 agents fixed
+them, each with a regression test from the REAL FP site + a hard recall guard (real-hacks + corpus stay green).
+- **oracle-manipulation** — `balanceOf(<user/owner/msg.sender/_msgSender()>)` was misread as a manipulable spot
+  price (the shared classifier only caught `this`/member `msg.sender`). Now only `balanceOf(address(this))` / a
+  pool/vault handle is price-like. **Aave 3 High → 0**; Cream/Harvest/bZx/gamma/jimbo/midas all still fire.
+- **reentrancy** — root cause: real scans exclude `lib/`/`@openzeppelin`, so stateless-library/free-function calls
+  (`Time.timestamp()`, `UQ112x112`, `upperLookupRecent`) were mis-typed External re-entry vectors. 3 gates:
+  library-static-dispatch exclusion; read-only fires only with a real own-body external call; cross-function needs a
+  post-call write or an unsettled pre-call read. **symbiotic 4→0, v4-core 1→0, gte getReserves gone**; Pendle/revest/
+  classic TPs retained.
+- **selector-collision** — required no hash sink + counted casts/`Unknown` as dynamic. Now needs adjacent real
+  `Dynamic`-`Dynamic` (`string`/`bytes`) into a keccak/selector sink. **6 FPs→0** (gte pairFor, AA UserOperationLib,
+  v4 SVG×2+Descriptor×2); genuine SWC-133 still fires. (encodepacked-collision was already correct.)
+- **unchecked-return** — flagged Permit2's void-returning 4-arg `transferFrom`. Now gated to bool-returning ERC-20
+  shape / suppresses IAllowanceTransfer. **3 Permit2 FPs→0**; genuine `token.transfer`/`lzEndpoint.send` retained.
+- **twap-manipulation** — fired on view getters / `tokenURI`. Now requires the read to flow into a valuation/sink.
+  **v4-periphery 2→0.**  **centralization-risk** — Medium now needs a real fund-movement opcode to a steerable dest;
+  pure address-setters → Low (correctly promotes `BackingEigen.mint`/`Collector.transfer` to Medium, demotes
+  `setFeeToSetter` to Low) + a `_msgSender()` guard-gap fix.
+- **Result:** 132 detectors (precision-only, no new). **Aave Highs 4→1** (the 3 oracle FPs eliminated; remaining Crit
+  upgradeable-proxy + High rewards-reentrancy are out-of-scope/defensible). Combined across aave+v4peri+gte+symbiotic:
+  selector + twap → 0, reentrancy/oracle down to genuine hits only. ~764 engine tests (+22 regression, all from real
+  shapes) + corpus 20/20 + 8/8 + 5 real-hack harnesses, 0 warnings. STILL OPEN (next wave): upgradeable-proxy
+  over-severity on a standard OZ proxy; the `transient`-keyword parser gap (EntryPoint.sol skipped). _done._

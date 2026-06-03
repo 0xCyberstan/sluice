@@ -1,10 +1,26 @@
-//! Selector / hash collision: `abi.encodePacked` with two or more dynamic
-//! arguments. Packed encoding does not insert length prefixes or padding, so
-//! adjacent dynamic values share an ambiguous byte boundary
+//! Selector / hash collision: `abi.encodePacked` with two or more *adjacent*
+//! dynamic arguments whose packed bytes feed a hash/selector sink. Packed
+//! encoding does not insert length prefixes or padding, so two variable operands
+//! sitting next to each other share an ambiguous byte boundary
 //! (`encodePacked("a","bc") == encodePacked("ab","c")`). When the result feeds a
-//! `keccak256` digest — a signature payload, a merkle leaf, or a mapping key —
-//! distinct logical inputs collapse to the same hash. This is the Poly-Network /
+//! `keccak256`/`sha256` digest or an `abi.encodeWithSignature`/`Selector`
+//! preimage — a signature payload, a merkle leaf, or a mapping key — distinct
+//! logical inputs collapse to the same hash. This is the Poly-Network /
 //! signature-collision class.
+//!
+//! Two guards keep this precise:
+//!
+//! * **Proven-dynamic adjacency.** Only `string`/`bytes`/array are dynamic; a
+//!   `windows(2)` pass requires two consecutive operands *both* classified
+//!   [`ArgClass::Dynamic`]. Fixed-width operands (`address`, `uintN`/`intN`,
+//!   `bytesN`, `bool`, literals, casts) and length-pinned operands pin the
+//!   boundary, and an `Unknown` operand is not proof of dynamism, so none of
+//!   them can stand in as a collision partner. A fixed field between two strings
+//!   or an init-code-hash tail (`..., keccak256(...), initCodeHash`) is silent.
+//! * **Security-sensitive sink.** The packed bytes must flow into a hash /
+//!   selector preimage. Packing dynamic operands into a *display / return*
+//!   `string` (the NFT-SVG / token-descriptor idiom) is not a collision attack
+//!   surface and stays silent.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -104,49 +120,56 @@ impl Detector for SelectorCollisionDetector {
                     .collect();
 
                 let dynamic_typed = classes.iter().filter(|k| **k == ArgClass::Dynamic).count();
-                // Two adjacent args that are both not provably fixed.
-                let consecutive_nonfixed = classes
+                // The collision primitive is purely a *shared boundary between two
+                // variable operands*: two operands BOTH proven dynamic
+                // (`string`/`bytes`/array) sitting next to each other in the packed
+                // buffer. Only `string`/`bytes`/array are dynamic — `address`,
+                // `uintN`/`intN`, `bytesN`, `bool`, literals and casts are
+                // fixed-width and pin the boundary, so they must NOT count toward
+                // the pair. An `Unknown` operand (unresolved type, call result,
+                // arithmetic) is *not proof of dynamism* either, so it cannot
+                // stand in as a collision partner: requiring proven-`Dynamic` on
+                // both sides keeps a fixed field placed between two strings
+                // (`encodePacked(a, uint16(n), b)`) and an init-code-hash tail
+                // (`encodePacked(..., keccak256(...), initCodeHash)`) silent.
+                let adjacent_dynamic = classes
                     .windows(2)
-                    .any(|w| w[0] != ArgClass::Fixed && w[1] != ArgClass::Fixed);
-
-                // Fire when at least two args could be dynamic:
-                //  - two resolved dynamic-typed args, or
-                //  - one resolved dynamic arg sitting next to another non-fixed arg.
-                // Pure-`Unknown` noise alone (and all-fixed) is suppressed.
-                let fire = dynamic_typed >= 2 || (dynamic_typed >= 1 && consecutive_nonfixed);
-                if !fire {
+                    .any(|w| w[0] == ArgClass::Dynamic && w[1] == ArgClass::Dynamic);
+                if !adjacent_dynamic {
                     return;
                 }
 
-                let feeds_hash = hashed.contains(&span);
-                // Honest heuristic confidence: type inference is best-effort, and
-                // a real collision still requires a meaningful pair of inputs.
-                // Bump (still modest) when the packed bytes reach a hash/selector.
-                let confidence = if feeds_hash { 0.6 } else { 0.45 };
-
-                let sink = if feeds_hash {
-                    " and the result feeds a `keccak256` digest (signature payload, merkle leaf, or mapping key), \
-                     so two distinct inputs can forge the same hash"
-                } else {
-                    ""
-                };
+                // Only a security-sensitive sink makes the boundary ambiguity
+                // exploitable: the packed bytes must flow into a `keccak256` /
+                // `sha256` digest, an `abi.encodeWithSignature`/`Selector`
+                // preimage, or a mapping/id key. Packing dynamic operands into a
+                // *display / return* `string` (the NFT-SVG / token-descriptor
+                // idiom) is not a collision attack surface, so it stays silent.
+                if !hashed.contains(&span) {
+                    return;
+                }
 
                 let b = FindingBuilder::new(self.id(), Category::SelectorCollision)
                     .title("abi.encodePacked with multiple dynamic arguments (hash collision)")
                     .severity(Severity::Medium)
-                    .confidence(confidence)
+                    // Honest heuristic confidence: type inference is best-effort and
+                    // a real collision still requires a meaningful pair of inputs,
+                    // but the packed bytes are proven to reach a hash/selector sink.
+                    .confidence(0.6)
                     // ValueFlow: the (potentially attacker-supplied) packed values
                     // flow into a hash/selector sink where the boundary ambiguity
                     // becomes exploitable. That is the value-flow evidence; no
                     // invariant or trust-frontier claim is made here.
                     .dimension(Dimension::ValueFlow)
                     .message(format!(
-                        "`{}` calls `abi.encodePacked` with {} dynamic-length arguments{}. Packed encoding omits \
-                         length prefixes, so adjacent dynamic values share an ambiguous boundary \
+                        "`{}` calls `abi.encodePacked` with {} adjacent dynamic-length arguments \
+                         (string/bytes/array) and the result feeds a `keccak256`/`sha256` digest or \
+                         selector (signature payload, merkle leaf, or mapping key), so two distinct \
+                         inputs can forge the same hash. Packed encoding omits length prefixes, so \
+                         adjacent dynamic values share an ambiguous boundary \
                          (`encodePacked(\"a\",\"bc\") == encodePacked(\"ab\",\"c\")`).",
                         f.name,
                         dynamic_typed.max(2),
-                        sink
                     ))
                     .recommendation(
                         "Use `abi.encode` (length-prefixed) instead of `abi.encodePacked`, or place a fixed-width \
@@ -439,6 +462,69 @@ mod tests {
         }
     "#;
 
+    // SILENT (real FP, gte-perps Launchpad.pairFor): the CREATE2 pair address.
+    // Both `token0`/`token1` are `address` (fixed-width), and the outer pack is
+    // `[hex"ff", factory, keccak256(...), uniV2InitCodeHash]` — `factory` is a
+    // fixed `address`, the inner `keccak256(...)` is an unresolved (Unknown) call
+    // result, and `uniV2InitCodeHash` is a `bytes` state var. There is no pair of
+    // *adjacent* proven-dynamic operands (the lone `bytes` tail sits next to an
+    // Unknown, not another dynamic), so this must stay silent.
+    const FP_CREATE2_PAIRFOR: &str = r#"
+        pragma solidity ^0.8.19;
+        interface IUniswapV2Pair {}
+        contract Library {
+            bytes public uniV2InitCodeHash;
+            function sortTokens(address a, address b) internal pure returns (address, address) {
+                return a < b ? (a, b) : (b, a);
+            }
+            function pairFor(address factory, address tokenA, address tokenB) internal view returns (IUniswapV2Pair pair) {
+                (address token0, address token1) = sortTokens(tokenA, tokenB);
+                pair = IUniswapV2Pair(address(uint160(uint256(keccak256(
+                    abi.encodePacked(hex"ff", factory, keccak256(abi.encodePacked(token0, token1)), uniV2InitCodeHash)
+                )))));
+            }
+        }
+    "#;
+
+    // SILENT (real FP, account-abstraction UserOperationLib.encodePaymasterSignature):
+    // only ONE dynamic operand (`paymasterSignature` is `bytes`); it is followed
+    // by a fixed `uint16(len)` cast and a fixed `bytes8` magic, and the result is
+    // a plain `return` value (no hash sink). No adjacent-dynamic pair and no
+    // hash/selector sink → must stay silent.
+    const FP_PAYMASTER_SUFFIX: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Lib {
+            bytes8 constant internal MAGIC = 0x22e325a297439656;
+            function encodePaymasterSignature(bytes calldata paymasterSignature) internal pure returns (bytes memory) {
+                uint256 len = paymasterSignature.length;
+                if (len == 0) { return ""; }
+                return abi.encodePacked(paymasterSignature, uint16(len), MAGIC);
+            }
+        }
+    "#;
+
+    // SILENT (real FP, v4-periphery SVG.generateSVGBorderText / Descriptor):
+    // many adjacent dynamic `string` operands are concatenated to build a DISPLAY
+    // string that is `return`ed (wrapped in `string(...)`), NOT fed to a hash.
+    // Adjacent dynamics are present, but there is no security-sensitive sink, so
+    // this is not a collision attack surface and must stay silent.
+    const FP_SVG_DISPLAY_STRING: &str = r#"
+        pragma solidity ^0.8.20;
+        library SVG {
+            function generateSVGBorderText(
+                string memory quoteCurrency,
+                string memory baseCurrency,
+                string memory quoteCurrencySymbol,
+                string memory baseCurrencySymbol
+            ) internal pure returns (string memory svg) {
+                svg = string(abi.encodePacked(
+                    '<text>', baseCurrency, " - ", baseCurrencySymbol,
+                    '</text><text>', quoteCurrency, " - ", quoteCurrencySymbol, '</text>'
+                ));
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_vuln() {
         let fs = run(VULN);
@@ -482,5 +568,29 @@ mod tests {
     fn fires_on_two_unpinned_bytes() {
         let fs = run(TWO_UNPINNED_BYTES);
         assert!(fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
+    }
+
+    // Regression (R28 dogfood, gte-perps): the CREATE2 `pairFor` packs only
+    // fixed `address`es and a lone `bytes` tail with no adjacent-dynamic pair.
+    #[test]
+    fn silent_on_create2_pairfor() {
+        let fs = run(FP_CREATE2_PAIRFOR);
+        assert!(!fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
+    }
+
+    // Regression (R28 dogfood, account-abstraction): a single `bytes` operand
+    // beside fixed fields, returned (not hashed).
+    #[test]
+    fn silent_on_paymaster_suffix() {
+        let fs = run(FP_PAYMASTER_SUFFIX);
+        assert!(!fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
+    }
+
+    // Regression (R28 dogfood, v4-periphery SVG/Descriptor): adjacent dynamic
+    // `string`s concatenated into a DISPLAY/return string with no hash sink.
+    #[test]
+    fn silent_on_svg_display_string() {
+        let fs = run(FP_SVG_DISPLAY_STRING);
+        assert!(!fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
     }
 }

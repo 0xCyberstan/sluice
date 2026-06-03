@@ -83,16 +83,41 @@ impl Detector for TwapManipulationDetector {
                 continue;
             }
 
-            // --- (2) Is the price actually used for valuation? ---
+            // --- (2) Is the price actually *consumed* for a financial decision? ---
+            //
+            // The vulnerability is a manipulable price feeding a *financial* action
+            // (swap / borrow / mint / liquidation / collateral valuation) or being
+            // persisted to state. A function that merely *reads* a slot0/observe
+            // value and hands it back — a pure view passthrough getter
+            // (`StateView.getSlot0` → `return poolManager.getSlot0(id)`) — or that
+            // uses the tick only to render display metadata (`PositionDescriptor.
+            // tokenURI` building an NFT data-URI string) is NOT a price *consumer*:
+            // nothing downstream of it makes a value decision here, so a manipulated
+            // tick has no in-contract financial effect to exploit. Such functions
+            // are suppressed.
+
+            // 2a. Metadata / display getters: a `tokenURI`/`uri`/`name`/`symbol`/…
+            //     function, or any function that returns a `string` (a human-readable
+            //     label, not a quantity used in math). The read feeds presentation,
+            //     not a financial decision.
+            if is_metadata_or_string_returning(f) {
+                continue;
+            }
+
             let writes_accounting = f.effects.written_vars().iter().any(|v| is_accounting_name(v));
             let name_l = f.name.to_ascii_lowercase();
             let valuation_name = ["price", "value", "collateral", "quote", "amount", "convert", "rate", "twap", "oracle", "mint", "borrow", "liquidat"]
                 .iter()
                 .any(|k| name_l.contains(k));
-            // A view function that returns a number off one of these reads is a
-            // price getter even if its name is generic.
-            let returns_number = f.is_view_or_pure() && !f.returns.is_empty();
-            if !writes_accounting && !valuation_name && !returns_number {
+            // 2b. The price flows into a financial *use*: a valuation calculation
+            //     (arithmetic on the read — `price = sqrtP * sqrtP / Q96`, a
+            //     cumulative-tick `delta = c[1] - c[0]`) or a swap / borrow / mint /
+            //     liquidation / deposit / settlement *sink* call. A `view`/`pure`
+            //     getter that does none of these is a pure passthrough (it just
+            //     forwards the read), which is the `StateView.getSlot0` false
+            //     positive — suppress it. (A state write is itself a consuming use.)
+            let flows_into_financial_use = body_has_valuation_or_sink(f);
+            if !writes_accounting && !valuation_name && !flows_into_financial_use {
                 continue;
             }
 
@@ -347,6 +372,83 @@ fn reads_window_param(f: &sluice_ir::Function) -> bool {
     })
 }
 
+/// True if this is a metadata / display function whose price read feeds a
+/// human-readable label rather than a financial decision: a `tokenURI` / `uri` /
+/// `name` / `symbol` / `metadata` / `description` / `render` / `svg` / `image`
+/// function (the ERC-721/1155 metadata surface — `PositionDescriptor.tokenURI`),
+/// or **any** function that returns a `string` (a label, not a quantity used in
+/// math). Such a read never drives a swap/borrow/mint/valuation, so a manipulated
+/// tick has no in-contract financial effect here — it is not a price *consumer*.
+fn is_metadata_or_string_returning(f: &sluice_ir::Function) -> bool {
+    let l = f.name.to_ascii_lowercase();
+    // Substring markers: the metadata/display surface (`tokenURI`, `contractURI`,
+    // `*Metadata`, `renderSVG`, …).
+    const METADATA_SUBSTR: &[&str] = &["tokenuri", "contracturi", "metadata", "description", "svg"];
+    if METADATA_SUBSTR.iter().any(|m| l.contains(m)) {
+        return true;
+    }
+    // Exact-match label getters (kept exact so they don't shadow a real consumer
+    // whose name merely *contains* one of these tokens, e.g. `renameVault`).
+    const METADATA_EXACT: &[&str] = &["uri", "name", "symbol", "render", "image"];
+    if METADATA_EXACT.iter().any(|m| l == *m) {
+        return true;
+    }
+    // A `string`-returning function yields a label, not a quantity for math.
+    f.returns.iter().any(|r| {
+        let t = r.ty.trim();
+        t.starts_with("string")
+    })
+}
+
+/// True if the body uses a price for a financial decision: it performs a
+/// **valuation calculation** (an arithmetic operation — the manipulable tick is
+/// scaled / differenced / multiplied into a value, e.g. `price = sqrtP * sqrtP /
+/// Q96` or a cumulative-tick `delta = c[1] - c[0]`), or it calls a financial
+/// **sink** (`swap` / `borrow` / `mint` / `liquidate` / `deposit` / `redeem` /
+/// `repay` / `withdraw` / `settle` / `quote` / `convert` / `value` / `collateral`
+/// / `price`). A `view`/`pure` getter that does **none** of these is a pure
+/// passthrough that merely forwards the read (the `StateView.getSlot0` shape) and
+/// is therefore not a price consumer.
+fn body_has_valuation_or_sink(f: &sluice_ir::Function) -> bool {
+    use sluice_ir::ExprKind;
+    const SINK_CALLS: &[&str] = &[
+        "swap", "borrow", "mint", "liquidat", "deposit", "redeem", "repay", "withdraw", "settle",
+        "quote", "convert", "value", "collateral", "price", "exchange", "getamount", "calculate",
+    ];
+    let mut found = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            match &e.kind {
+                // A valuation calculation: arithmetic that scales / differences the
+                // price into a derived value.
+                ExprKind::Binary { op, .. } if op.is_arithmetic() => {
+                    found = true;
+                }
+                // A financial-sink call (by best-effort callee name).
+                ExprKind::Call(c) => {
+                    let name = c
+                        .func_name
+                        .as_deref()
+                        .or_else(|| c.callee.simple_name())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if SINK_CALLS.iter().any(|k| name.contains(k)) {
+                        found = true;
+                    }
+                }
+                _ => {}
+            }
+        });
+        if found {
+            break;
+        }
+    }
+    found
+}
+
 /// Span of the first Uniswap-V3-style price read in the body (the `slot0` /
 /// `observe` / `consult` call), used as the finding anchor.
 fn price_read_span(f: &sluice_ir::Function) -> Option<sluice_ir::Span> {
@@ -435,5 +537,91 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "twap-manipulation"));
+    }
+
+    // ---- Fix A regressions: view passthrough / metadata are NOT price consumers ----
+
+    // Real shape (Uniswap v4-periphery `StateView.getSlot0`): a pure `view`
+    // passthrough that just forwards `poolManager.getSlot0(id)` to its return. It
+    // reads slot0 but does NOT consume it for any swap/borrow/mint/valuation, so a
+    // manipulated tick has no in-contract financial effect — must be SILENT.
+    const VIEW_PASSTHROUGH_GETSLOT0: &str = r#"
+        interface IPoolManager {
+            function getSlot0(bytes32 id)
+                external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee);
+        }
+        contract StateView {
+            IPoolManager public poolManager;
+            function getSlot0(bytes32 poolId)
+                external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)
+            {
+                return poolManager.getSlot0(poolId);
+            }
+        }
+    "#;
+
+    #[test]
+    fn view_passthrough_getslot0_is_silent() {
+        let fs = run(VIEW_PASSTHROUGH_GETSLOT0);
+        assert!(
+            !fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "a pure view slot0 passthrough getter must not fire (not a price consumer): {:?}",
+            fs.iter().filter(|f| f.detector == "twap-manipulation").collect::<Vec<_>>()
+        );
+    }
+
+    // Real shape (Uniswap v4-periphery `PositionDescriptor.tokenURI`): reads slot0
+    // for the current `tick`, but the tick is only used to render an NFT metadata
+    // data-URI *string*. Display, not a financial decision — must be SILENT.
+    const TOKENURI_METADATA: &str = r#"
+        interface IPoolManager {
+            function getSlot0(bytes32 id) external view returns (uint160, int24, uint24, uint24);
+        }
+        library Descriptor { function build(int24 tick) internal pure returns (string memory) {} }
+        contract PositionDescriptor {
+            IPoolManager public poolManager;
+            function tokenURI(bytes32 poolId, uint256 tokenId) external view returns (string memory) {
+                (, int24 tick,,) = poolManager.getSlot0(poolId);
+                return Descriptor.build(tick);
+            }
+        }
+    "#;
+
+    #[test]
+    fn tokenuri_metadata_is_silent() {
+        let fs = run(TOKENURI_METADATA);
+        assert!(
+            !fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "a tokenURI metadata getter (string return) must not fire: {:?}",
+            fs.iter().filter(|f| f.detector == "twap-manipulation").collect::<Vec<_>>()
+        );
+    }
+
+    // Over-suppression guard: a *consuming* `view` getter with a generic name that
+    // actually derives a value from slot0 (a valuation calculation `sqrtP * sqrtP`)
+    // is a genuine spot-price consumer and MUST still fire — the passthrough
+    // suppression must not silence a real spot-price valuation.
+    const VIEW_CONSUMER_VALUES_SLOT0: &str = r#"
+        interface IPoolManager {
+            function getSlot0(bytes32 id) external view returns (uint160 sqrtPriceX96, int24 tick, uint24, uint24);
+        }
+        contract Lending {
+            IPoolManager public poolManager;
+            function check(bytes32 poolId) external view returns (uint256 collateralValue) {
+                (uint160 sqrtP,,,) = poolManager.getSlot0(poolId);
+                // derive a price from the *instantaneous* sqrtPrice — manipulable
+                collateralValue = (uint256(sqrtP) * uint256(sqrtP)) >> 96;
+            }
+        }
+    "#;
+
+    #[test]
+    fn view_consumer_that_values_slot0_still_fires() {
+        let fs = run(VIEW_CONSUMER_VALUES_SLOT0);
+        assert!(
+            fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "a view getter that derives a value from slot0 must still fire: {:?}",
+            fs
+        );
     }
 }

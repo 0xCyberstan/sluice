@@ -16,19 +16,36 @@
 //! cardinal rule (precision over volume): a Low (or higher) finding is reserved
 //! for a body with a genuine **fund-sink whose destination is not a fixed/preset
 //! recipient** — i.e. an attacker-steerable fund movement. Everything weaker is
-//! Info or silent.
+//! Info or silent. The Medium (fund-reroute) tier is in turn reserved for a body
+//! that executes a genuine **fund-movement opcode** — a token
+//! `transfer`/`safeTransfer`/`transferFrom`, an ETH send, a `mint`/`burn`, or an
+//! `approve` — to an **externally-supplied / steerable** destination; a pure
+//! privileged setter that only reassigns configuration (an **address re-point**
+//! with no transfer/mint/approve opcode) is not a fund mover and is capped at Low.
 //!
 //!   * **Strong** — "Privileged admin can move/re-route user funds with no
 //!     timelock" — when the body contains a real fund-flow (token
 //!     `transfer`/`safeTransfer`/`transferFrom`, `.call{value:}` / `.send` ETH
 //!     move, `mint`/`burn`, `approve`, or a reassignment of a
-//!     withdrawal/treasury/recipient **address** state variable) AND that flow is
-//!     attacker-steerable: the destination is **caller-chosen** (`withdrawTo(to,
-//!     …)` / `rescue(token,to,amt)`), or it is a supply move (`mint`/`burn`), or
-//!     it re-points a recipient **address** state var. A fund-routing-shaped
-//!     setter (`set*Fee` / `setRouter` / `migrate`) that also moves funds is the
-//!     more serious configuration-reroute case → **Medium**; a plain steerable
-//!     fund mover → **Low**.
+//!     withdrawal/treasury/recipient **address** state variable). The severity
+//!     then turns on whether the body executes a fund-movement **opcode** and how
+//!     steerable it is:
+//!       - **Medium** — a fund-movement opcode (`transfer`/`safeTransfer`/
+//!         `transferFrom`/`mint`/`burn`/`approve`/ETH-send) to an
+//!         **externally-supplied / steerable** destination: a caller-chosen
+//!         (parameter) recipient (`withdrawTo(to, …)`, `Collector.transfer(token,
+//!         recipient, …)`), or a `mint`/`burn` to a non-fixed-protocol account
+//!         (Aave `BackingEigen.mint(to, …)`). A fund-routing-shaped setter
+//!         (`set*Fee` / `setRouter` / `migrate` / `setFeeReceiver`) that *also*
+//!         executes a fund-movement opcode — even to a fixed/preset destination
+//!         (`Allocator.migrate` → `safeTransfer(newAllocator, …)`) — is the
+//!         configuration-reroute case and is likewise **Medium**.
+//!       - **Low** — a privileged setter that **re-points** a withdrawal/treasury/
+//!         recipient **address** state var but executes **no** fund-movement opcode
+//!         (`setFeeToSetter` reassigning the next admin, `setTreasury(address)`,
+//!         the `pullVault` ownership-accept two-step). It changes where *future*
+//!         funds go but moves nothing itself in this transaction, so it is a pure
+//!         privileged setter — capped at Low, never the Medium fund-reroute tier.
 //!   * **Suppressed — preset-destination fund mover** — a body that *does* move
 //!     funds but only to a **fixed / preset / internal** destination (a state
 //!     var, a constant, a per-`id` mapping entry, or a bare `approve` to a fixed
@@ -235,19 +252,6 @@ impl Detector for CentralizationDetector {
                 if all_value_moves_are_caller_own(f) {
                     continue;
                 }
-                // A fund-routing-shaped name (sets a fee/recipient/treasury/router,
-                // or a sweep/migrate) that *also* moves funds is the most serious
-                // configuration-reroute case → Medium, strong title.
-                if is_fund_routing_setter(&f.name) {
-                    out.push(self.finding(
-                        cx,
-                        f,
-                        STRONG_TITLE,
-                        Severity::Medium,
-                        strong_msg(&contract.name, &f.name),
-                    ));
-                    continue;
-                }
                 // Protocol-internal plumbing: the access guard pins `msg.sender` to
                 // a **fixed protocol contract** (an inline / modifier
                 // `require(msg.sender == <immutable | constant | contract-typed |
@@ -256,8 +260,11 @@ impl Detector for CentralizationDetector {
                 // / governance) path. The *only* caller is that one wired contract,
                 // so a mint/burn or transfer here is the protocol's own machinery
                 // (e.g. `StakingDistributor.distribute` minting to `staking`, an
-                // `OptimismMintableERC20.mint` callable only by `BRIDGE`), not a
-                // discretionary admin who can rug users — suppress.
+                // `OptimismMintableERC20.mint` callable only by `BRIDGE`, an Aave
+                // `AToken.transferUnderlyingTo` callable only by the immutable
+                // `POOL`), not a discretionary admin who can rug users — suppress.
+                // (Checked before the tiering arms so protocol plumbing never lands
+                // in the Medium fund-movement tier.)
                 //
                 // Exception: a body that **re-points** a withdrawal/treasury/
                 // recipient *address* state var is a genuine fund-routing change
@@ -269,19 +276,80 @@ impl Detector for CentralizationDetector {
                 {
                     continue;
                 }
-                // Steerable fund-flow → Low, strong title. "Steerable" means the
-                // admin can direct value somewhere an attacker would care about:
-                //   * the destination is **caller-chosen** (a parameter), the
-                //     classic `withdrawTo(to, …)` / arbitrary-recipient rug; or
-                //   * the body **mints / burns** supply to a destination that is
-                //     not the caller's own / a fixed protocol contract (creates or
-                //     destroys balances at an attacker-relevant address); or
-                //   * it re-points a withdrawal/treasury/recipient **address**
-                //     state var (re-routes where future funds go).
-                if has_caller_chosen_value_move(f)
-                    || mint_or_burn_is_steerable(f, contract)
-                    || reassigns_recipient_address(f, contract)
-                {
+
+                // Does the body actually execute a **fund-movement opcode** — a
+                // token `transfer`/`safeTransfer`/`transferFrom`, an ETH send, a
+                // `mint`/`burn`, or an `approve`? This is the genuine-fund-movement
+                // gate that separates the Medium (fund-reroute) tier from a pure
+                // privileged setter. A body whose *only* fund-flow signal is a
+                // recipient-**address re-point** (a state-var write, no transfer /
+                // mint / approve) is a privileged setter, not a fund mover.
+                let has_opcode = has_fund_movement_opcode(f);
+                // Is that movement **steerable** — directed somewhere an attacker
+                // would care about: a caller-chosen (externally-supplied) destination
+                // (`withdrawTo(to, …)` / `mint(to, …)`), or a `mint`/`burn` to a
+                // non-fixed-protocol account (creates/destroys balances at an
+                // attacker-relevant address)?
+                let steerable = has_caller_chosen_value_move(f) || mint_or_burn_is_steerable(f, contract);
+
+                // (1) Genuine fund movement to an externally-supplied / steerable
+                //     destination → Medium. This is the real fund-reroute the class
+                //     is for: a `transfer`/`safeTransfer`/`transferFrom`/`mint`/
+                //     `approve` opcode whose destination an admin can steer to an
+                //     attacker-relevant address (Aave `BackingEigen.mint(to, …)`,
+                //     `Collector.transfer(token, recipient, …)`, an
+                //     `emergencyTokenTransfer(token, to, …)`). Reserving Medium for
+                //     an actual fund-movement opcode is what keeps a pure admin
+                //     setter (no opcode) out of the Medium tier.
+                if has_opcode && steerable {
+                    out.push(self.finding(
+                        cx,
+                        f,
+                        STRONG_TITLE,
+                        Severity::Medium,
+                        strong_msg(&contract.name, &f.name),
+                    ));
+                    continue;
+                }
+                // (2) A fund-routing-shaped name (`set*Fee` / `setRouter` / `migrate`
+                //     / `setFeeReceiver`) that *also* executes a fund-movement opcode
+                //     — even to a fixed/preset destination — is the configuration-
+                //     reroute case → Medium, strong title (e.g. `Allocator.migrate`
+                //     transferring held funds to `newAllocator`). The opcode
+                //     requirement is what now excludes a pure address-re-pointing
+                //     setter (`setFeeToSetter` / `setFeeTo`, body `feeTo = x;` with
+                //     no transfer/mint) from this Medium arm; such a setter falls
+                //     through to the Low tier below.
+                if is_fund_routing_setter(&f.name) && has_opcode {
+                    out.push(self.finding(
+                        cx,
+                        f,
+                        STRONG_TITLE,
+                        Severity::Medium,
+                        strong_msg(&contract.name, &f.name),
+                    ));
+                    continue;
+                }
+                // (3) A privileged change that **re-points** a withdrawal / treasury
+                //     / recipient **address** state var but executes no fund-movement
+                //     opcode is a pure privileged setter — it redirects where *future*
+                //     funds go, but moves nothing itself in this transaction. Per the
+                //     tiering, a setter with no fund-movement opcode is at most Low
+                //     (the `setFeeToSetter` / `setTreasury` / `pullVault` shape).
+                if reassigns_recipient_address(f, contract) {
+                    out.push(self.finding(
+                        cx,
+                        f,
+                        STRONG_TITLE,
+                        Severity::Low,
+                        strong_msg(&contract.name, &f.name),
+                    ));
+                    continue;
+                }
+                // (4) A steerable fund movement that is not caught above (defensive:
+                //     e.g. a caller-chosen move our opcode scan could not positively
+                //     confirm) → Low, strong title.
+                if steerable {
                     out.push(self.finding(
                         cx,
                         f,
@@ -504,6 +572,50 @@ fn has_fund_flow(f: &Function, contract: &Contract) -> bool {
                 // Mint / burn create or destroy balances.
                 Some("mint") | Some("_mint") | Some("burn") | Some("_burn") => found = true,
                 // Approvals grant spending authority over held funds.
+                Some("approve") | Some("safeApprove") | Some("forceApprove") => found = true,
+                _ => {}
+            }
+        });
+        if found {
+            break;
+        }
+    }
+    found
+}
+
+/// True if the function body executes a real **fund-movement opcode**: a token
+/// `transfer`/`transferFrom`/`safeTransfer`/`safeTransferFrom`, a native-ETH send
+/// (`.transfer`/`.send`/`.call{value:}`), a `mint`/`burn`, or an `approve`. This
+/// is the subset of [`has_fund_flow`] that *moves value in this transaction* — it
+/// deliberately **excludes** a bare recipient-**address re-point** (a state-var
+/// write). It is the gate for the Medium fund-reroute tier: a privileged setter
+/// that merely reassigns an address (`setFeeToSetter` / `setFeeTo`, body `feeTo =
+/// x;`) executes no opcode and so is not a fund mover.
+fn has_fund_movement_opcode(f: &Function) -> bool {
+    let mut found = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            let ExprKind::Call(call) = &e.kind else { return };
+            // Native-ETH send.
+            if matches!(call.kind, CallKind::Transfer | CallKind::Send)
+                || (call.kind == CallKind::LowLevelCall && call.value.is_some())
+            {
+                found = true;
+                return;
+            }
+            match call.func_name.as_deref() {
+                Some("transfer") | Some("transferFrom")
+                    if matches!(call.kind, CallKind::External | CallKind::Internal) =>
+                {
+                    found = true;
+                }
+                Some("safeTransfer") | Some("safeTransferFrom") => found = true,
+                Some("mint") | Some("_mint") | Some("burn") | Some("_burn") | Some("burnFrom") => {
+                    found = true
+                }
                 Some("approve") | Some("safeApprove") | Some("forceApprove") => found = true,
                 _ => {}
             }
@@ -1058,12 +1170,15 @@ fn call_callee_name(c: &sluice_ir::Call) -> Option<&str> {
     c.callee.simple_name()
 }
 
-/// True if the expression mentions `msg.sender` anywhere (deep), peeling casts at
-/// the root. Used to pre-filter guard conditions.
+/// True if the expression mentions the caller anywhere (deep) — either
+/// `msg.sender` or the OZ / ERC-2771 accessor `_msgSender()` / `msgSender()`. Used
+/// to pre-filter guard conditions, so a guard written as
+/// `require(_msgSender() == address(POOL))` (the Aave `onlyPool` shape) is
+/// recognized as a `msg.sender` access check just like `msg.sender == POOL`.
 fn expr_mentions_msg_sender(e: &Expr) -> bool {
     let mut found = false;
     e.visit(&mut |sub| {
-        if sub.mentions_member("msg", "sender") {
+        if mentions_msg_sender(sub) {
             found = true;
         }
     });
@@ -1207,6 +1322,9 @@ fn value_move_dest(call: &sluice_ir::Call) -> Option<&Expr> {
         call.func_name.as_deref(),
         Some("transfer") | Some("transferFrom") | Some("safeTransfer") | Some("safeTransferFrom")
             | Some("mint") | Some("_mint")
+            // `approve(spender, amt)` grants spending authority; the spender is the
+            // steerable destination (second-to-last arg, like a transfer recipient).
+            | Some("approve") | Some("safeApprove") | Some("forceApprove")
     );
     if !is_transfer_family {
         return None;
@@ -2197,6 +2315,104 @@ mod tests {
         assert!(
             c.iter().any(|f| f.title.contains("move/re-route user funds")),
             "a recipient/treasury re-point must still fire strong even under a fixed-contract guard: {:?}",
+            c
+        );
+    }
+
+    // ===== Fix B: Medium reserved for a genuine fund-movement opcode ==========
+
+    // Real shape (gte-perps `GTELaunchpadV2PairFactory.setFeeToSetter`): a pure
+    // admin setter that only **reassigns the next admin** address —
+    // `feeToSetter = _feeToSetter;` — with NO transfer/mint/approve opcode. It moves
+    // no funds, so it must NOT sit at the Medium fund-reroute tier; downgraded to
+    // Low (a privileged setter), never Medium+.
+    const PURE_ADMIN_SETTER_NO_OPCODE: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Factory {
+            address public feeTo;
+            address public feeToSetter;
+            function setFeeToSetter(address _feeToSetter) external {
+                if (msg.sender != feeToSetter) revert("FORBIDDEN");
+                feeToSetter = _feeToSetter;
+            }
+            function setFeeTo(address _feeTo) external {
+                if (msg.sender != feeToSetter) revert("FORBIDDEN");
+                feeTo = _feeTo;
+            }
+        }
+    "#;
+
+    #[test]
+    fn pure_admin_setter_no_opcode_is_at_most_low() {
+        let fs = run(PURE_ADMIN_SETTER_NO_OPCODE);
+        let c = central(&fs);
+        assert!(!c.is_empty(), "the address-re-pointing setters should still be reported");
+        // A setter with no fund-movement opcode must never reach Medium+.
+        assert!(
+            c.iter().all(|f| f.severity <= Severity::Low),
+            "a pure admin setter (no transfer/mint/approve opcode) must be at most Low, never Medium: {:?}",
+            c
+        );
+        // Specifically the named `setFeeToSetter` shape is Low (not Medium).
+        assert!(
+            c.iter().any(|f| f.function == "setFeeToSetter" && f.severity == Severity::Low),
+            "setFeeToSetter must be Low: {:?}",
+            c
+        );
+    }
+
+    // Real shape (Aave/EigenLayer `BackingEigen.mint`): a privileged `mint(to,
+    // amount)` to a caller-supplied (externally-supplied) address — a genuine
+    // fund-movement opcode that creates balances at an attacker-relevant address.
+    // This is the fund-reroute tier and MUST be Medium or higher.
+    const MINT_TO_ARBITRARY_ADDRESS: &str = r#"
+        pragma solidity ^0.8.0;
+        contract BackingEigen {
+            mapping(address => bool) public isMinter;
+            function _mint(address to, uint256 a) internal {}
+            function mint(address to, uint256 amount) external {
+                require(isMinter[msg.sender], "not a minter");
+                _mint(to, amount);
+            }
+        }
+    "#;
+
+    #[test]
+    fn mint_to_arbitrary_address_is_medium_or_higher() {
+        let fs = run(MINT_TO_ARBITRARY_ADDRESS);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.function == "mint"
+                && f.severity >= Severity::Medium
+                && f.title.contains("move/re-route user funds")),
+            "mint(to, amount) to a caller-supplied address must be Medium+ (genuine fund-reroute): {:?}",
+            c
+        );
+    }
+
+    // Companion: a caller-chosen *transfer* to an externally-supplied address (the
+    // Aave `Collector.transfer(token, recipient, amt)` / `emergencyTokenTransfer`
+    // shape) is also a genuine fund movement → Medium+, strong title.
+    const TRANSFER_TO_ARBITRARY_ADDRESS: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IERC20 { function safeTransfer(address to, uint256 a) external; }
+        contract Collector {
+            address public owner;
+            modifier onlyFundsAdmin() { require(msg.sender == owner, "no"); _; }
+            function transfer(IERC20 token, address recipient, uint256 amount) external onlyFundsAdmin {
+                token.safeTransfer(recipient, amount);
+            }
+        }
+    "#;
+
+    #[test]
+    fn admin_transfer_to_arbitrary_address_is_medium_or_higher() {
+        let fs = run(TRANSFER_TO_ARBITRARY_ADDRESS);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.severity >= Severity::Medium
+                && f.title.contains("move/re-route user funds")),
+            "an admin transfer to a caller-supplied recipient must be Medium+: {:?}",
             c
         );
     }

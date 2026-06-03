@@ -75,12 +75,51 @@ fn is_trusted_call(cs: &CallSite, trusted: &rustc_hash::FxHashSet<String>) -> bo
         && trusted.contains(sluice_frontier::target_root(&cs.target))
 }
 
+/// True iff this `External` call is really a STATELESS-LIBRARY / static-namespace
+/// dispatch (`Time.timestamp()`, `Math.max(...)`, `UQ112x112.encode(...)`,
+/// `SafeCast.toUint128(...)`) rather than a call into another contract. Such a
+/// call runs in-process (an internal `JUMP`), never hands control to attacker
+/// code, and therefore can never arm reentrancy.
+///
+/// The parser already classifies these as `Internal` when the library is in the
+/// analyzed source set; the problem is the common case where the library lives in
+/// an EXCLUDED dependency tree (`lib/`, `@openzeppelin/…`) and so is invisible to
+/// the parser, which then falls back to `External`. We recover the library shape
+/// structurally: the call receiver is a BARE PascalCase identifier (`Time`,
+/// `UQ112x112`) — a type/library namespace — and NOT a state variable of the
+/// contract (a `Pool`-named handle would be a real callee). A receiver that is a
+/// member/cast/index/`msg.*` expression (`IFoo(addr)`, `a.b`, `q[i]`, `msg`) is
+/// never a bare namespace, so genuine external calls are unaffected. Value-bearing
+/// and token-transfer-named calls are excluded for safety: even a namespaced
+/// `SafeERC20.safeTransfer(token, …)` ultimately moves tokens and is left armed.
+fn is_library_static_call(cs: &CallSite, contract_state_vars: &rustc_hash::FxHashSet<String>) -> bool {
+    if cs.kind != CallKind::External || cs.sends_value || is_token_transfer_name(cs.func_name.as_deref()) {
+        return false;
+    }
+    let root = sluice_frontier::target_root(&cs.target);
+    // The receiver must be EXACTLY a bare identifier (`target` is the whole
+    // receiver text; if it had a `.`/`(`/`[`/space the root would be a prefix of
+    // it). Reject anything where the root is not the full target.
+    if root != cs.target.trim() {
+        return false;
+    }
+    // PascalCase (type/library convention) and not a declared state variable.
+    let mut chars = root.chars();
+    let pascal = chars.next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+        && root.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    pascal && !contract_state_vars.contains(root)
+}
+
 /// True iff `f` contains at least one GENUINE (untrusted) reentrancy-capable
 /// external/low-level call that actually ARMS reentrancy (untrusted, and not an
 /// internal guard/assert helper). A function with none of these cannot be
 /// re-entered, so it must never trip a classic/cross-function reentrancy rule.
-fn has_genuine_reentry_vector(f: &Function, trusted: &rustc_hash::FxHashSet<String>) -> bool {
-    f.effects.call_sites.iter().any(|cs| is_arming_call(cs, trusted))
+fn has_genuine_reentry_vector(
+    f: &Function,
+    trusted: &rustc_hash::FxHashSet<String>,
+    state_vars: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    f.effects.call_sites.iter().any(|cs| is_arming_call(cs, trusted, state_vars))
 }
 
 /// True iff the arming external call is a low-level/value call to a
@@ -92,9 +131,10 @@ fn has_genuine_reentry_vector(f: &Function, trusted: &rustc_hash::FxHashSet<Stri
 fn has_caller_supplied_value_vector(
     f: &Function,
     trusted: &rustc_hash::FxHashSet<String>,
+    state_vars: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     f.effects.call_sites.iter().any(|cs| {
-        is_arming_call(cs, trusted)
+        is_arming_call(cs, trusted, state_vars)
             && cs.sends_value
             && {
                 let root = sluice_frontier::target_root(&cs.target).to_ascii_lowercase();
@@ -149,13 +189,22 @@ fn is_guard_helper_name(name: Option<&str>) -> bool {
 }
 
 /// A reentry-capable call site that genuinely ARMS reentrancy: an untrusted
-/// re-entry vector that is NOT an internal guard/assert helper. The guard-helper
-/// exclusion is the `setFeature`-shape protection (an `_assertOnly*()` check must
-/// never be read as the arming external call).
-fn is_arming_call(cs: &CallSite, trusted: &rustc_hash::FxHashSet<String>) -> bool {
+/// re-entry vector that is NOT an internal guard/assert helper and NOT a
+/// stateless-library / static-namespace dispatch. The guard-helper exclusion is
+/// the `setFeature`-shape protection (an `_assertOnly*()` check must never be read
+/// as the arming external call); the library-static exclusion is the
+/// `Time.timestamp()` / `UQ112x112.encode()` shape (a pure in-process library call
+/// mis-classified `External` because the library lives in an excluded dependency
+/// tree — it hands control to no one and cannot be re-entered).
+fn is_arming_call(
+    cs: &CallSite,
+    trusted: &rustc_hash::FxHashSet<String>,
+    state_vars: &rustc_hash::FxHashSet<String>,
+) -> bool {
     is_reentry_vector(cs)
         && !is_trusted_call(cs, trusted)
         && !is_guard_helper_name(cs.func_name.as_deref())
+        && !is_library_static_call(cs, state_vars)
 }
 
 /// True iff `f` performs a storage WRITE to one of `vars` STRICTLY AFTER a
@@ -169,18 +218,113 @@ fn has_qualifying_post_call_write(
     f: &Function,
     vars: &[String],
     trusted: &rustc_hash::FxHashSet<String>,
+    state_vars: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     let first_vector = f
         .effects
         .call_sites
         .iter()
-        .filter(|cs| is_arming_call(cs, trusted))
+        .filter(|cs| is_arming_call(cs, trusted, state_vars))
         .map(|cs| cs.order)
         .min();
     let Some(first) = first_vector else { return false };
     f.effects.storage_writes.iter().any(|w| {
         w.order > first && is_value_state_var(&w.var) && vars.iter().any(|v| v == &w.var)
     })
+}
+
+/// True iff the read-only-flagged getter `f` (or one of its DIRECTLY resolved
+/// internal callees) performs a genuine reentrancy-capable external/low-level call
+/// in its OWN body. Read-only reentrancy is only reportable when the getter itself
+/// hands control out mid-read; a getter that merely returns a storage read
+/// (`getReserves`, `totalOperatorNetworkSharesAt` — a pure `upperLookupRecent`
+/// library lookup) makes no external call and therefore cannot expose mid-update
+/// state through its own execution. We look at the getter's own call sites and its
+/// directly resolved callees (`f.callees`) — NOT an inherited superclass chain and
+/// NOT a transitive closure — matching the precision contract exactly.
+fn readonly_getter_has_own_call(
+    cx: &AnalysisContext,
+    f: &Function,
+    trusted: &rustc_hash::FxHashSet<String>,
+    state_vars: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    if has_genuine_reentry_vector(f, trusted, state_vars) {
+        return true;
+    }
+    f.callees.iter().any(|cid| {
+        cx.scir.function(*cid).is_some_and(|callee| {
+            // A callee in another contract resolves its own trusted set; reuse the
+            // getter's (a superset of immutable/infra names) as a safe approximation
+            // — the only goal is to detect a REAL external/low-level call there.
+            has_genuine_reentry_vector(callee, trusted, state_vars)
+        })
+    })
+}
+
+/// True iff `f` exposes a GENUINE cross-function re-entry surface across its
+/// external call: it either (a) writes some storage STRICTLY AFTER the call
+/// (leaving shared state mid-update — the revest double-mint shape, and the
+/// deferred-write case where the post-call write lives in a callee is still
+/// covered by (b) via the read-before var), or (b) reads BEFORE the call a storage
+/// var it does NOT settle (write) before the call and that is not a trusted
+/// governance/config address — a value it carries across the re-entry window
+/// (Pendle `increaseLockPosition`'s `positionData`).
+///
+/// A function that SETTLES every var it reads before the call (writes the new
+/// value before interacting — CEI) and whose only other pre-call reads are
+/// trusted config/guard addresses, with NO post-call write, has nothing for a
+/// re-entrant sibling to corrupt. That is the v4 `collectProtocolFees` shape:
+/// `protocolFeesAccrued` is decremented before `currency.transfer` and the guard
+/// read is `protocolFeeController` (a trusted controller address) — CEI-correct.
+fn has_cross_function_surface(
+    f: &Function,
+    trusted: &rustc_hash::FxHashSet<String>,
+    state_vars: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    let Some(first) = f
+        .effects
+        .call_sites
+        .iter()
+        .filter(|cs| is_arming_call(cs, trusted, state_vars))
+        .map(|cs| cs.order)
+        .min()
+    else {
+        return false;
+    };
+    // (a) any storage write strictly after the external call — state left
+    // mid-update for a re-entrant sibling.
+    if f.effects.storage_writes.iter().any(|w| w.order > first) {
+        return true;
+    }
+    // (b) a pre-call read of a var that is NOT settled before the call and is not a
+    // trusted config/guard address — a stale value relied on across the call.
+    let written_before: rustc_hash::FxHashSet<&str> = f
+        .effects
+        .storage_writes
+        .iter()
+        .filter(|w| w.order < first)
+        .map(|w| w.var.as_str())
+        .collect();
+    f.effects.storage_reads.iter().any(|r| {
+        r.order < first
+            && !written_before.contains(r.var.as_str())
+            && !is_trusted_state_name(&r.var)
+    })
+}
+
+/// True iff `name` reads like a trusted governance/config/guard ADDRESS variable —
+/// a `*controller`/`*owner`/`*admin`/`*authority`/`*governor`/`*registry`/… handle
+/// that an entry guard compares against (`if (msg.sender != protocolFeeController)`).
+/// A pre-call read of such a var is a permission check, not value carried across
+/// the re-entry window, so it must not seed a cross-function finding.
+fn is_trusted_state_name(name: &str) -> bool {
+    let l = name.trim_start_matches('_').to_ascii_lowercase();
+    const TRUSTED: &[&str] = &[
+        "controller", "owner", "admin", "authority", "governor", "governance",
+        "registry", "factory", "manager", "guardian", "role", "timelock",
+        "comptroller", "oracle", "feed",
+    ];
+    TRUSTED.iter().any(|k| l.contains(k))
 }
 
 impl Detector for ReentrancyDetector {
@@ -204,6 +348,14 @@ impl Detector for ReentrancyDetector {
             // (`distributor`/`treasury`/`veFXS`/a getter-dispatched module). This
             // mirrors the frontier exactly so detector and producer agree.
             let trusted = sluice_frontier::reentrancy_trusted_targets(cx.scir, f.contract);
+            // Declared state-variable names of f's contract — used to tell a
+            // stateless-library namespace (`Time`, `UQ112x112`) apart from a real
+            // contract handle stored in a (rare PascalCase) state var.
+            let state_vars: rustc_hash::FxHashSet<String> = cx
+                .scir
+                .contract(f.contract)
+                .map(|c| c.state_vars.iter().map(|v| v.name.clone()).collect())
+                .unwrap_or_default();
 
             for r in cx.frontier.reentrancy_of(f.id) {
                 if r.guarded || cx.has_reentrancy_guard(f) {
@@ -224,18 +376,29 @@ impl Detector for ReentrancyDetector {
                     // the external call, so that function must itself contain a
                     // genuine (untrusted) re-entry vector.
                     ReentrancyKind::Classic | ReentrancyKind::CrossFunction => {
-                        if !has_genuine_reentry_vector(f, &trusted) {
-                            // Either no external/low-level call at all, or every
-                            // such call targets trusted infrastructure (the
-                            // harvest-calls-`distributor`/`treasury` class). Not an
-                            // open re-entry surface — suppress.
+                        if !has_genuine_reentry_vector(f, &trusted, &state_vars) {
+                            // No external/low-level call at all, every such call
+                            // targets trusted infrastructure (the
+                            // harvest-calls-`distributor`/`treasury` class), or the
+                            // only "call" is a stateless-library dispatch
+                            // (`Time.timestamp()`/`UQ112x112.encode()` — the
+                            // VaultTokenized `_update`/`setOperatorNetworkShares`
+                            // shape). Not an open re-entry surface — suppress.
                             continue;
                         }
                     }
-                    // Read-only flags a view getter (which makes no external call);
-                    // its backing call was already validated on the writer path and
-                    // recorded in `backed_by_call`.
-                    ReentrancyKind::ReadOnly => {}
+                    // Read-only flags a view getter. Per the precision contract it
+                    // is reportable ONLY when the getter ITSELF (or a directly
+                    // resolved internal callee) makes a genuine external/low-level
+                    // call mid-read — a pure storage-read getter (`getReserves`,
+                    // `totalOperatorNetworkSharesAt`) cannot expose mid-update state
+                    // through its own execution and must stay silent, regardless of
+                    // what a sibling mutating writer does.
+                    ReentrancyKind::ReadOnly => {
+                        if !readonly_getter_has_own_call(cx, f, &trusted, &state_vars) {
+                            continue;
+                        }
+                    }
                 }
 
                 // PRECISION GATE 2 (classic only) — require a storage write
@@ -245,7 +408,20 @@ impl Detector for ReentrancyDetector {
                 // there is no post-call write at all (a one-line transfer), there
                 // is nothing for re-entry to corrupt.
                 if r.kind == ReentrancyKind::Classic
-                    && !has_qualifying_post_call_write(f, &r.vars_written_after, &trusted)
+                    && !has_qualifying_post_call_write(f, &r.vars_written_after, &trusted, &state_vars)
+                {
+                    continue;
+                }
+
+                // PRECISION GATE 2b (cross-function only) — require a genuine
+                // cross-function surface on f: state left written AFTER the call, or
+                // an unsettled, non-config pre-call read carried across the call. A
+                // CEI-correct function that settles every value it reads before the
+                // call and only otherwise reads a trusted config/guard address, with
+                // no post-call write, is not re-enterable into harm (v4
+                // `collectProtocolFees`: decrement before `currency.transfer`).
+                if r.kind == ReentrancyKind::CrossFunction
+                    && !has_cross_function_surface(f, &trusted, &state_vars)
                 {
                     continue;
                 }
@@ -313,7 +489,7 @@ impl Detector for ReentrancyDetector {
                 // High — so an unrecognized in-protocol call can no longer over-rank
                 // to Critical (the `claimCredit` shape). Read-only / cross-function
                 // keep their existing value-flow corroboration.
-                let caller_supplied_value = has_caller_supplied_value_vector(f, &trusted);
+                let caller_supplied_value = has_caller_supplied_value_vector(f, &trusted, &state_vars);
                 let add_value_flow = match r.kind {
                     ReentrancyKind::Classic => caller_supplied_value,
                     _ => f.effects.call_sites.iter().any(|c| c.sends_value),
@@ -579,6 +755,175 @@ mod tests {
         assert!(
             classic.dimensions.contains(&Dimension::ValueFlow),
             "a caller-supplied value re-entry must retain the ValueFlow corroboration dimension"
+        );
+    }
+
+    /// R28 FP1 — read-only reentrancy on a pure storage-read view getter.
+    /// Real sites: gte `GTELaunchpadV2Pair.getReserves` (returns three reserve
+    /// slots) and symbiotic `NetworkRestakeDelegator.totalOperatorNetworkSharesAt`
+    /// (a single `upperLookupRecent` library lookup). The getter makes NO external
+    /// call of its own, so it cannot expose mid-update state through its own
+    /// execution — read-only reentrancy must stay silent even though a mutating
+    /// writer (`_update`) updates the same reserves after an (in this fixture,
+    /// genuine) external call. The classic finding on the writer may still fire;
+    /// only the read-only finding on the getter is suppressed.
+    #[test]
+    fn silent_on_readonly_view_getter_without_own_call() {
+        // `getReserves` shape: oracle-named value getter, pure storage reads, no call.
+        let src = r#"
+            interface IERC20 { function balanceOf(address) external view returns (uint256); }
+            contract Pair {
+                uint112 private reserve0;
+                uint112 private reserve1;
+                uint32  private blockTimestampLast;
+                address public token0;
+                // Read by integrators as a price/reserve oracle, but makes NO call.
+                function getReserves() public view returns (uint112 r0, uint112 r1, uint32 t) {
+                    r0 = reserve0; r1 = reserve1; t = blockTimestampLast;
+                }
+                // Mutating writer with a genuine external token call before the writes.
+                function sync() external {
+                    uint256 bal = IERC20(token0).balanceOf(address(this)); // staticcall-ish read
+                    (bool ok,) = token0.call(""); require(ok);             // genuine external call
+                    reserve0 = uint112(bal);                               // write after the call
+                    blockTimestampLast = uint32(block.timestamp);
+                }
+            }
+        "#;
+        let fs = reentrancy_findings(src);
+        assert!(
+            !fs.iter().any(|f| f.category == Category::ReadOnlyReentrancy),
+            "read-only reentrancy must not fire on a pure storage-read getter with no call of its own"
+        );
+    }
+
+    /// R28 FP1 — the `totalOperatorNetworkSharesAt` shape: the getter's only "call"
+    /// is an internal stateless-library lookup (`upperLookupRecent`), which is not
+    /// an external re-entry vector. Read-only must stay silent.
+    #[test]
+    fn silent_on_readonly_getter_with_only_library_lookup() {
+        let src = r#"
+            library Checkpoints {
+                struct Trace { uint256 v; }
+                function upperLookupRecent(Trace storage t, uint48 ts) internal view returns (uint256) { return t.v; }
+                function push(Trace storage t, uint48 ts, uint256 x) internal { t.v = x; }
+            }
+            contract Delegator {
+                using Checkpoints for Checkpoints.Trace;
+                mapping(bytes32 => Checkpoints.Trace) internal _shares;
+                // value-oracle-named getter whose only call is a library lookup
+                function totalOperatorNetworkSharesAt(bytes32 sn, uint48 ts) public view returns (uint256) {
+                    return _shares[sn].upperLookupRecent(ts);
+                }
+            }
+        "#;
+        assert!(
+            !reentrancy_findings(src).iter().any(|f| f.category == Category::ReadOnlyReentrancy),
+            "read-only must not fire when the getter only performs an internal library lookup"
+        );
+    }
+
+    /// R28 FP2 — CEI-correct function flagged as cross-function reentrancy.
+    /// Real site: v4-core `ProtocolFees.collectProtocolFees` reads the
+    /// `protocolFeeController` guard and DECREMENTS `protocolFeesAccrued` BEFORE
+    /// `currency.transfer` — checks-effects-interactions correct, no post-call
+    /// write. A sibling (`_updateProtocolFees`/`setProtocolFeeController`) touches
+    /// the same vars, but since this function settles its value before the call
+    /// and its only other pre-call read is the controller guard, there is nothing a
+    /// re-entrant sibling can corrupt. Must stay silent.
+    #[test]
+    fn silent_on_cei_correct_pre_call_guard_and_settle() {
+        let src = r#"
+            interface IERC20 { function transfer(address to, uint256 a) external returns (bool); }
+            contract ProtocolFees {
+                mapping(address => uint256) public protocolFeesAccrued;
+                address public protocolFeeController;
+                IERC20 public token;
+                function setProtocolFeeController(address c) external { protocolFeeController = c; }      // sibling writes controller
+                function _updateProtocolFees(address cur, uint256 a) internal { protocolFeesAccrued[cur] += a; } // sibling writes accrued
+                function collectProtocolFees(address recipient, address cur, uint256 amount) external returns (uint256 c) {
+                    if (msg.sender != protocolFeeController) revert();          // guard READ before call
+                    c = (amount == 0) ? protocolFeesAccrued[cur] : amount;
+                    protocolFeesAccrued[cur] -= c;                              // SETTLE before the call (CEI)
+                    token.transfer(recipient, c);                              // external transfer LAST, no write after
+                }
+            }
+        "#;
+        assert!(
+            !fires(src),
+            "a CEI-correct function (settle-then-transfer, guard read before the call, no post-call write) must stay silent"
+        );
+    }
+
+    /// R28 FP3 — classic/cross fired on a function whose only "external" call is a
+    /// stateless-library dispatch off a bare PascalCase namespace
+    /// (`Time.timestamp()`), mis-classified `External` because the library lives in
+    /// an excluded dependency tree. Real sites: symbiotic `VaultTokenized._update`
+    /// and `NetworkRestakeDelegator.setOperatorNetworkShares` — storage + emit only,
+    /// no external call of their own. Must stay silent.
+    #[test]
+    fn silent_on_library_static_dispatch_only() {
+        let src = r#"
+            library Time { function timestamp() internal view returns (uint48) { return uint48(block.timestamp); } }
+            library Checkpoints {
+                struct Trace { uint256 v; }
+                function push(Trace storage t, uint48 ts, uint256 x) internal { t.v = x; }
+                function latest(Trace storage t) internal view returns (uint256) { return t.v; }
+            }
+            contract Delegator {
+                using Checkpoints for Checkpoints.Trace;
+                mapping(bytes32 => Checkpoints.Trace) internal _total;
+                mapping(bytes32 => mapping(address => Checkpoints.Trace)) internal _ops;
+                function setOperatorNetworkShares(bytes32 sn, address op, uint256 shares) external {
+                    uint256 prev = _ops[sn][op].latest();                 // pre-call read
+                    if (prev == shares) revert();
+                    _total[sn].push(Time.timestamp(), shares);            // "call" is Time.timestamp (library)
+                    _ops[sn][op].push(Time.timestamp(), shares);
+                }
+            }
+        "#;
+        // The library namespace `Time` (a bare PascalCase receiver, not a state var)
+        // is NOT a re-entry vector, so there is no genuine external call to arm any
+        // reentrancy finding.
+        assert!(
+            !fires(src),
+            "a function whose only external-looking call is a stateless-library dispatch must stay silent"
+        );
+    }
+
+    /// Recall guard — a GENUINE external-call-then-state-write must STILL fire even
+    /// when the post-call write is performed by a directly-called internal helper.
+    /// Real site: pendle `VotingEscrowPendleMainchain.increaseLockPosition` does
+    /// `pendle.safeTransferFrom(...)` (reads `positionData` before it) and defers
+    /// the `positionData` write to `_increasePosition`. A sibling (`withdraw`) also
+    /// writes `positionData`, so this is a real cross-function re-entry surface.
+    #[test]
+    fn fires_on_transfer_then_deferred_state_write() {
+        let src = r#"
+            interface IERC20 { function safeTransferFrom(address f, address t, uint256 a) external; }
+            contract VE {
+                struct Pos { uint128 amount; uint128 expiry; }
+                mapping(address => Pos) public positionData;
+                IERC20 public pendle;
+                function _increasePosition(address u, uint128 amt) internal {
+                    positionData[u] = Pos(positionData[u].amount + amt, positionData[u].expiry); // write (post-call, in callee)
+                }
+                function withdraw() external {                       // sibling that mutates positionData
+                    delete positionData[msg.sender];
+                }
+                function increaseLockPosition(uint128 amt, uint128 newExpiry) external returns (uint128) {
+                    address u = msg.sender;
+                    if (newExpiry < positionData[u].expiry) revert();  // pre-call READ of positionData (unsettled)
+                    uint128 total = amt + positionData[u].amount;
+                    pendle.safeTransferFrom(u, address(this), amt);    // genuine external token call
+                    _increasePosition(u, amt);                         // state settled AFTER the call, in a callee
+                    return total;
+                }
+            }
+        "#;
+        assert!(
+            fires(src),
+            "a genuine transfer-then-(deferred)-state-write must still fire as cross-function reentrancy"
         );
     }
 }
