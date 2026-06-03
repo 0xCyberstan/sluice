@@ -2,15 +2,28 @@
 //! or more buckets with floor division and then force-assigns the leftover (the
 //! rounding dust) to a single bucket via a `amount - a - b` residual.
 //!
-//! The canonical shape — the **Symbiotic `Vault.onSlash`** slashing split:
+//! The canonical shape — the **Symbiotic `Vault.onSlash`** slashing split. In
+//! the real contract the proportional shares are taken with OpenZeppelin's
+//! `Math.mulDiv` (a *floor* `a * b / denom`, written as a `using Math for uint256`
+//! bound call `slashedAmount.mulDiv(stake, total)`), and the residual is forced
+//! onto the last bucket:
 //! ```solidity
-//! function onSlash(uint256 amount, ...) external {
+//! function onSlash(uint256 amount, uint48 captureTimestamp) external {
+//!     uint256 slashableStake        = activeStake_ + withdrawals_ + nextWithdrawals;
+//!     uint256 slashedAmount         = Math.min(amount, slashableStake);
+//!     uint256 activeSlashed         = slashedAmount.mulDiv(activeStake_, slashableStake);     // floor
+//!     uint256 nextWithdrawalsSlashed = slashedAmount.mulDiv(nextWithdrawals, slashableStake); // floor
+//!     // the two floors lose dust; force the remainder onto ONE bucket:
+//!     uint256 withdrawalsSlashed    = slashedAmount - activeSlashed - nextWithdrawalsSlashed;
+//!     withdrawals[currentEpoch_]    = withdrawals_ - withdrawalsSlashed;   // <- residual sink
+//! }
+//! ```
+//! The equivalent written with the bare `/` operator is the same bug:
+//! ```solidity
 //!     uint256 activeSlashed   = amount * activeStake   / totalStake;   // floor
 //!     uint256 withdrawSlashed = amount * withdrawals   / totalStake;   // floor
-//!     // the two floors lose dust; force the remainder onto ONE bucket:
 //!     uint256 nextSlashed     = amount - activeSlashed - withdrawSlashed;
 //!     nextEpochWithdrawals -= nextSlashed;        // <- residual sink
-//! }
 //! ```
 //! Each `a * w / total` truncates toward zero, so `a + b < amount` by up to two
 //! wei. The code then *forces* `r = amount - a - b` (strictly larger than the
@@ -31,13 +44,17 @@
 //!
 //! Precision anchors (all required, so this stays quiet on ordinary arithmetic):
 //!   * the function is externally reachable and state-mutating;
-//!   * its body contains **>= 2 integer divisions** (the multi-bucket split);
+//!   * its body contains **>= 2 floor proportional splits** — either the bare
+//!     integer-division operator (`a * w / total`) or a *floor* `mulDiv`-family
+//!     bound/library call (`x.mulDiv(w, total)` / `Math.mulDiv(x, w, total)` /
+//!     `mulDivDown`), which is how the real Symbiotic vault writes the split;
 //!   * a later assignment or `return` computes a value that is a chain of **>= 2
 //!     subtractions** from a common quantity (`x - a - b`, the forced residual)
 //!     and that value flows into a bucket state variable / mapping (an `Assign`
 //!     to storage, a `-=`/`+=` on a bucket, or a `return`);
-//!   * no `mulDivUp`/`mulDivCeil`/`ceilDiv`/`Rounding.Up` helper pins the bucket
-//!     rounding direction.
+//!   * no `mulDivUp`/`mulDivCeil`/`ceilDiv`/`Rounding.Up`/`+ denom - 1` helper
+//!     pins the bucket rounding direction (a 4-arg `mulDiv(.., Rounding.Up)` or a
+//!     `mulDivUp` is *not* counted as a floor split and also suppresses).
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -64,9 +81,12 @@ impl Detector for ProportionalSplitResidualDetector {
                 continue;
             }
 
-            // (1) The multi-bucket split: at least two integer divisions in the
-            // body. A single division is an ordinary ratio, not a split.
-            if count_divisions(f) < 2 {
+            // (1) The multi-bucket split: at least two *floor* proportional
+            // shares in the body — either the bare `/` operator or a floor
+            // `mulDiv`-family call (the real Symbiotic vault uses `Math.mulDiv`,
+            // a bound `x.mulDiv(w, total)`). A single share is an ordinary ratio,
+            // not a split. Ceil-rounded shares are deliberately not counted here.
+            if count_floor_splits(f) < 2 {
                 continue;
             }
 
@@ -116,20 +136,61 @@ impl Detector for ProportionalSplitResidualDetector {
     }
 }
 
-/// Count distinct integer-division (`BinOp::Div`) sub-expressions in the body.
-/// This is the multi-bucket-split signal: two or more proportional shares of one
-/// quantity. (`mulDiv`-family calls are deliberately *not* counted here — those
-/// have an explicit rounding mode and are handled by `uses_rounding_helper`.)
-fn count_divisions(f: &Function) -> usize {
+/// Count *floor* proportional-share computations in the body — the multi-bucket
+/// split signal: two or more truncating shares of one quantity. Two forms count:
+///   * the bare integer-division operator `BinOp::Div` (`a * w / total`); and
+///   * a *floor* `mulDiv`-family call — OpenZeppelin's `Math.mulDiv(x, w, total)`
+///     or the `using Math for uint256` bound form `x.mulDiv(w, total)`, plus the
+///     `mulDivDown` spelling. This is exactly how the real Symbiotic
+///     `Vault.onSlash` writes its split, so it must count or the detector never
+///     fires on the true target.
+///
+/// Ceil/round-up shares are deliberately **not** counted: a 4-argument
+/// `mulDiv(.., Rounding.Up)`, or `mulDivUp`/`mulDivCeil`/`ceilDiv`/`divUp`, pin a
+/// fair rounding direction and are handled (as a suppressor) by
+/// `uses_rounding_helper`.
+fn count_floor_splits(f: &Function) -> usize {
     let mut n = 0usize;
     for s in &f.body {
-        s.visit_exprs(&mut |e| {
-            if let ExprKind::Binary { op: BinOp::Div, .. } = &e.kind {
-                n += 1;
-            }
+        s.visit_exprs(&mut |e| match &e.kind {
+            ExprKind::Binary { op: BinOp::Div, .. } => n += 1,
+            ExprKind::Call(c) if is_floor_muldiv_call(c) => n += 1,
+            _ => {}
         });
     }
     n
+}
+
+/// True if `c` is a *floor* `mulDiv`-family call. We key on the resolved
+/// `func_name` (so both `Math.mulDiv(x, w, t)` and the bound `x.mulDiv(w, t)`
+/// match — the parser records `func_name = Some("mulDiv")` for the member call,
+/// and `Some("mulDiv")` for the library call too). A trailing rounding-mode
+/// argument (a 4th positional arg to `mulDiv`, e.g. `mulDiv(x, w, t, Rounding.Up)`)
+/// or an explicitly-up spelling (`mulDivUp`/`mulDivCeil`/`mulDivRoundingUp`)
+/// means the rounding is pinned, so it is **not** a floor split.
+fn is_floor_muldiv_call(c: &sluice_ir::Call) -> bool {
+    let Some(name) = c.func_name.as_deref() else {
+        return false;
+    };
+    let lname = name.to_ascii_lowercase();
+    // An up/ceil-rounded variant is not a floor split.
+    if lname.contains("up") || lname.contains("ceil") {
+        return false;
+    }
+    // Recognize `mulDiv` and its explicit floor spelling `mulDivDown`.
+    if lname != "muldiv" && lname != "muldivdown" {
+        return false;
+    }
+    // Plain `mulDiv` floors with 2 (bound: receiver + 2 args) or 3 positional
+    // args. A 4th positional arg is a `Rounding` mode -> not a floor split.
+    let positional = c.args.len();
+    let with_receiver = positional + usize::from(c.receiver.is_some());
+    // Bound call `x.mulDiv(w, t)` => receiver + 2 args = 3 operands (floor).
+    // Library call `Math.mulDiv(x, w, t)` => 3 args, no extra receiver (floor).
+    // `mulDiv(x, w, t, Rounding.Up)` => 4 args (rounded) — already excluded by
+    // the "up"/"ceil" name check only if spelled in the name, so also bail when
+    // the operand count signals a rounding mode.
+    with_receiver <= 3 && positional <= 3
 }
 
 /// Find a forced-residual sink: an assignment (incl. `+=`/`-=`) or a `return`
@@ -357,12 +418,96 @@ mod tests {
         }
     "#;
 
+    // Vulnerable, faithful to the REAL Symbiotic `Vault.onSlash`: the shares are
+    // taken with the floor `Math.mulDiv` (here the `using Math for uint256` bound
+    // form `slashedAmount.mulDiv(stake, total)`, with NO bare `/` operator at
+    // all), the split lives inside an `if/else` branch, and the residual
+    // `slashedAmount - activeSlashed - nextWithdrawalsSlashed` is forced onto the
+    // last bucket. This is the shape that previously fired 0 because the gate only
+    // counted the `/` operator.
+    const VULN_REAL_MULDIV: &str = r#"
+        library Math {
+            function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) { return x * y / d; }
+            function min(uint256 a, uint256 b) internal pure returns (uint256) { return a < b ? a : b; }
+        }
+        contract Vault {
+            using Math for uint256;
+            mapping(uint256 => uint256) public withdrawals;
+            uint256 public activeStake_;
+            address public burner;
+
+            function onSlash(uint256 amount, uint256 currentEpoch_) external returns (uint256 slashedAmount) {
+                uint256 withdrawals_ = withdrawals[currentEpoch_];
+                uint256 nextWithdrawals = withdrawals[currentEpoch_ + 1];
+                uint256 slashableStake = activeStake_ + withdrawals_ + nextWithdrawals;
+                slashedAmount = Math.min(amount, slashableStake);
+                if (slashedAmount > 0) {
+                    uint256 activeSlashed = slashedAmount.mulDiv(activeStake_, slashableStake);
+                    uint256 nextWithdrawalsSlashed = slashedAmount.mulDiv(nextWithdrawals, slashableStake);
+                    uint256 withdrawalsSlashed = slashedAmount - activeSlashed - nextWithdrawalsSlashed;
+                    withdrawals[currentEpoch_ + 1] = nextWithdrawals - nextWithdrawalsSlashed;
+                    withdrawals[currentEpoch_] = withdrawals_ - withdrawalsSlashed;
+                }
+            }
+        }
+    "#;
+
+    // Safe counterpart to the real shape: identical multi-bucket split, but the
+    // shares are taken with `mulDivUp` (a pinned, fair round-up). The floor dust
+    // no longer silently lands on one bucket, so the detector suppresses — and the
+    // `mulDivUp` calls are not counted as floor splits.
+    const SAFE_REAL_MULDIVUP: &str = r#"
+        library Math {
+            function mulDivUp(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) { return (x * y + d - 1) / d; }
+            function min(uint256 a, uint256 b) internal pure returns (uint256) { return a < b ? a : b; }
+        }
+        contract Vault {
+            using Math for uint256;
+            mapping(uint256 => uint256) public withdrawals;
+            uint256 public activeStake_;
+
+            function onSlash(uint256 amount, uint256 currentEpoch_) external returns (uint256 slashedAmount) {
+                uint256 withdrawals_ = withdrawals[currentEpoch_];
+                uint256 nextWithdrawals = withdrawals[currentEpoch_ + 1];
+                uint256 slashableStake = activeStake_ + withdrawals_ + nextWithdrawals;
+                slashedAmount = Math.min(amount, slashableStake);
+                if (slashedAmount > 0) {
+                    uint256 activeSlashed = slashedAmount.mulDivUp(activeStake_, slashableStake);
+                    uint256 nextWithdrawalsSlashed = slashedAmount.mulDivUp(nextWithdrawals, slashableStake);
+                    uint256 withdrawalsSlashed = slashedAmount - activeSlashed - nextWithdrawalsSlashed;
+                    withdrawals[currentEpoch_ + 1] = nextWithdrawals - nextWithdrawalsSlashed;
+                    withdrawals[currentEpoch_] = withdrawals_ - withdrawalsSlashed;
+                }
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_vuln() {
         let fs = run(VULN);
         assert!(
             fs.iter().any(|f| f.detector == "proportional-split-residual"),
             "{:#?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn fires_on_real_muldiv_shape() {
+        let fs = run(VULN_REAL_MULDIV);
+        assert!(
+            fs.iter().any(|f| f.detector == "proportional-split-residual"),
+            "real Symbiotic mulDiv onSlash shape must fire: {:#?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_real_muldivup_shape() {
+        let fs = run(SAFE_REAL_MULDIVUP);
+        assert!(
+            !fs.iter().any(|f| f.detector == "proportional-split-residual"),
+            "mulDivUp (pinned rounding) must suppress: {:#?}",
             fs
         );
     }

@@ -25,7 +25,7 @@
 //! mapping(uint256 => uint256) public withdrawalShares;   // share supply / epoch
 //!
 //! // repricing site (the invariant): price = assets[k] * s / shares[k]
-//! function previewRedeem(uint256 epoch, uint256 s) public view returns (uint256) {
+//! function withdrawalsOf(uint256 epoch, uint256 s) public view returns (uint256) {
 //!     return withdrawals[epoch] * s / withdrawalShares[epoch];
 //! }
 //!
@@ -35,11 +35,21 @@
 //! }
 //! ```
 //!
+//! In the real Symbiotic `Vault`, the proportional price is not an inline `/`: it
+//! is an **ERC-4626 ratio helper** — `ERC4626Math.previewRedeem(userShares,
+//! withdrawals[epoch], withdrawalShares[epoch])`, i.e.
+//! `convertToAssets(shares, totalAssets, totalShares)` — so the assets var and the
+//! share-supply var appear as the two *pool-total* arguments of the helper call,
+//! not as the numerator/denominator of a `Div`. The detector treats both forms as
+//! the same repricing invariant.
+//!
 //! Precision strategy (single Invariant dimension, Medium @ 0.5):
-//!   * we only fire when a **repricing division pairs** an assets-like var with a
-//!     shares-like var, indexed by the *same key*, in *some* function — this is
-//!     the structural proof that the two mappings are a priced pool, not two
-//!     unrelated numbers;
+//!   * we only fire when a **repricing site pairs** an assets-like var with a
+//!     shares-like var, indexed by the *same key* — either as an inline
+//!     `assets[k] * s / shares[k]` division, or as the two pool-total arguments of
+//!     an ERC-4626 ratio helper (`previewRedeem` / `convertToAssets` /
+//!     `previewDeposit` / ...) — in *some* function. This is the structural proof
+//!     that the two mappings are a priced pool, not two unrelated numbers;
 //!   * we then report a **different** function that writes the assets var but
 //!     **not** the shares var. A function that writes both (the co-update) is the
 //!     safe shape and is suppressed;
@@ -169,35 +179,109 @@ impl Detector for PooledSharesRepriceDesyncDetector {
     }
 }
 
-/// Scan `f`'s body for repricing divisions and push any discovered
+/// Scan `f`'s body for repricing sites and push any discovered
 /// `(assetsVar, sharesVar)` pairs into `out`.
 ///
-/// A repricing division is a `Div` whose **numerator** indexes an assets-like
-/// state var and whose **denominator** indexes a shares-like state var, with the
-/// *same index key* on both sides (`assets[k] * x / shares[k]`). Requiring the
-/// matching key is what ties the two mappings to one pool and keeps this from
-/// firing on two unrelated ratios.
+/// Two repricing forms are recognized, both of which prove the two mappings are a
+/// single priced pool:
+///
+///   1. an **inline division** `Div` whose numerator indexes an assets-like state
+///      var and whose denominator indexes a shares-like state var with the *same
+///      index key* (`assets[k] * x / shares[k]`);
+///   2. an **ERC-4626 ratio-helper call** (`previewRedeem` / `convertToAssets` /
+///      `previewDeposit` / ...) where the two *pool-total* arguments are an
+///      assets-like indexed var and a shares-like indexed var with the same key —
+///      the real Symbiotic shape `ERC4626Math.previewRedeem(userShares,
+///      withdrawals[epoch], withdrawalShares[epoch])`.
+///
+/// Requiring the matching index key on both sides is what ties the two mappings to
+/// one pool and keeps this from firing on two unrelated ratios.
 fn collect_reprice_pairs(f: &Function, out: &mut Vec<RepricePair>) {
     for s in &f.body {
         s.visit_exprs(&mut |e| {
-            let ExprKind::Binary { op: BinOp::Div, lhs, rhs } = &e.kind else {
-                return;
-            };
-            // Denominator must be (or contain) a shares-like indexed access.
-            let Some((shares_var, shares_key)) = find_indexed(rhs, NameKind::Shares) else {
-                return;
-            };
-            // Numerator must be (or contain) an assets-like indexed access whose
-            // key matches the denominator's key.
-            let Some((assets_var, assets_key)) = find_indexed(lhs, NameKind::Assets) else {
-                return;
-            };
-            if !keys_match(&assets_key, &shares_key) {
-                return;
+            match &e.kind {
+                // Form 1: inline `assets[k] * x / shares[k]`.
+                ExprKind::Binary { op: BinOp::Div, lhs, rhs } => {
+                    // Denominator must be (or contain) a shares-like indexed access.
+                    let Some((shares_var, shares_key)) = find_indexed(rhs, NameKind::Shares) else {
+                        return;
+                    };
+                    // Numerator must be (or contain) an assets-like indexed access
+                    // whose key matches the denominator's key.
+                    let Some((assets_var, assets_key)) = find_indexed(lhs, NameKind::Assets) else {
+                        return;
+                    };
+                    if !keys_match(&assets_key, &shares_key) {
+                        return;
+                    }
+                    out.push(RepricePair { assets_var, shares_var });
+                }
+                // Form 2: ERC-4626 ratio helper `previewRedeem(s, totalAssets, totalShares)`.
+                ExprKind::Call(call) => {
+                    if let Some(pair) = pair_from_reprice_call(call) {
+                        out.push(pair);
+                    }
+                }
+                _ => {}
             }
-            out.push(RepricePair { assets_var, shares_var });
         });
     }
+}
+
+/// Method/function names of the canonical ERC-4626 ratio helpers. Each prices a
+/// proportional conversion between assets and shares against the two *pool totals*
+/// passed as its trailing two arguments (`fn(amount, totalA, totalB)`), so the
+/// assets-side and shares-side state vars surface as `args[1]` and `args[2]`
+/// (order varies per helper — we classify by name, not position).
+const REPRICE_HELPERS: &[&str] = &[
+    "previewredeem",   // convertToAssets(shares, totalAssets, totalShares)
+    "previewmint",     // convertToAssets(shares, totalAssets, totalShares)
+    "previewdeposit",  // convertToShares(assets, totalShares, totalAssets)
+    "previewwithdraw", // convertToShares(assets, totalShares, totalAssets)
+    "converttoassets", // (shares, totalAssets, totalShares)
+    "converttoshares", // (assets, totalShares, totalAssets)
+];
+
+/// If `call` is an ERC-4626 ratio helper whose two pool-total arguments are an
+/// assets-like indexed var and a shares-like indexed var keyed identically, return
+/// that pair. The per-user `amount` is always `args[0]` and is excluded — we look
+/// only at the trailing two (the pool totals), so the per-user share balance
+/// (itself a "shares"-named access) cannot be mistaken for the pool's share supply.
+fn pair_from_reprice_call(call: &sluice_ir::Call) -> Option<RepricePair> {
+    let name = call.func_name.as_deref()?.to_ascii_lowercase();
+    if !REPRICE_HELPERS.iter().any(|h| name == *h) {
+        return None;
+    }
+    // Need at least the two pool-total args (`amount, totalA, totalB`).
+    if call.args.len() < 3 {
+        return None;
+    }
+    let totals = &call.args[1..3];
+
+    // Among the two pool-total args, find one assets-like and one shares-like
+    // indexed access whose keys match. Order-independent, so this handles both
+    // `(…, totalAssets, totalShares)` and `(…, totalShares, totalAssets)`.
+    let mut assets: Option<(String, String)> = None;
+    let mut shares: Option<(String, String)> = None;
+    for a in totals {
+        if shares.is_none() {
+            if let Some(s) = find_indexed(a, NameKind::Shares) {
+                shares = Some(s);
+                continue;
+            }
+        }
+        if assets.is_none() {
+            if let Some(s) = find_indexed(a, NameKind::Assets) {
+                assets = Some(s);
+            }
+        }
+    }
+    let (assets_var, assets_key) = assets?;
+    let (shares_var, shares_key) = shares?;
+    if !keys_match(&assets_key, &shares_key) {
+        return None;
+    }
+    Some(RepricePair { assets_var, shares_var })
 }
 
 /// Does `f` contain a repricing division for *this specific pair*? Used to avoid
@@ -443,5 +527,120 @@ mod tests {
     fn silent_without_repricing_division() {
         let fs = run(SAFE_NO_REPRICE);
         assert!(!fs.iter().any(|f| f.detector == "pooled-shares-reprice-desync"));
+    }
+
+    // ---- the REAL Symbiotic Vault shape ------------------------------------
+    //
+    // Mirrors symbiotic-core/src/contracts/vault/Vault.sol precisely:
+    //   * the pooled-asset / share-supply mappings are declared in an ABSTRACT
+    //     BASE (`VaultStorage`), and the pricing + slashing live in the derived
+    //     `Vault` — exercising inherited-state-var resolution;
+    //   * the repricing site is an ERC-4626 ratio HELPER CALL
+    //     `ERC4626Math.previewRedeem(userShares, withdrawals[epoch],
+    //     withdrawalShares[epoch])` (i.e. `convertToAssets(s, totalAssets,
+    //     totalShares)`) — NOT an inline `/`;
+    //   * `onSlash` writes `withdrawals[...]` at DIFFERENT key expressions
+    //     (`currentEpoch_`, `currentEpoch_ + 1`) than the repricer's `epoch`, and
+    //     never touches `withdrawalShares` — the one-sided desync;
+    //   * `_withdraw` is the SAFE co-update: it writes both `withdrawals[epoch]`
+    //     and `withdrawalShares[epoch]` and must stay suppressed.
+    const SYMBIOTIC: &str = r#"
+        library ERC4626Math {
+            function previewRedeem(uint256 shares, uint256 totalAssets, uint256 totalShares)
+                internal pure returns (uint256)
+            {
+                return (shares * (totalAssets + 1)) / (totalShares + 1);
+            }
+            function previewDeposit(uint256 assets, uint256 totalShares, uint256 totalAssets)
+                internal pure returns (uint256)
+            {
+                return (assets * (totalShares + 1)) / (totalAssets + 1);
+            }
+        }
+
+        abstract contract VaultStorage {
+            mapping(uint256 => uint256) public withdrawals;       // pooled assets / epoch
+            mapping(uint256 => uint256) public withdrawalShares;  // share supply / epoch
+            mapping(uint256 => mapping(address => uint256)) public withdrawalSharesOf;
+            address public slasher;
+            address public burner;
+            uint256 internal _epoch;
+            function currentEpoch() public view returns (uint256) { return _epoch; }
+        }
+
+        contract Vault is VaultStorage {
+            function withdrawalsOf(uint256 epoch, address account) public view returns (uint256) {
+                return ERC4626Math.previewRedeem(
+                    withdrawalSharesOf[epoch][account], withdrawals[epoch], withdrawalShares[epoch]
+                );
+            }
+
+            function _withdraw(address claimer, uint256 assets) internal returns (uint256 mintedShares) {
+                uint256 epoch = currentEpoch() + 1;
+                uint256 w = withdrawals[epoch];
+                uint256 ws = withdrawalShares[epoch];
+                mintedShares = ERC4626Math.previewDeposit(assets, ws, w);
+                withdrawals[epoch] = w + assets;
+                withdrawalShares[epoch] = ws + mintedShares;
+                withdrawalSharesOf[epoch][claimer] += mintedShares;
+            }
+
+            function onSlash(uint256 amount, uint48) external returns (uint256 slashedAmount) {
+                if (msg.sender != slasher) revert();
+                uint256 currentEpoch_ = currentEpoch();
+                uint256 nextWithdrawals = withdrawals[currentEpoch_ + 1];
+                uint256 withdrawals_ = withdrawals[currentEpoch_];
+                slashedAmount = amount;
+                withdrawals[currentEpoch_ + 1] = nextWithdrawals - 1;
+                withdrawals[currentEpoch_] = withdrawals_ - slashedAmount;
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_symbiotic_helper_call_shape() {
+        let fs = run(SYMBIOTIC);
+        assert!(
+            fs.iter().any(|f| f.detector == "pooled-shares-reprice-desync"
+                && f.contract == "Vault"
+                && f.function == "onSlash"),
+            "expected onSlash desync via ERC4626 helper pairing; got {:#?}",
+            fs
+        );
+        // The safe co-update `_withdraw` (writes both mappings) must NOT be flagged.
+        assert!(
+            !fs.iter().any(|f| f.detector == "pooled-shares-reprice-desync"
+                && f.function == "_withdraw"),
+            "co-update _withdraw must be suppressed; got {:#?}",
+            fs
+        );
+    }
+
+    // SAFE (Pendle shape): `previewRedeem` exists, but as a 2-arg EXTERNAL call on
+    // an interface (`IStandardizedYield(SY).previewRedeem(tokenOut, netSyIn)`) whose
+    // args are not same-keyed assets/shares pool totals. No repricing pair forms, so
+    // a one-sided writer of an unrelated mapping must not be flagged.
+    const SAFE_TWO_ARG_PREVIEW: &str = r#"
+        interface ISY { function previewRedeem(address t, uint256 n) external view returns (uint256); }
+        contract Router {
+            mapping(uint256 => uint256) public withdrawals;
+            address public sy;
+            function quote(address tokenOut, uint256 netSyIn) external view returns (uint256) {
+                return ISY(sy).previewRedeem(tokenOut, netSyIn);
+            }
+            function bump(uint256 epoch, uint256 a) external {
+                withdrawals[epoch] += a;
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_two_arg_external_preview() {
+        let fs = run(SAFE_TWO_ARG_PREVIEW);
+        assert!(
+            !fs.iter().any(|f| f.detector == "pooled-shares-reprice-desync"),
+            "2-arg external previewRedeem must not form a repricing pair; got {:#?}",
+            fs
+        );
     }
 }

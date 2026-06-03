@@ -197,6 +197,27 @@ symbiotic-audit/symbiotic-core/src/contracts):
   dogfood re-measure of the tuned detector set.
 - Core: shared SCIR primitives (caller-supplied-`hint` taint query; pooled-assets-vs-per-key-shares co-update query) so
   these detectors stop being one-off string matching — the architecture/extensibility thrust. _status: pending._
+- **Result (via 6 parallel worktree-isolated agents — first use of [[feedback-agent-iteration]]):** ALL 6 R7 novel
+  detectors now ACTIVE + real-code-validated → **57 active detectors**. Independent dogfood (the authoritative gate,
+  not the per-agent isolated numbers): novel-detector FPs on the 4 prior codebases = **0/0/0/0** (olympus/eigenlayer/
+  pendle/etherfi back to their exact R6 baselines 92/23/81/126 — the 52-FP internal-rounding flood, the cert-verifier
+  FPs, and the epoch FPs all eliminated), while **all 6 fire on the real Symbiotic source** (12 hits: epoch 4,
+  checkpoint 2, silenced-callback 2, internal-rounding 2, proportional 1, pooled 1). Re-tuning that worked:
+  internal-share-pricing-rounding → bare-`mulDiv`-with-pooled-aggregate-divisor only; checkpoint-hint-trust → requires
+  an OZ/Symbiotic `Trace*` container (structurally excludes cert-verifier mapping-indexes / observation buffers);
+  proportional/pooled/silenced rebuilt to match the real `Vault.onSlash` / withdrawal-queue / asm `pop(call)` shapes;
+  epoch now requires the live read to have a captured/epoch sibling. 231 tests, 0 warnings, corpus 20/20 + 8/8.
+  The 12 Symbiotic hits are candidate findings to triage (unverified; may be design tradeoffs). _done._
+
+#### R9 candidate backlog (from R8 WF3 research on Renzo — ranked; several point at concrete LIVE sites to verify)
+1. **unguarded-emergency-accounting-mutator** — an external accounting-state writer that LOST its access modifier while sibling `emergency*`/`track*` functions keep theirs (sibling-consensus on fund-accounting writes, distinct from name-based access-control). _Live site to verify: Renzo `OperatorDelegator.sol:572 emergencyTrackSlashedQueuedWithdrawalDelta` (no modifier; writes slash-delta that feeds ezETH TVL/price)._
+2. **crosschain-rate-feed-staleness-trust** — L2/destination mints against a bridged price whose freshness is checked vs the *message's own* timestamp, not local receipt time (Renzo `xRenzoDepositNativeBridge`/`HyperlaneReceiver`).
+3. **snapshot-redeem-reprice-asymmetry** — request→claim redeem amount clamped DOWN-only at claim while the reserve is decremented by the pre-clamp value (Renzo `WithdrawQueue.sol:469-534`).
+4. **netted-aggregate-slash-desync** — `exposure = principalAgg − lossAgg` where the two aggregates are written by independent functions with no joint invariant (Renzo `OperatorDelegator:725`). Distinct from accounting CoUpdate (single-function paired write) — this is cross-writer netting.
+5. **oracle-driven-first-mint-seeding** — LST exchange-rate mint (`supply*new/tvl`) whose empty-protocol guard only covers the literal first mint; re-emptyable (Renzo `RenzoOracle.calculateMintAmount`). Complements balance-driven `vault.rs` first-depositor.
+6. **proportional-payout-tx-value-trust** — push splitter sizing each cut from a re-read `address(this).balance`, swallowing failed legs (order-dependent skew) (Renzo `PaymentSplitter.sol:191`). Inverse of `dos.rs` (failures swallowed, not reverting).
+7. **whitelist-cooldown-bypass-coupled-to-pause** — withdrawal cooldown skipped for whitelisted users UNLESS an unrelated risk/pause flag is set (Renzo `WithdrawQueue.sol:434`). Distinct from governance-timelock (no-timelock); this is timelock-present-but-conditionally-bypassed.
+_(Full agent report with SCIR signatures + FP-suppression per class is in the R8 WF3 task transcript.)_
 - **Result:** 50 detectors; corpus 20/20 recall + 8/8 clean; **R4 hacks now 8/8** (TempleDAO caught by the
   new `untrusted-call-target` detector — the R4 MISS, closed). 153 tests, 0 warnings. Delivered:
   - **WF1 cast precision:** integer-issues width-bit suppression (`uintN(address)`/`uintN(bytesM)`/narrower-int

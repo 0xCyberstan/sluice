@@ -23,11 +23,27 @@
 //! *wrong* hint silently returns the *wrong* checkpoint: a stake/shares/resolver
 //! value for the wrong epoch, desyncing every downstream accounting figure
 //! (slashable stake, vote weight, the active resolver). This is the shape behind
-//! Symbiotic Core `Checkpoints.upperLookupRecent(self, key, hint)`.
+//! Symbiotic Core `Checkpoints.upperLookupRecent(self, key, hint)` and its
+//! underlying by-position accessor `at(Trace*, pos)` — the latter resolves and
+//! returns a checkpoint chosen solely by the caller-supplied `pos` with no
+//! bracketing re-check, which is exactly what the detector flags on the real
+//! `Checkpoints.sol` (the keyed `upperLookupRecent(self, key, hint_)` variants in
+//! that file *do* re-check and are correctly suppressed).
 //!
 //! Precision anchors (all required, so this stays quiet on ordinary
 //! index-a-parameter code such as `arr[i]` getters):
-//!   * a parameter whose **name** is hint-like (`hint`/`index`/`idx`/`pos`/`at`/
+//!   * the lookup operates on a **checkpoint-`Trace` container** — a parameter
+//!     whose type is the OpenZeppelin / Symbiotic `Trace*` family (`Trace208`,
+//!     `Trace224`, `Trace256`) or a bare `Checkpoint*[]` array. The `Trace` family
+//!     is *specifically* the append-only, binary-search/hint-indexed keyed log
+//!     whose public API (`upperLookupRecent(self, key, hint)`) exposes a
+//!     caller-supplied hint, which is exactly what makes by-position trust the
+//!     live hazard. This anchor is what separates the real target from look-alike
+//!     structures: EigenLayer's `Snapshots` (`DefaultWadHistory` / `Snapshot[]`),
+//!     Pendle's `VeHistoryLib` (`History`/`Checkpoint[]`-wrapping) and its Uniswap
+//!     `Observation[]` oracle ring buffer, and the cert-verifiers' nested
+//!     `_operatorInfos[set][ts][index]` mappings — none of which is a `Trace`;
+//!   * a parameter whose **name** is hint-like (`hint`/`index`/`idx`/`pos`/
 //!     `checkpointIndex`) and whose **type is an unsigned integer**;
 //!   * that parameter is used as an **index** `base[hint]` or as an **argument to
 //!     a checkpoint accessor** (`at`/`_unsafeAccess`/`*lookup*`/`*checkpoint*`);
@@ -81,19 +97,23 @@ impl Detector for CheckpointHintTrustDetector {
                 continue;
             }
 
-            // --- structural gate: a hint-like unsigned-int parameter ---
-            let Some(hint) = hint_param(f) else { continue };
-
-            // There must also be a *requested key* parameter distinct from the
-            // hint (`key`/`timestamp`/`time`/`at`/`when`). This is the principled
-            // anchor: the bug is "you were given a key AND a hint and trusted the
-            // hint without checking it resolves to the key." A raw accessor that
-            // takes only a position (`at(self, pos)` / `_unsafeAccess(arr, i)`)
-            // has no requested key to desync against — it is the unchecked
-            // primitive by design, and flagging it is noise. Require the key.
-            if !has_key_param(f, &hint) {
+            // --- positive checkpoint anchor: the lookup must operate on a
+            // `Trace`-family checkpoint container (or a bare `Checkpoint*[]`). This
+            // is the principled discriminator that fires on the real Symbiotic
+            // `Checkpoints.{at,upperLookupRecent}(Trace*, ...)` while staying silent
+            // on look-alikes that index something else by position: the
+            // cert-verifiers index nested `_operatorInfos` *mappings* and return
+            // `*OperatorInfo` structs; Pendle's oracle indexes an `Observation[]`
+            // ring buffer; EigenLayer's `Snapshots` / Pendle's `VeHistoryLib` use
+            // `*History` wrappers and `Snapshot[]` / `Checkpoint[]` — none of which
+            // is a `Trace`. Requiring the `Trace` container is what drops every one
+            // of those to zero. ---
+            if !indexes_checkpoint_trace(f) {
                 continue;
             }
+
+            // --- structural gate: a hint-like unsigned-int parameter ---
+            let Some(hint) = hint_param(f) else { continue };
 
             // The hint must actually be *used* as a checkpoint index — either a
             // bare index `base[hint]` or an argument to a checkpoint accessor
@@ -120,14 +140,15 @@ impl Detector for CheckpointHintTrustDetector {
                 .confidence(0.5)
                 .dimension(Dimension::ValueFlow)
                 .message(format!(
-                    "`{}` resolves a checkpoint value from the caller-supplied index/hint parameter \
-                     `{hint}` (`base[{hint}]` / `at(self, {hint})`) and lets that value flow to a return or \
-                     accounting write, but never re-validates that the resolved entry actually \
-                     corresponds to the requested key/timestamp (no `entry._key == key` / bracketing \
-                     `at(self, {hint} + 1)._key > key` check). A caller who passes a wrong hint receives \
-                     the checkpoint for the wrong epoch — the wrong stake / shares / opt-in / resolver \
-                     value — desyncing downstream accounting. This is the Symbiotic Core \
-                     `Checkpoints.upperLookupRecent(self, key, hint)` hint-trust shape.",
+                    "`{}` operates on a `Trace`-family checkpoint log and resolves a checkpoint from the \
+                     caller-supplied index/hint parameter `{hint}` (`base[{hint}]` / `at(self, {hint})`), \
+                     letting the resolved entry's value flow to a return or accounting write, but never \
+                     re-validates that the resolved entry actually corresponds to the requested \
+                     key/timestamp (no `entry._key == key` / bracketing `at(self, {hint} + 1)._key > key` \
+                     check). A caller who passes a wrong hint receives the checkpoint for the wrong epoch \
+                     — the wrong stake / shares / opt-in / resolver value — desyncing downstream \
+                     accounting. This is the Symbiotic Core `Checkpoints.upperLookupRecent(self, key, hint)` \
+                     / `at(self, pos)` hint-trust shape.",
                     f.name,
                     hint = hint,
                 ))
@@ -178,36 +199,33 @@ fn hint_param(f: &Function) -> Option<String> {
     })
 }
 
-/// Key-like parameter names — the "requested key" the lookup is *for*. The hint
-/// claims to point at the checkpoint active at this key.
-const KEY_NAMES: &[&str] = &["key", "timestamp", "time", "ts", "when", "at", "epoch"];
-
-/// Does `f` take a requested-key parameter that is *not* the hint itself? The
-/// key may be any integer-ish / bytes32 type (`uint48 timestamp`, `uint256 key`).
-/// We exclude the hint param by name so a single `at`-named param can't satisfy
-/// both roles.
-fn has_key_param(f: &Function, hint: &str) -> bool {
+/// Does `f` operate on a checkpoint-`Trace` container? True when any parameter's
+/// declared type is the OpenZeppelin / Symbiotic `Trace*` family (its type name
+/// contains `trace`, case-insensitive — `Trace208` / `Trace224` / `Trace256` /
+/// `OZCheckpoints.Trace208`), or is a bare `Checkpoint*[]` array (`type` contains
+/// `checkpoint` *and* is an array).
+///
+/// This is the positive anchor that pins the detector to the genuine Symbiotic
+/// `Checkpoints` hint-lookup family and excludes the look-alikes:
+///   * cert-verifiers take `OperatorSet` / `uint32` / `uint256` and index a
+///     `mapping` — no `Trace`/`Checkpoint[]` param;
+///   * Pendle's oracle takes `Observation[65535]` — not a `Trace`/`Checkpoint`;
+///   * EigenLayer `Snapshots` takes `DefaultWadHistory` / `Snapshot[]`, and
+///     Pendle's `VeHistoryLib` takes `History` — `History`/`Snapshot` are not
+///     `Trace`, and neither exposes a `Checkpoint[]` *parameter*.
+fn indexes_checkpoint_trace(f: &Function) -> bool {
     f.params.iter().any(|p| {
-        let Some(name) = p.name.as_deref() else { return false };
-        if name == hint {
-            return false;
+        let t = p.ty.to_ascii_lowercase();
+        // `Trace*` family (the hint-exposing keyed checkpoint log).
+        if t.contains("trace") {
+            return true;
         }
-        is_key_name(name)
+        // A bare `Checkpoint*[]` storage array (the underlying positional store).
+        if t.contains("checkpoint") && (t.contains("[]") || t.contains('[')) {
+            return true;
+        }
+        false
     })
-}
-
-/// Case-insensitive: `name` equals a key token or its trailing camelCase word is
-/// a key token (`captureTimestamp`, `slashKey`, `voteEpoch`).
-fn is_key_name(name: &str) -> bool {
-    let l = name.to_ascii_lowercase();
-    if KEY_NAMES.iter().any(|k| l == *k) {
-        return true;
-    }
-    if let Some(tail) = last_camel_word(name) {
-        let tl = tail.to_ascii_lowercase();
-        return KEY_NAMES.iter().any(|k| tl == *k);
-    }
-    false
 }
 
 /// Case-insensitive: `name` is exactly a hint token, or is a camelCase
@@ -384,28 +402,25 @@ mod tests {
         }
     "#;
 
-    // Same lookup but WITH the bracketing re-check: the resolved entry's `_key`
-    // is compared against the requested `key` before its value is trusted, and a
-    // verified search is the fallback. The hint is validated -> no finding.
+    // Same keyed lookup but WITH the bracketing re-check, and reading the entry
+    // INLINE (`self._checkpoints[hint]`) so the only candidate function is the
+    // keyed lookup itself: the resolved entry's `_key` is compared against the
+    // requested `key` before its value is trusted, and a verified search is the
+    // fallback. The hint is validated -> no finding. (This is the safe shape of
+    // the real Symbiotic `upperLookupRecent(self, key, hint_)`.)
     const SAFE_RECHECK: &str = r#"
         library Checkpoints {
             struct Checkpoint208 { uint48 _key; uint208 _value; }
             struct Trace208 { Checkpoint208[] _checkpoints; }
-            function at(Trace208 storage self, uint32 pos) internal view returns (Checkpoint208 memory) {
-                return self._checkpoints[pos];
-            }
-            function length(Trace208 storage self) internal view returns (uint256) {
-                return self._checkpoints.length;
-            }
             function search(Trace208 storage self, uint48 key) internal view returns (uint208) {
                 return self._checkpoints[0]._value;
             }
             function upperLookupRecent(Trace208 storage self, uint48 key, uint32 hint) internal view returns (uint208) {
-                Checkpoint208 memory checkpoint = at(self, hint);
+                Checkpoint208 memory checkpoint = self._checkpoints[hint];
                 if (checkpoint._key == key) {
                     return checkpoint._value;
                 }
-                if (checkpoint._key < key && (hint == length(self) - 1 || at(self, hint + 1)._key > key)) {
+                if (checkpoint._key < key && (hint == self._checkpoints.length - 1 || self._checkpoints[hint + 1]._key > key)) {
                     return checkpoint._value;
                 }
                 return search(self, key);
@@ -426,8 +441,55 @@ mod tests {
         }
     "#;
 
+    // EigenLayer cert-verifier shape: a caller-supplied `operatorIndex` indexes a
+    // NESTED MAPPING (`_operatorInfos[set][ts][index]`) and returns an
+    // `OperatorInfo` struct — NOT a `Trace`/`Checkpoint` container, and the value
+    // is not a checkpoint stake/share. The `Trace`-container anchor suppresses it
+    // even though it has a `*Timestamp` "key" and an `*Index` "hint". (Real FP:
+    // BN254CertificateVerifier.getNonsignerOperatorInfo / ECDSA.getOperatorInfo.)
+    const SAFE_CERT_VERIFIER: &str = r#"
+        contract BN254CertificateVerifier {
+            struct OperatorInfo { uint256 weight; uint256 pubkeyX; }
+            mapping(bytes32 => mapping(uint32 => mapping(uint256 => OperatorInfo))) internal _operatorInfos;
+            function getNonsignerOperatorInfo(bytes32 operatorSetKey, uint32 referenceTimestamp, uint256 operatorIndex)
+                external view returns (OperatorInfo memory)
+            {
+                return _operatorInfos[operatorSetKey][referenceTimestamp][operatorIndex];
+            }
+        }
+    "#;
+
+    // Pendle `VeHistoryLib.Checkpoints.get` shape: a by-position accessor that
+    // RETURNS a `Checkpoint memory` from a `History` container indexed by `index`,
+    // with no re-check. Structurally identical to Symbiotic `at`, BUT the container
+    // is `History`, not a `Trace` — so the `Trace`-container anchor keeps it quiet.
+    // (Real FP risk: pendle VeHistoryLib.sol `get`.)
+    const SAFE_HISTORY_GET: &str = r#"
+        library Checkpoints {
+            struct Checkpoint { uint128 timestamp; uint256 value; }
+            struct History { Checkpoint[] _checkpoints; }
+            function get(History storage self, uint256 index) internal view returns (Checkpoint memory) {
+                return self._checkpoints[index];
+            }
+        }
+    "#;
+
+    // Pendle Uniswap-style oracle ring buffer: `Observation[65535]` indexed by a
+    // caller `index`, returning an `Observation` value. Not a `Trace`/`Checkpoint`
+    // container -> suppressed. (Real FP: OracleLib.observeSingle / write.)
+    const SAFE_OBSERVATION_RING: &str = r#"
+        library OracleLib {
+            struct Observation { uint32 blockTimestamp; uint216 cum; bool initialized; }
+            function observeSingle(Observation[65535] storage self, uint32 time, uint16 index)
+                public view returns (uint216)
+            {
+                Observation memory last = self[index];
+                return last.cum;
+            }
+        }
+    "#;
+
     #[test]
-    #[ignore = "detector quarantined pending R8 real-code tuning (see detectors/mod.rs); re-enable on activation"]
     fn fires_on_vuln() {
         assert!(fires(VULN), "{:#?}", run(VULN));
     }
@@ -440,5 +502,20 @@ mod tests {
     #[test]
     fn silent_when_param_not_a_hint() {
         assert!(!fires(SAFE_NOT_A_HINT), "{:#?}", run(SAFE_NOT_A_HINT));
+    }
+
+    #[test]
+    fn silent_on_cert_verifier_mapping_index() {
+        assert!(!fires(SAFE_CERT_VERIFIER), "{:#?}", run(SAFE_CERT_VERIFIER));
+    }
+
+    #[test]
+    fn silent_on_non_trace_history_accessor() {
+        assert!(!fires(SAFE_HISTORY_GET), "{:#?}", run(SAFE_HISTORY_GET));
+    }
+
+    #[test]
+    fn silent_on_observation_ring_buffer() {
+        assert!(!fires(SAFE_OBSERVATION_RING), "{:#?}", run(SAFE_OBSERVATION_RING));
     }
 }

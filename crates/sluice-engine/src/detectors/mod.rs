@@ -142,13 +142,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(proportional_split_residual::ProportionalSplitResidualDetector),
         Box::new(pooled_shares_reprice_desync::PooledSharesRepriceDesyncDetector),
         Box::new(silenced_privileged_callback::SilencedPrivilegedCallbackDetector),
-        // QUARANTINED pending R8 real-code tuning (the R7 dogfood showed these regress
-        // precision): internal-share-pricing-rounding floods on every internal `a*b/c`
-        // (52 FPs across the 4 codebases — reward-index / points / penalty-ratio math),
-        // and checkpoint-hint-trust over-fires on cert verifiers AND misses the real
-        // Checkpoints.sol it targets. R8 tightens both, then re-activates.
-        // Box::new(internal_share_pricing_rounding::InternalSharePricingRoundingDetector),
-        // Box::new(checkpoint_hint_trust::CheckpointHintTrustDetector),
+        // R8-tuned + re-activated (were R7-quarantined). internal-share-pricing-rounding
+        // now matches ONLY a bare `mulDiv` (no Rounding arg) with a pooled-aggregate
+        // divisor spanning share+asset operands (kills the 52 FPs); checkpoint-hint-trust
+        // now requires an OZ/Symbiotic `Trace*` container (structurally excludes the
+        // cert-verifier / observation-buffer FPs) and fires on the real Checkpoints.sol.
+        Box::new(internal_share_pricing_rounding::InternalSharePricingRoundingDetector),
+        Box::new(checkpoint_hint_trust::CheckpointHintTrustDetector),
     ]
 }
 

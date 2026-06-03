@@ -1,68 +1,70 @@
-//! Epoch-boundary staleness — a live quantity used where an epoch/snapshot
-//! capture is the protocol's invariant.
+//! Epoch-boundary staleness — a live quantity used where the *same* quantity has
+//! an epoch/snapshot-captured accessor that the protocol's invariant requires.
 //!
-//! Restaking / staking / governance protocols that are organized around
-//! **epochs** (or capture timestamps / snapshots) establish a rule: the figure
-//! that decides slashing power, voting weight, or a reward share must be the
-//! value **captured at the epoch boundary** (the moment the epoch was sealed),
-//! not the value as it stands *right now*. The captured value cannot be moved
-//! once the epoch is fixed; the live value can be pumped or drained inside the
-//! epoch with a flash-deposit / flash-withdraw and reverted in the same block.
+//! Restaking / staking / governance protocols organized around **epochs** (or
+//! capture timestamps / snapshots) establish a rule: the figure that decides
+//! slashing power, voting weight, or a reward share must be the value **captured
+//! at the epoch boundary** (the moment the epoch was sealed), not the value as it
+//! stands *right now*. The captured value cannot be moved once the epoch is
+//! fixed; the live value can be pumped or drained inside the epoch with a
+//! flash-deposit / flash-withdraw and reverted in the same block.
 //!
-//! The staleness bug is the inverse of "stale oracle": here the contract *has*
-//! the epoch-captured accessor (so the protocol clearly intends capture
-//! semantics), yet a state-mutating entry point reaches for the **live / latest /
-//! current** accessor of the *same quantity* and feeds it into a `require`, a
-//! branch, or an assignment. Symbiotic/Mellow-style `activeStake()` used where
-//! `activeStakeAt(captureTimestamp)` was required, or OZ `getVotes()` used where
-//! `getPastVotes(blockNumber)` was required, are the canonical shapes.
+//! The canonical instance is Symbiotic's `Vault.onSlash(amount, captureTimestamp)`:
+//! it validates the epoch with `epochAt(captureTimestamp)`, yet computes the
+//! slashable amount from the **live** `activeStake()` rather than
+//! `activeStakeAt(captureTimestamp, hint)` — the captured accessor the vault
+//! itself exposes. An operator who is being slashed for an old epoch can change
+//! the *current* active stake between capture and the slash call.
 //!
-//! Precision anchors (all required, so this stays silent on protocols that have
-//! no epoch machinery, and on functions that are already epoch-aware):
-//!   * the **contract** exposes at least one epoch/capture/snapshot-keyed
-//!     accessor (a function, state var, or call whose name contains `epoch`,
-//!     `capturetimestamp`, `snapshot`, `getpast`, or `pointat`) — this proves the
-//!     protocol's invariant is capture-based, not live;
-//!   * a **state-mutating, externally-reachable** function in the *same* contract
-//!     reads the same quantity through a **live/current/latest** accessor
-//!     (`activestake`, `totalstake`, `totalsupply`, current `balanceof`, ...) and
-//!     **uses** that read in a `require`/`if`/assignment (a decision), not merely
-//!     forwards it;
-//!   * the function is **not** itself epoch-aware: it takes no epoch/timestamp/
-//!     snapshot parameter that it threads into the read (such a function is
-//!     reading at a caller-supplied capture point on purpose).
+//! Precision anchor (the thing that distinguishes a real epoch-staleness bug from
+//! an ordinary live read): the live quantity must be the **same quantity for which
+//! the contract provides an epoch/snapshot-captured accessor**. We require, for
+//! the live name `X` consumed in a decision, that the contract (its own functions
+//! *plus inherited ones*) defines a **captured sibling** of `X` — a function named
+//! like `X` + `At` (Symbiotic `activeStakeAt`, OZ-Snapshot `totalSupplyAt`) or the
+//! `getPast<X>` form (OZ `getVotes` → `getPastVotes`) — that takes a
+//! timestamp/epoch/snapshot/block parameter. This is strictly stronger than "the
+//! contract mentions `epoch` somewhere": a vault that snapshots `activeStake` but
+//! reads it live is flagged, whereas a staking contract whose `rebase` reads
+//! `token.balanceOf(this)` — for which there is *no* `balanceOfAt` snapshot — is
+//! not, even though it has an `epoch` struct.
+//!
+//! Additional gates (all required):
+//!   * the consuming function is **state-mutating and externally reachable** and
+//!     **uses** the live read in a `require`/branch/assignment (a decision), not
+//!     merely forwards it from a getter;
+//!   * the consuming function is **not** itself the captured accessor;
+//!   * the specific decision read is the **live** variant, not the captured one
+//!     (`activeStakeAt(...)` / `getPastVotes(...)` reads are the safe form and are
+//!     never flagged).
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
 use sluice_ir::{Contract, Expr, ExprKind, Function};
+use std::collections::HashSet;
 
 pub struct EpochBoundaryStalenessDetector;
 
-/// Tokens whose presence (in a function name, state-var name, or called method
-/// name) evidences that the contract captures quantities at an epoch boundary /
-/// snapshot. Their existence is what distinguishes an epoch-based protocol — for
-/// which a live read is a real bug — from an ordinary one where a live read is
-/// simply the design.
-const EPOCH_MARKERS: &[&str] = &[
-    "epoch",
-    "capturetimestamp",
-    "snapshot",
-    "getpast",   // OZ ERC20Votes / ERC5805: getPastVotes / getPastTotalSupply
-    "pointat",   // checkpoint "point at" style accessors
-];
+/// Capture-shaped parameter names / types: a captured accessor takes one of these
+/// so the caller pins the read to a boundary.
+const CAPTURE_PARAM_NAMES: &[&str] =
+    &["timestamp", "epoch", "snapshot", "blocknumber", "blockno", "captureat", "pointat", "ts"];
+const CAPTURE_PARAM_TYPES: &[&str] = &["uint48", "uint32"]; // common epoch/timestamp widths
 
-/// Live / current / latest accessors for a stake-like or supply-like quantity.
-/// Reading one of these *is* the manipulable read when the protocol's invariant
-/// wants the epoch-captured value. Deliberately a closed, stake/governance-shaped
-/// set so this never fires on unrelated `current*` helpers.
+/// Live / current / latest accessors for a stake-like, supply-like, or
+/// voting-power-like quantity. Reading one of these *is* the manipulable read when
+/// the protocol's invariant wants the epoch-captured value. Deliberately a closed,
+/// stake/governance-shaped set so this never fires on unrelated `current*` helpers.
 const LIVE_ACCESSORS: &[&str] = &[
     "activestake",
+    "activeshares",
+    "activesharesof",
+    "activebalanceof",
     "totalstake",
     "currentstake",
     "totalsupply",
     "totalassets",
-    "balanceof",
     "getvotes",
     "votingpower",
     "totalvotes",
@@ -76,7 +78,7 @@ impl Detector for EpochBoundaryStalenessDetector {
         Category::EpochBoundaryStaleness
     }
     fn description(&self) -> &'static str {
-        "Live/current quantity used for a decision where an epoch/snapshot-captured value is the invariant"
+        "Live/current quantity used for a decision where the same quantity has an epoch/snapshot-captured accessor"
     }
 
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
@@ -87,9 +89,16 @@ impl Detector for EpochBoundaryStalenessDetector {
             if contract.is_interface() || contract.is_library() {
                 continue;
             }
-            // STRUCTURAL GATE 1: the contract must demonstrably be epoch-based —
-            // it captures some quantity at an epoch / snapshot / capture point.
-            if !contract_has_epoch_machinery(cx, contract) {
+
+            // Collect, across this contract *and its inherited bases*, the set of
+            // live accessor names for which a captured sibling exists. This is the
+            // core precision gate: only a live read of one of THESE names can be a
+            // staleness bug, because only these are quantities the protocol seals
+            // at an epoch/snapshot boundary. (In Symbiotic, `onSlash` lives in
+            // `Vault` while `activeStakeAt` lives in the inherited `VaultStorage`,
+            // so the base walk is essential.)
+            let captured_live_names = captured_live_quantities(cx, contract);
+            if captured_live_names.is_empty() {
                 continue;
             }
 
@@ -97,54 +106,48 @@ impl Detector for EpochBoundaryStalenessDetector {
                 if !f.has_body || !f.is_externally_reachable() || !f.is_state_mutating() {
                     continue;
                 }
-                // Reading the live value to expose it (a `view`) is fine; the bug
-                // is using it to *drive a state mutation*. `is_state_mutating`
-                // above already excludes view/pure, but be explicit for clarity.
+                // A view/pure getter that surfaces the live value is not the bug;
+                // `is_state_mutating` already excludes those, but be explicit.
                 if f.is_view_or_pure() {
                     continue;
                 }
-                // SUPPRESS: a function that is itself an epoch/snapshot accessor
-                // (its own name carries the marker) is the capture path, not a
-                // victim of it.
-                if name_has_marker(&f.name, EPOCH_MARKERS) {
-                    continue;
-                }
-                // SUPPRESS: the function is already epoch-aware — it takes an
-                // epoch / timestamp / snapshot parameter and threads it into the
-                // body. Then its reads are deliberately at a chosen capture point.
-                if is_epoch_aware(f) {
+                // SUPPRESS: a function that is itself a captured accessor (its own
+                // name is the captured form) is the capture path, not a victim.
+                if is_captured_accessor_name(&f.name) {
                     continue;
                 }
 
-                // STRUCTURAL GATE 2: find a live/current accessor read that is
-                // actually *used* in a decision (require / branch / assignment).
-                let Some((span, accessor)) = first_live_decision_read(f) else {
+                // Find a live-accessor read that (a) is *used* in a decision and
+                // (b) names a quantity for which a captured sibling exists.
+                let Some((span, accessor)) = first_live_decision_read(f, &captured_live_names) else {
                     continue;
                 };
 
                 let b = FindingBuilder::new(self.id(), Category::EpochBoundaryStaleness)
                     .title("Live quantity used where an epoch/snapshot-captured value is required")
                     .severity(Severity::Medium)
-                    .confidence(0.45)
+                    .confidence(0.5)
                     .dimension(Dimension::Invariant)
                     .message(format!(
                         "`{}` reads `{}` at the current/latest block and uses it in a decision \
-                         (require / branch / assignment), while `{}` captures the same kind of \
-                         quantity at an epoch boundary / snapshot elsewhere (an `epoch` / \
-                         `captureTimestamp` / `snapshot` / `getPast*` accessor exists). When the \
-                         protocol's invariant is the epoch-captured figure, consuming the live one \
-                         is manipulable *within* the epoch: an attacker can flash-deposit to inflate \
-                         (or flash-withdraw to deflate) stake/supply/voting weight in the same \
-                         transaction, skew the slashing power / vote / reward share, and unwind — \
-                         the epoch-boundary staleness class.",
-                        f.name, accessor, contract.name
+                         (require / branch / assignment), while the contract exposes an \
+                         epoch/snapshot-captured accessor for the *same* quantity \
+                         (`{}At(...)` / `getPast{}` taking a timestamp/epoch/block argument). When \
+                         the protocol's invariant is the epoch-captured figure, consuming the live \
+                         one is manipulable *within* the epoch: an attacker can flash-deposit to \
+                         inflate (or flash-withdraw to deflate) the stake/supply/voting weight in \
+                         the same transaction, skew the slashing power / vote / reward share, and \
+                         unwind — the epoch-boundary staleness class. (Symbiotic `onSlash` validates \
+                         `epochAt(captureTimestamp)` but slashes against the live `activeStake()` \
+                         instead of `activeStakeAt(captureTimestamp)`.)",
+                        f.name, accessor, accessor, accessor
                     ))
                     .recommendation(
                         "Read the quantity at the epoch's capture point, not live: use the \
                          epoch-keyed accessor the contract already provides \
-                         (`activeStakeAt(captureTimestamp)`, `getPastVotes(epochBlock)`, a snapshot \
-                         id) so the value is fixed for the epoch and cannot be flash-manipulated \
-                         between capture and use.",
+                         (`activeStakeAt(captureTimestamp, hint)`, `getPastVotes(epochBlock)`, a \
+                         snapshot id) so the value is fixed for the epoch and cannot be \
+                         flash-manipulated between capture and use.",
                     );
                 out.push(cx.finish(b, f.id, span));
             }
@@ -154,109 +157,134 @@ impl Detector for EpochBoundaryStalenessDetector {
     }
 }
 
-/// STRUCTURAL GATE 1: does the contract have any epoch/capture/snapshot-keyed
-/// accessor? We look at (a) the names of its functions, (b) the names of its
-/// state variables, and (c) the method names it calls — any one carrying an
-/// epoch marker proves the protocol seals quantities at a boundary.
-fn contract_has_epoch_machinery(cx: &AnalysisContext, contract: &Contract) -> bool {
-    if contract.state_vars.iter().any(|v| name_has_marker(&v.name, EPOCH_MARKERS)) {
-        return true;
+/// The set of live-accessor names (lowercased) for which the contract — its own
+/// functions *and inherited ones* — provides a captured sibling. A captured
+/// sibling of live name `X` is an in-scope function `g` such that:
+///   * `g` takes a capture-shaped parameter (timestamp / epoch / snapshot / block,
+///     or a `uint48`/`uint32` width), AND
+///   * `g.name` is the captured form of `X`: `X + "At"` (Symbiotic `activeStakeAt`,
+///     OZ-Snapshot `totalSupplyAt`) or the `getPast`-substituted form
+///     (`getVotes` → `getPastVotes`).
+/// Returning the *live* names (not the captured ones) lets the decision-read scan
+/// match directly on what a buggy function actually calls.
+fn captured_live_quantities(cx: &AnalysisContext, contract: &Contract) -> HashSet<String> {
+    // 1. Gather every in-scope function name (own + transitive bases).
+    let mut scope_fn_names: Vec<String> = Vec::new();
+    collect_scope_function_names(cx, contract, &mut scope_fn_names, &mut HashSet::new());
+
+    // 2. Also remember, for each in-scope function, whether it takes a capture
+    //    param — a captured sibling must.
+    let mut capture_param_fns: HashSet<String> = HashSet::new();
+    collect_capture_param_fn_names(cx, contract, &mut capture_param_fns, &mut HashSet::new());
+
+    // 3. For every live accessor that is a *plausible* captured form present in
+    //    scope, record the corresponding live name.
+    let mut out: HashSet<String> = HashSet::new();
+    for live in LIVE_ACCESSORS {
+        let live = *live;
+        // Candidate captured-sibling names for this live accessor.
+        let at_form = format!("{live}at");
+        let getpast_form = live
+            .strip_prefix("get")
+            .map(|rest| format!("getpast{rest}"));
+
+        let has_at = scope_fn_names
+            .iter()
+            .any(|n| n.to_ascii_lowercase() == at_form && capture_param_fns.contains(&n.to_ascii_lowercase()));
+        let has_getpast = getpast_form.as_ref().is_some_and(|gp| {
+            scope_fn_names
+                .iter()
+                .any(|n| n.to_ascii_lowercase() == *gp && capture_param_fns.contains(&n.to_ascii_lowercase()))
+        });
+
+        if has_at || has_getpast {
+            out.insert(live.to_string());
+        }
+    }
+    out
+}
+
+/// Collect the names of all functions visible to `contract` (own + transitively
+/// inherited), by walking `bases` through `contract_named`.
+fn collect_scope_function_names(
+    cx: &AnalysisContext,
+    contract: &Contract,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    if !seen.insert(contract.name.clone()) {
+        return;
     }
     for f in cx.scir.functions_of(contract.id) {
-        if name_has_marker(&f.name, EPOCH_MARKERS) {
-            return true;
-        }
-        if f.effects
-            .call_sites
-            .iter()
-            .any(|c| c.func_name.as_deref().map(|n| name_has_marker(n, EPOCH_MARKERS)).unwrap_or(false))
-        {
-            return true;
-        }
-        if f.effects.internal_calls.iter().any(|n| name_has_marker(n, EPOCH_MARKERS)) {
-            return true;
+        out.push(f.name.clone());
+    }
+    for base in &contract.bases {
+        if let Some(bc) = cx.scir.contract_named(base) {
+            collect_scope_function_names(cx, bc, out, seen);
         }
     }
-    false
 }
 
-/// SUPPRESS: a function is "epoch-aware" if it accepts an epoch / timestamp /
-/// snapshot / block-number parameter and **passes that parameter into a call**
-/// (the accessor read) — i.e. it reads at a caller-chosen capture point on
-/// purpose. We require the parameter to flow into a call argument (not merely
-/// appear somewhere) so a function that *accepts* an epoch arg but ignores it —
-/// the very bug shape — is not mistaken for epoch-aware. Errs toward suppression
-/// on genuinely epoch-threaded reads to keep precision high.
-fn is_epoch_aware(f: &Function) -> bool {
-    const PARAM_NAME_MARKERS: &[&str] =
-        &["epoch", "timestamp", "snapshot", "blocknumber", "captureat", "pointat"];
-    const PARAM_TYPE_HINTS: &[&str] = &["uint48", "uint32"]; // common epoch/timestamp widths
-
-    for p in &f.params {
-        let pname = p.name.as_deref().unwrap_or("");
-        if pname.is_empty() {
-            continue;
+/// Collect (lowercased) names of in-scope functions that take a capture-shaped
+/// parameter — the necessary condition for a function to be a captured accessor.
+fn collect_capture_param_fn_names(
+    cx: &AnalysisContext,
+    contract: &Contract,
+    out: &mut HashSet<String>,
+    seen: &mut HashSet<String>,
+) {
+    if !seen.insert(contract.name.clone()) {
+        return;
+    }
+    for f in cx.scir.functions_of(contract.id) {
+        if function_takes_capture_param(f) {
+            out.insert(f.name.to_ascii_lowercase());
         }
-        let lname = pname.to_ascii_lowercase();
+    }
+    for base in &contract.bases {
+        if let Some(bc) = cx.scir.contract_named(base) {
+            collect_capture_param_fn_names(cx, bc, out, seen);
+        }
+    }
+}
+
+/// Does `f` accept a capture-shaped parameter (a timestamp/epoch/snapshot/block by
+/// name, or a `uint48`/`uint32` by type)? Required of any captured accessor.
+fn function_takes_capture_param(f: &Function) -> bool {
+    f.params.iter().any(|p| {
+        let lname = p.name.as_deref().unwrap_or("").to_ascii_lowercase();
         let lty = p.ty.to_ascii_lowercase();
+        let name_hit = !lname.is_empty() && CAPTURE_PARAM_NAMES.iter().any(|m| lname.contains(m));
+        let type_hit = CAPTURE_PARAM_TYPES.iter().any(|t| lty == *t);
+        name_hit || type_hit
+    })
+}
 
-        let name_hit = PARAM_NAME_MARKERS.iter().any(|m| lname.contains(m));
-        let type_hit = PARAM_TYPE_HINTS.iter().any(|t| lty == *t);
-
-        // The parameter is epoch/timestamp-shaped AND is handed to a call — it is
-        // being threaded into the (capture-keyed) read deliberately.
-        if (name_hit || type_hit) && param_flows_into_call_arg(f, pname) {
-            return true;
-        }
+/// `name` is itself a captured-accessor name (the safe form): it carries a capture
+/// marker (`getPast*`, `*snapshot*`) or ends in the `At` suffix while starting with
+/// a known live-accessor root (`activeStakeAt`, `totalSupplyAt`).
+fn is_captured_accessor_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    if l.contains("getpast") || l.contains("snapshot") || l.contains("pointat") {
+        return true;
+    }
+    // `...At` suffix over a live-accessor root.
+    if l.ends_with("at") && LIVE_ACCESSORS.iter().any(|a| l.starts_with(a)) {
+        return true;
     }
     false
 }
 
-/// Does the parameter `name` appear as (part of) an argument to some call in the
-/// body — `foo(name)`, `src.activeStakeAt(name)`, `getPastVotes(name)`? This is
-/// the structural proxy for "passes the epoch param to the read".
-fn param_flows_into_call_arg(f: &Function, name: &str) -> bool {
-    let mut found = false;
-    for s in &f.body {
-        s.visit_exprs(&mut |e| {
-            if found {
-                return;
-            }
-            e.visit(&mut |sub| {
-                if let ExprKind::Call(c) = &sub.kind {
-                    if c.args.iter().any(|a| expr_mentions_ident(a, name)) {
-                        found = true;
-                    }
-                }
-            });
-        });
-        if found {
-            break;
-        }
-    }
-    found
-}
-
-/// Does `name` appear as an identifier anywhere in `e`?
-fn expr_mentions_ident(e: &Expr, name: &str) -> bool {
-    let mut found = false;
-    e.visit(&mut |sub| {
-        if let ExprKind::Ident(n) = &sub.kind {
-            if n == name {
-                found = true;
-            }
-        }
-    });
-    found
-}
-
-/// STRUCTURAL GATE 2: the first read of a live/current accessor that is *used* in
-/// a decision (a `require`/`assert`, an `if`/`while`/`for`/`do-while` condition,
-/// or an assignment / var-decl initializer). Returns the span of the using
-/// statement and the matched accessor name. Requiring genuine *use* (not a bare
-/// read, and not a value merely returned/forwarded) is the key precision anchor:
-/// a getter that surfaces the live value is not the bug.
-fn first_live_decision_read(f: &Function) -> Option<(sluice_ir::Span, String)> {
+/// STRUCTURAL GATE: the first read of a live accessor — *restricted to the live
+/// names that have a captured sibling* — that is *used* in a decision (a
+/// `require`/`assert`, an `if`/`while`/`for`/`do-while` condition, or an
+/// assignment / var-decl initializer). Returns the span of the using statement and
+/// the matched accessor name. Requiring genuine *use* is the second precision
+/// anchor: a getter that merely surfaces the live value is not the bug.
+fn first_live_decision_read(
+    f: &Function,
+    captured_live_names: &HashSet<String>,
+) -> Option<(sluice_ir::Span, String)> {
     let mut hit: Option<(sluice_ir::Span, String)> = None;
 
     for s in &f.body {
@@ -270,19 +298,19 @@ fn first_live_decision_read(f: &Function) -> Option<(sluice_ir::Span, String)> {
                 StmtKind::If { cond, .. }
                 | StmtKind::While { cond, .. }
                 | StmtKind::DoWhile { cond, .. } => {
-                    if let Some(a) = expr_reads_live_accessor(cond) {
+                    if let Some(a) = expr_reads_live_accessor(cond, captured_live_names) {
                         hit = Some((st.span, a));
                     }
                 }
                 StmtKind::For { cond: Some(cond), .. } => {
-                    if let Some(a) = expr_reads_live_accessor(cond) {
+                    if let Some(a) = expr_reads_live_accessor(cond, captured_live_names) {
                         hit = Some((st.span, a));
                     }
                 }
                 // Used in a `require(...)` / `assert(...)` or assigned into state /
                 // a local that then drives the decision.
                 StmtKind::Expr(e) => {
-                    if let Some(a) = require_or_assign_uses_live(e) {
+                    if let Some(a) = require_or_assign_uses_live(e, captured_live_names) {
                         hit = Some((st.span, a));
                     }
                 }
@@ -290,7 +318,7 @@ fn first_live_decision_read(f: &Function) -> Option<(sluice_ir::Span, String)> {
                 // function will branch/compute on. The decisive use of the live
                 // value starts here, so this is a fair anchor.
                 StmtKind::VarDecl { init: Some(e), .. } => {
-                    if let Some(a) = expr_reads_live_accessor(e) {
+                    if let Some(a) = expr_reads_live_accessor(e, captured_live_names) {
                         hit = Some((st.span, a));
                     }
                 }
@@ -306,8 +334,7 @@ fn first_live_decision_read(f: &Function) -> Option<(sluice_ir::Span, String)> {
 
 /// A `require`/`assert` whose args read a live accessor, or an assignment whose
 /// value reads a live accessor.
-fn require_or_assign_uses_live(e: &Expr) -> Option<String> {
-    // require(... activeStake() ...) / assert(...)
+fn require_or_assign_uses_live(e: &Expr, names: &HashSet<String>) -> Option<String> {
     if let ExprKind::Call(c) = &e.kind {
         use sluice_ir::{Builtin, CallKind};
         if matches!(
@@ -315,26 +342,25 @@ fn require_or_assign_uses_live(e: &Expr) -> Option<String> {
             CallKind::Builtin(Builtin::Require) | CallKind::Builtin(Builtin::Assert)
         ) {
             for a in &c.args {
-                if let Some(name) = expr_reads_live_accessor(a) {
+                if let Some(name) = expr_reads_live_accessor(a, names) {
                     return Some(name);
                 }
             }
         }
     }
-    // x = activeStake();  /  x += totalStake();
     if let ExprKind::Assign { value, .. } = &e.kind {
-        if let Some(name) = expr_reads_live_accessor(value) {
+        if let Some(name) = expr_reads_live_accessor(value, names) {
             return Some(name);
         }
     }
     None
 }
 
-/// Does `e` contain a read of a live/current accessor — either a call
-/// (`activeStake()`, `token.balanceOf(...)`, `getVotes(...)`) or a bare
-/// member/identifier (`activeStake`, `totalSupply`) — that is NOT an
-/// epoch/snapshot-keyed variant? Returns the matched accessor name.
-fn expr_reads_live_accessor(e: &Expr) -> Option<String> {
+/// Does `e` contain a read of a live accessor *whose quantity has a captured
+/// sibling* — either a call (`activeStake()`, `getVotes(...)`) or a bare
+/// member/identifier — that is NOT itself the captured variant? Returns the matched
+/// accessor name (as written).
+fn expr_reads_live_accessor(e: &Expr, names: &HashSet<String>) -> Option<String> {
     let mut found: Option<String> = None;
     e.visit(&mut |sub| {
         if found.is_some() {
@@ -347,22 +373,21 @@ fn expr_reads_live_accessor(e: &Expr) -> Option<String> {
                 .clone()
                 .or_else(|| c.callee.simple_name().map(|s| s.to_string()));
             if let Some(name) = nm {
-                if is_live_accessor_name(&name) {
+                if is_live_match(&name, names) {
                     found = Some(name);
                     return;
                 }
             }
         }
-        // Bare member access (`pool.activeStake`) or identifier (`totalSupply`),
-        // e.g. a public auto-getter or state variable read.
+        // Bare member access (`pool.activeStake`) or identifier (`totalSupply`).
         match &sub.kind {
             ExprKind::Member { member, .. } => {
-                if is_live_accessor_name(member) {
+                if is_live_match(member, names) {
                     found = Some(member.clone());
                 }
             }
             ExprKind::Ident(n) => {
-                if is_live_accessor_name(n) {
+                if is_live_match(n, names) {
                     found = Some(n.clone());
                 }
             }
@@ -372,27 +397,16 @@ fn expr_reads_live_accessor(e: &Expr) -> Option<String> {
     found
 }
 
-/// `name` is a live/current accessor of a stake/supply/voting quantity, and is
-/// NOT an epoch/snapshot-keyed variant (those carry an `EPOCH_MARKERS` token and
-/// are exactly the safe form). The epoch-marker exclusion is essential: it lets
-/// `activeStakeAt` / `getPastVotes` / `totalSupplyAt` pass through untouched.
-fn is_live_accessor_name(name: &str) -> bool {
+/// `name` resolves to a live accessor (lowercased, exact) that is present in the
+/// captured-sibling set `names`, and is NOT itself the captured `*At`/`getPast*`
+/// variant. The exact-name match (not substring) keeps `activeStakeAt` from being
+/// read as `activestake` + noise.
+fn is_live_match(name: &str, names: &HashSet<String>) -> bool {
     let l = name.to_ascii_lowercase();
-    if name_has_marker(&l, EPOCH_MARKERS) {
+    if is_captured_accessor_name(&l) {
         return false;
     }
-    // A trailing `at`/`At` (e.g. `activeStakeAt`) marks the captured variant even
-    // though it is not in EPOCH_MARKERS; treat it as the safe form.
-    if l.ends_with("at") && LIVE_ACCESSORS.iter().any(|a| l.starts_with(a)) {
-        return false;
-    }
-    LIVE_ACCESSORS.iter().any(|a| l == *a || l.contains(a))
-}
-
-/// Case-insensitive: does `name` contain any of `markers`?
-fn name_has_marker(name: &str, markers: &[&str]) -> bool {
-    let l = name.to_ascii_lowercase();
-    markers.iter().any(|m| l.contains(m))
+    names.contains(&l)
 }
 
 #[cfg(test)]
@@ -405,66 +419,90 @@ mod tests {
         run(src).iter().any(|f| f.detector == "epoch-boundary-staleness")
     }
 
-    // VULN: an epoch-based vault. `slashableStake()` is the epoch-captured
-    // accessor (proves capture semantics), but `requestSlash` decides the slash
-    // amount from the LIVE `activeStake()` — manipulable within the epoch with a
-    // flash deposit/withdraw. The function is not epoch-aware (no epoch param).
+    // VULN (Symbiotic onSlash shape, split across inheritance): the captured
+    // accessor `activeStakeAt(uint48,bytes)` lives in the base `VaultStorage`,
+    // while `onSlash` lives in the derived `Vault` and slashes against the LIVE
+    // `activeStake()` after validating `epochAt(captureTimestamp)`. The capture
+    // param flows into `epochAt`, NOT into the stake read — exactly the bug.
     const VULN: &str = r#"
-        interface IStakeSource {
-            function activeStake() external view returns (uint256);
-            function activeStakeAt(uint48 captureTimestamp) external view returns (uint256);
+        abstract contract VaultStorage {
+            function epochAt(uint48 timestamp) public view returns (uint256) { return timestamp; }
+            function activeStakeAt(uint48 timestamp, bytes memory hint) public view returns (uint256) { return timestamp; }
+            function activeStake() public view returns (uint256) { return 1; }
         }
-        contract SlashingVault {
-            IStakeSource public source;
-            uint48 public captureTimestamp;
-            mapping(uint256 => uint256) public slashedAt;
-
-            // Epoch-captured accessor — establishes the capture invariant.
-            function slashableStakeAt(uint48 ts) external view returns (uint256) {
-                return source.activeStakeAt(ts);
-            }
-
-            // BUG: decides slash power from the live value, not the captured one.
-            function requestSlash(uint256 amount) external {
-                uint256 power = source.activeStake();
-                require(amount <= power, "too much");
-                slashedAt[block.timestamp] = amount;
+        contract Vault is VaultStorage {
+            address slasher;
+            mapping(uint256 => uint256) withdrawals;
+            function onSlash(uint256 amount, uint48 captureTimestamp) external returns (uint256 slashedAmount) {
+                uint256 captureEpoch = epochAt(captureTimestamp);
+                uint256 activeStake_ = activeStake();
+                uint256 slashableStake = activeStake_ + withdrawals[captureEpoch + 1];
+                slashedAmount = amount < slashableStake ? amount : slashableStake;
+                withdrawals[captureEpoch + 1] = slashableStake - slashedAmount;
             }
         }
     "#;
 
-    // SAFE (epoch-aware): the same vault, but `requestSlash` takes the epoch's
-    // captureTimestamp and reads `activeStakeAt(captureTimestamp)` — it consumes
-    // the captured value, so there is nothing to manipulate within the epoch.
-    const SAFE_EPOCH_AWARE: &str = r#"
+    // VULN (single contract): captured accessor and live read in the same body.
+    const VULN_SINGLE: &str = r#"
         interface IStakeSource {
             function activeStake() external view returns (uint256);
-            function activeStakeAt(uint48 captureTimestamp) external view returns (uint256);
         }
         contract SlashingVault {
             IStakeSource public source;
-            uint48 public captureTimestamp;
             mapping(uint256 => uint256) public slashedAt;
-
-            function slashableStakeAt(uint48 ts) external view returns (uint256) {
-                return source.activeStakeAt(ts);
+            function activeStakeAt(uint48 ts) external view returns (uint256) { return ts; }
+            function requestSlash(uint256 amount) external {
+                uint256 power = activeStake();
+                require(amount <= power, "too much");
+                slashedAt[block.timestamp] = amount;
             }
+            function activeStake() public view returns (uint256) { return 1; }
+        }
+    "#;
 
+    // SAFE (epoch-aware): `requestSlash` reads the CAPTURED `activeStakeAt(ts)` —
+    // the safe form — so there is nothing to flash-manipulate.
+    const SAFE_EPOCH_AWARE: &str = r#"
+        contract SlashingVault {
+            mapping(uint256 => uint256) public slashedAt;
+            function activeStakeAt(uint48 ts) external view returns (uint256) { return ts; }
+            function activeStake() public view returns (uint256) { return 1; }
             function requestSlash(uint256 amount, uint48 epochCaptureTimestamp) external {
-                uint256 power = source.activeStakeAt(epochCaptureTimestamp);
+                uint256 power = activeStakeAt(epochCaptureTimestamp);
                 require(amount <= power, "too much");
                 slashedAt[epochCaptureTimestamp] = amount;
             }
         }
     "#;
 
-    // SAFE (no epoch machinery): an ordinary staking contract with no epoch /
-    // snapshot / capture accessor anywhere. Reading the live `activeStake()` is
-    // the design, not a bug — the structural gate must keep us silent.
-    const SAFE_NO_EPOCH: &str = r#"
-        interface IStakeSource {
-            function activeStake() external view returns (uint256);
+    // SAFE (no captured sibling for the live quantity): an epoch-based contract
+    // whose mutating function reads `token.balanceOf(this)` — for which there is
+    // NO `balanceOfAt` snapshot accessor. This is the olympus `rebase`/`unstake`
+    // and eigenlayer `sweep` FP shape: epoch machinery present, but the live read
+    // is of a quantity the contract never snapshots.
+    const SAFE_NO_CAPTURED_SIBLING: &str = r#"
+        interface IERC20 { function balanceOf(address a) external view returns (uint256); }
+        contract Staking {
+            struct Epoch { uint256 length; uint256 number; uint256 end; }
+            Epoch public epoch;
+            IERC20 OHM;
+            // captured accessor exists, but for a DIFFERENT quantity (activeStake),
+            // not for the balanceOf the function below reads.
+            function activeStakeAt(uint48 ts) public view returns (uint256) { return ts; }
+            function activeStake() public view returns (uint256) { return 1; }
+            function rebase() public returns (uint256) {
+                uint256 balance = OHM.balanceOf(address(this));
+                if (balance > 0) { epoch.number++; }
+                return balance;
+            }
         }
+    "#;
+
+    // SAFE (no epoch machinery at all): ordinary staking, no captured accessor
+    // anywhere. The live `activeStake()` read is the design.
+    const SAFE_NO_EPOCH: &str = r#"
+        interface IStakeSource { function activeStake() external view returns (uint256); }
         contract SimpleStaker {
             IStakeSource public source;
             uint256 public lastSeen;
@@ -477,13 +515,23 @@ mod tests {
     "#;
 
     #[test]
-    fn fires_on_live_read_in_epoch_protocol() {
+    fn fires_on_live_read_with_captured_sibling_across_inheritance() {
         assert!(fires(VULN), "{:#?}", run(VULN));
     }
 
     #[test]
-    fn silent_when_function_is_epoch_aware() {
+    fn fires_on_live_read_single_contract() {
+        assert!(fires(VULN_SINGLE), "{:#?}", run(VULN_SINGLE));
+    }
+
+    #[test]
+    fn silent_when_decision_reads_captured_value() {
         assert!(!fires(SAFE_EPOCH_AWARE), "{:#?}", run(SAFE_EPOCH_AWARE));
+    }
+
+    #[test]
+    fn silent_when_live_quantity_has_no_captured_sibling() {
+        assert!(!fires(SAFE_NO_CAPTURED_SIBLING), "{:#?}", run(SAFE_NO_CAPTURED_SIBLING));
     }
 
     #[test]
