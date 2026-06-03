@@ -776,6 +776,7 @@ name = "sluice-verify"
 version = "0.1.0"
 dependencies = [
  "rustc-hash",
+ "sluice-engine",
  "sluice-findings",
  "sluice-ir",
 ]

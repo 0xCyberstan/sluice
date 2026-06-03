@@ -1,15 +1,31 @@
 //! # sluice-verify
 //!
-//! Lightweight finding triage and **Foundry proof-of-concept generation** — the
-//! analog of `vortex-verify`. Two jobs:
+//! Lightweight finding triage and **real, compiling Foundry proof-of-concept
+//! generation** — the analog of `vortex-verify`. Two jobs:
 //!
 //! * **Feasibility filter** (`feasible`): a cheap, conservative reachability
 //!   check that refutes findings whose sink is plainly guarded on every path.
 //!   It over-approximates, so it never refutes a real finding (matching
 //!   `vortex`'s interval-arithmetic triage philosophy).
-//! * **PoC scaffolding** (`generate_poc`): emit a `forge` test skeleton tailored
-//!   to the finding's category, the practical differentiator for turning a
-//!   finding into a bug-bounty submission.
+//! * **PoC generation** (`generate_poc`): emit a `forge` test tailored to the
+//!   finding's category. For the first-class families (reentrancy, access
+//!   control, ERC-4626 inflation, oracle, bridge) this is a *real, compiling*
+//!   harness — imports the target by relative path, deploys it, builds an
+//!   attacker contract where needed, and ends in a real assertion
+//!   (`assertGt`/`assertLt`/`assertEq`/`expectRevert`). The long tail falls back
+//!   to a trace-annotated stub. Sluice **never invokes `forge`** — it is
+//!   static-only; it *emits* artifacts a human runs (`forge test`).
+//!
+//! ## Honesty tiers (recorded in `Finding.tags` + a header banner)
+//! * **T1** — compiling exploit harness (valid given the target resolves its imports).
+//! * **T2** — compiling skeleton + asserted hypothesis (fill the `/* FILL */` constants).
+//! * **T3** — trace-annotated stub (not claimed to compile).
+
+mod context;
+mod project;
+mod templates;
+
+pub use context::{PocContext, Tier};
 
 use sluice_findings::{Category, Finding};
 use sluice_ir::{Function, Scir};
@@ -49,111 +65,68 @@ fn needs_attacker_reachability(cat: Category) -> bool {
     )
 }
 
-/// Generate a Foundry PoC skeleton for a finding.
+/// Resolve the honesty tier a finding's PoC would carry (without rendering it).
+/// `T3` when no first-class template applies or the target isn't concrete.
+pub fn poc_tier(scir: &Scir, finding: &Finding) -> Tier {
+    match context::poc_context(scir, finding) {
+        Some(cx) => templates::first_class()
+            .iter()
+            .find(|t| t.applies(finding.category))
+            .map(|t| t.tier(&cx))
+            .unwrap_or(Tier::T3),
+        None => Tier::T3,
+    }
+}
+
+/// Generate a Foundry PoC for a finding. Dispatches by category to the first
+/// matching first-class template (reentrancy / access-control / ERC-4626 /
+/// oracle / bridge); falls back to the trace-annotated T3 stub when no template
+/// applies or the target isn't a concrete contract.
 pub fn generate_poc(scir: &Scir, finding: &Finding) -> String {
-    let contract = &finding.contract;
-    let func = &finding.function;
-    let steps = attack_steps(finding.category, contract, func);
-    // `pragma_solidity` may hold a full directive ("pragma solidity ^0.8.20") or
-    // just a version range; normalize to the bare version constraint.
-    let pragma = {
-        let raw = scir.pragma_solidity.clone().unwrap_or_default();
-        let v = raw
-            .trim()
-            .trim_start_matches("pragma")
-            .trim()
-            .trim_start_matches("solidity")
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
-        if v.is_empty() { "^0.8.20".to_string() } else { v }
-    };
-
-    format!(
-        "// SPDX-License-Identifier: MIT\n\
-         pragma solidity {pragma};\n\n\
-         import \"forge-std/Test.sol\";\n\
-         // import the target: {contract} (defines `{func}`)\n\n\
-         contract {contract}_{cat}_PoC is Test {{\n\
-         \x20   {contract} target;\n\
-         \x20   address attacker = address(0xA11CE);\n\n\
-         \x20   function setUp() public {{\n\
-         \x20       // TODO: deploy {contract} and any collaborators (tokens, pools, oracle)\n\
-         \x20       // target = new {contract}(...);\n\
-         \x20   }}\n\n\
-         \x20   /// Finding {id} ({sev}): {title}\n\
-         \x20   function test_exploit_{func}() public {{\n\
-         \x20       vm.startPrank(attacker);\n{steps}\
-         \x20       vm.stopPrank();\n\
-         \x20       // TODO: assert the attacker profited / invariant broke\n\
-         \x20   }}\n\
-         }}\n",
-        pragma = pragma,
-        contract = sanitize(contract),
-        func = sanitize(func),
-        cat = finding.category.slug().replace('-', "_"),
-        id = finding.id,
-        sev = finding.severity.label(),
-        title = finding.title,
-        steps = steps,
-    )
+    match context::poc_context(scir, finding) {
+        Some(cx) => {
+            for t in templates::first_class() {
+                if t.applies(finding.category) {
+                    return t.render(&cx);
+                }
+            }
+            // Concrete contract but a non-first-class category → T3 stub *with*
+            // the real import + typed call.
+            templates::stub::render(scir, finding, Some(&cx))
+        }
+        // Interface/library/unresolved target → name-only T3 stub.
+        None => templates::stub::render(scir, finding, None),
+    }
 }
 
-fn attack_steps(cat: Category, contract: &str, func: &str) -> String {
-    let body = match cat {
-        Category::Reentrancy | Category::ReadOnlyReentrancy => format!(
-            "       // 1. Deposit so the contract owes the attacker.\n\
-             \x20       // 2. Call {func}(); in the attacker's receive()/fallback, re-enter {func}().\n\
-             \x20       // 3. Drain more than the deposited balance before state settles.\n"
-        ),
-        Category::OracleManipulation | Category::PriceManipulation => format!(
-            "       // 1. Flash-loan a large amount of the priced asset.\n\
-             \x20       // 2. Skew the spot source (swap into the pool / donate) to move the price.\n\
-             \x20       // 3. Call {func}() so {contract} values collateral/shares at the false price.\n\
-             \x20       // 4. Extract value, unwind the swap, repay the flash loan.\n"
-        ),
-        Category::Erc4626Inflation | Category::FirstDepositor => format!(
-            "       // 1. As the FIRST depositor, deposit 1 wei -> mint 1 share.\n\
-             \x20       // 2. Donate a large amount directly to the vault (transfer), inflating share price.\n\
-             \x20       // 3. Victim deposits; their shares round down to 0.\n\
-             \x20       // 4. Redeem your 1 share for the whole balance.\n"
-        ),
-        Category::MissingSolvencyCheck => format!(
-            "       // 1. Open a position via the normal guarded path.\n\
-             \x20       // 2. Use {func}() (which skips the solvency check) to push your account insolvent.\n\
-             \x20       // 3. Self-liquidate / withdraw against the unbacked position.\n"
-        ),
-        Category::AccessControl | Category::TxOriginAuth => format!(
-            "       // 1. As an unprivileged account, directly call {contract}.{func}().\n\
-             \x20       // 2. Observe privileged state changed without authorization.\n"
-        ),
-        Category::SignatureReplay | Category::EcrecoverZeroAddress | Category::SignatureMalleability => format!(
-            "       // 1. Capture or forge a signature accepted by {func}().\n\
-             \x20       // 2. Replay it (no nonce) or submit address(0)/malleable variant.\n"
-        ),
-        Category::DelegatecallStorage | Category::UninitializedProxy => format!(
-            "       // 1. Initialize/point the proxy implementation at attacker code.\n\
-             \x20       // 2. delegatecall executes it against {contract}'s storage -> takeover.\n"
-        ),
-        Category::UnsafeErc20 | Category::FeeOnTransfer => format!(
-            "       // 1. Use a fee-on-transfer / non-standard token so {contract} credits more than received.\n\
-             \x20       // 2. Withdraw the difference.\n"
-        ),
-        _ => format!("       // TODO: drive {contract}.{func}() into the vulnerable state.\n"),
-    };
-    body
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect()
-}
-
-/// Attach PoCs to the top-N highest-severity findings in place.
+/// Attach PoCs to the top-N highest-severity findings in place, tagging each with
+/// its honesty tier (`poc:tier1|tier2|tier3`). Findings are assumed already
+/// sorted by severity_score (the engine sorts before id assignment), so PoC
+/// budget is spent on the strongest findings first.
 pub fn attach_pocs(scir: &Scir, findings: &mut [Finding], top_n: usize) {
     for f in findings.iter_mut().take(top_n) {
+        let tier = poc_tier(scir, f);
+        let tag = tier.tag();
+        if !f.tags.iter().any(|t| t == tag) {
+            f.tags.push(tag.to_string());
+        }
         f.poc = Some(generate_poc(scir, f));
     }
+}
+
+/// Emit a self-contained Foundry skeleton project to `out_dir/sluice-poc/`:
+/// `foundry.toml`, `remappings.txt`, `README.md`, and one
+/// `test/F-XXX_<slug>.t.sol` per PoC'd finding. The README states each PoC's
+/// tier and the honesty banner. Returns the list of files written.
+///
+/// This is the *project* form of [`generate_poc`]; it does not run `forge`.
+pub fn emit_poc_project(
+    scir: &Scir,
+    findings: &[Finding],
+    out_dir: &std::path::Path,
+    top_n: usize,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    project::emit(scir, findings, out_dir, top_n)
 }
 
 #[allow(dead_code)]

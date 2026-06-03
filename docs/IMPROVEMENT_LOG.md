@@ -490,3 +490,27 @@ encodepacked-collision (SWC-133), locked-ether. NOT building: SWC-118/129/130/13
   proves it fires on the genuine shape. Sluice now spans the full SWC baseline AND every high-loss logic class. _done._
 
 _(Doc-hygiene: stale R10/R11 duplication + the out-of-order pending-R6 draft removed below; authoritative record is Rounds 1-20 + R21 above.)_
+
+### Round 22 — CORE CAPABILITY: real compiling Foundry-PoC generation (sluice-verify)
+Rotates to the "PoC compilation" core focus. Replaced the comment-only PoC stub with a **tiered generator**:
+**T1** compiling exploit harness, **T2** compiling skeleton + asserted hypothesis (`/* FILL */` constants),
+**T3** trace-annotated stub (not claimed to compile) — tagged per finding (`poc:tier1|2|3`).
+First-class templates: **reentrancy** (3 hook variants — `receive`/`tokensReceived`/`onERC721/1155Received`;
+real `assertGt(attacker)`/`assertLt(target)` drain), **access-control** (`vm.prank`→typed call→`assertEq(privVar)`
+or no-revert proof; init double-call for UnprotectedInitializer), **ERC4626 inflation** (canned `MockERC20`,
+first-depositor donation, `assertEq(victimShares,0)`); **oracle + bridge** as T2 second-wave (`vm.mockCall` skew /
+forged-message + asserted hypothesis). New CLI `--poc-out <dir>` writes a drop-in
+`sluice-poc/{foundry.toml,remappings.txt,README.md,test/F-*.t.sol}` Foundry project; `--poc-top N` (default 5).
+Threaded real `contract_id`/`function_id` into `Finding` (serde-skip `Option`, via `cx.finish`). Sluice still
+**NEVER invokes forge** (static-only): "compiles" = harness valid given the target resolves its imports.
+- **Result:** verified end-to-end — VulnBank → **T1** reentrancy (attacker contract + `receive()` + real drain
+  asserts); erc4626_inflation → **T2** ERC4626 (MockERC20 + `assertEq(victimShares,0)`) + **T2** reentrancy +
+  **T3** for the no-template fee-on-transfer finding; both `--poc` (inline) and `--poc-out` dispatch identically.
+  **671 engine tests + corpus 20/20 + 8/8 + 5 real-hack harnesses + 7 new sluice-verify template tests, 0 warnings.**
+  Closes the long-standing "real compiling Foundry PoCs" open item — a bounty-submission differentiator. _done._
+- Round also produced (read-only feeders, for upcoming rounds): **R23 build-ready v4 specs** corpus-verified
+  against the cloned `~/Data/corpus/v4-*` (`docs/R23_BUILD_SPECS.md` — Spec 1 V4CallbackMissingPoolManagerAuth is
+  the corpus-tunable Critical to build first; Specs 2/4 are fixture-only → Info-gate / await a hook corpus), and a
+  **precision backlog** from a 3-codebase dogfood (`docs/PRECISION_BACKLOG.md` — floating-pragma sub-classing,
+  array-length full-body guard scan, upgradeable inheritance-chain `_disableInitializers`, centralization-Info
+  suppression, + 2 engine bugs: `contract … layout at N is …` parse recovery, `is_file()` IO guard).

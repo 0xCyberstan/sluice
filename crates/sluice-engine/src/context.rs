@@ -138,6 +138,14 @@ impl<'a> AnalysisContext<'a> {
     /// Finalize a builder, resolving location from a function id + span.
     pub fn finish(&self, b: FindingBuilder, fid: FunctionId, span: Span) -> Finding {
         let (c, f) = self.names(fid);
+        // Thread the precise IR ids through so `sluice-verify` can recover the
+        // full `Contract`/`Function` (source file, ctor, signature, effects)
+        // without re-looking-up by name. `cid` is the function's owning contract.
+        let cid = self.scir.function(fid).map(|func| func.contract);
+        let mut b = b;
+        if let Some(cid) = cid {
+            b = b.with_ids(cid, fid);
+        }
         b.at(self.scir, c, f, span).build()
     }
 

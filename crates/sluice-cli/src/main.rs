@@ -67,9 +67,16 @@ struct ScanArgs {
     /// Disable these detector ids (comma-separated).
     #[arg(long, value_delimiter = ',')]
     disable: Vec<String>,
-    /// Attach a Foundry PoC skeleton to the top findings.
+    /// Attach an inline Foundry PoC to the top findings (top-10).
     #[arg(long)]
     poc: bool,
+    /// Write a drop-in `sluice-poc/` Foundry project (one `.t.sol` per PoC'd
+    /// finding) under this directory.
+    #[arg(long, value_name = "DIR")]
+    poc_out: Option<PathBuf>,
+    /// How many top findings to generate first-class (T1/T2) PoCs for.
+    #[arg(long, default_value = "5")]
+    poc_top: usize,
     /// Limit to the top N findings.
     #[arg(long)]
     top: Option<usize>,
@@ -217,7 +224,31 @@ fn run_scan(args: ScanArgs) -> Result<i32> {
         result.findings.truncate(top);
     }
     if args.poc {
+        // Inline PoCs on the top-10 (rendered into the report by `render`).
         sluice_verify::attach_pocs(&result.scir, &mut result.findings, 10);
+    } else if args.poc_out.is_some() {
+        // No inline PoCs requested, but a project is — still tag tiers on the
+        // top-N so SARIF/JSON/HTML consumers can filter by `poc:tierN`.
+        for f in result.findings.iter_mut().take(args.poc_top) {
+            let tag = sluice_verify::poc_tier(&result.scir, f).tag();
+            if !f.tags.iter().any(|t| t == tag) {
+                f.tags.push(tag.to_string());
+            }
+        }
+    }
+    if let Some(dir) = &args.poc_out {
+        match sluice_verify::emit_poc_project(&result.scir, &result.findings, dir, args.poc_top) {
+            Ok(written) => {
+                let proj = dir.join("sluice-poc");
+                eprintln!(
+                    "{} {} PoC file(s) → {}",
+                    "poc:".green().bold(),
+                    written.len(),
+                    proj.display()
+                );
+            }
+            Err(e) => eprintln!("{} writing PoC project: {e}", "error:".red().bold()),
+        }
     }
 
     let project = args

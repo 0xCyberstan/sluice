@@ -2,7 +2,7 @@
 //! normalizes its result into this struct, exactly as `vortex-findings` does.
 
 use serde::{Deserialize, Serialize};
-use sluice_ir::Span;
+use sluice_ir::{ContractId, FunctionId, Span};
 
 /// The three orthogonal analysis dimensions. A finding corroborated by more than
 /// one dimension is scored higher — the central false-positive-suppression idea
@@ -518,6 +518,17 @@ pub struct Finding {
     pub line: usize,
     #[serde(skip)]
     pub span: Span,
+    /// The IR id of the contract the finding is anchored in, when known. Threaded
+    /// in by `FindingBuilder::at`/`cx.finish` so `sluice-verify` can recover the
+    /// full `Contract` (source file, ctor, state vars) without a brittle
+    /// name-string re-lookup. `None` for findings located without an `Scir`.
+    #[serde(skip)]
+    pub contract_id: Option<ContractId>,
+    /// The IR id of the function the finding is anchored in, when known. Threaded
+    /// in by `cx.finish` (which already has the `FunctionId`); lets
+    /// `sluice-verify` read the exact `Function.signature`/`.params`/`.effects`.
+    #[serde(skip)]
+    pub function_id: Option<FunctionId>,
     pub snippet: String,
 
     pub message: String,

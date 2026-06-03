@@ -1,7 +1,7 @@
 //! Ergonomic [`Finding`] construction for detector authors.
 
 use crate::finding::{Category, Dimension, Finding, Severity, TraceStep};
-use sluice_ir::{Scir, Span};
+use sluice_ir::{ContractId, FunctionId, Scir, Span};
 
 /// A fluent builder. The engine assigns the final `id` and `severity_score`
 /// after corroboration scoring, so detectors only express intent.
@@ -26,6 +26,8 @@ impl FindingBuilder {
                 file: String::new(),
                 line: 0,
                 span: Span::dummy(),
+                contract_id: None,
+                function_id: None,
                 snippet: String::new(),
                 message: String::new(),
                 recommendation: String::new(),
@@ -92,11 +94,28 @@ impl FindingBuilder {
         self
     }
 
+    /// Record the IR ids of the anchoring contract/function so `sluice-verify`
+    /// can recover the full `Contract`/`Function` for PoC generation without a
+    /// name-string re-lookup. Called by `cx.finish`, which already has the
+    /// `FunctionId`.
+    pub fn with_ids(mut self, contract_id: ContractId, function_id: FunctionId) -> Self {
+        self.f.contract_id = Some(contract_id);
+        self.f.function_id = Some(function_id);
+        self
+    }
+
     /// Resolve `file`/`line`/`snippet` from the IR span and set contract/function.
     pub fn at(mut self, scir: &Scir, contract: impl Into<String>, function: impl Into<String>, span: Span) -> Self {
         let (file, line) = scir.location(span);
         self.f.contract = contract.into();
         self.f.function = function.into();
+        // Best-effort: recover the contract id from the name so `sluice-verify`
+        // can resolve the source file even when the finding wasn't finalized via
+        // `cx.finish` (which sets both ids precisely). Never overwrites an id an
+        // explicit `with_ids` already set.
+        if self.f.contract_id.is_none() {
+            self.f.contract_id = scir.contract_by_name.get(&self.f.contract).copied();
+        }
         self.f.file = file;
         self.f.line = line;
         self.f.span = span;
