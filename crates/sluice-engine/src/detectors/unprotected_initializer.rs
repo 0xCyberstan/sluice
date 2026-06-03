@@ -22,13 +22,23 @@
 //!   * `cx.is_initializer(f) == false`  — no `initializer`/`reinitializer` guard;
 //!   * `cx.has_access_control(f) == false` — no `onlyOwner`-style modifier and no
 //!     leading `require(msg.sender == ...)`;
+//!   * it carries no *manual one-shot re-init guard* — a leading
+//!     `require(...)`/`if (...) revert` whose condition reads a state variable
+//!     that this same function also writes (the classic "check a flag, revert if
+//!     already set, then set it" idiom: `if (version != 0) revert; ...; version = 1;`,
+//!     `require(!initialized); initialized = true;`, `require(governor == address(0));
+//!     governor = ...;`). OpenZeppelin's `initializer` modifier just packages this
+//!     same flag check, so a hand-rolled version is equally re-init-safe and must
+//!     not be flagged. A genuinely unprotected initializer (Parity's
+//!     `initWallet`: `owner = _owner;` with *no* leading guard at all) has no such
+//!     guard and still fires.
 //!   * it is not a constructor, and not declared in a library/interface.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::detectors::is_privileged_name;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::Function;
+use sluice_ir::{Function, GuardKind};
 
 pub struct UnprotectedInitializerDetector;
 
@@ -87,6 +97,19 @@ impl Detector for UnprotectedInitializerDetector {
             // (2) Guarded by access control (an `onlyOwner`-style modifier or a
             //     leading `require(msg.sender == ...)`): not anyone-callable.
             if cx.has_access_control(f) {
+                continue;
+            }
+            // (3) Guarded by a manual one-shot re-init check: a leading
+            //     `require(...)`/`if (...) revert` whose condition reads a state
+            //     variable that this function also writes back. This is the
+            //     hand-rolled equivalent of the `initializer` modifier
+            //     (`if (version != 0) revert; ...; version = 1;`,
+            //     `require(!initialized); initialized = true;`,
+            //     `require(governor == address(0)); governor = ...;`): after the
+            //     first call the flag is set and every later call reverts, so
+            //     ownership cannot be re-seized. Parity's `initWallet` — `owner =
+            //     _owner;` with no leading guard — has no such guard and still fires.
+            if has_one_shot_init_guard(f) {
                 continue;
             }
 
@@ -150,6 +173,56 @@ fn is_role_name(name: &str) -> bool {
     l == "role" || l == "roles" || l.ends_with("role") || l.ends_with("roles")
 }
 
+/// True if the function carries a hand-rolled **one-shot re-initialization
+/// guard**: a leading `require(...)` / `if (...) revert` whose condition reads a
+/// state variable that this same function also writes.
+///
+/// This is the manual equivalent of OpenZeppelin's `initializer` modifier — the
+/// function checks an "is-initialized" flag, reverts if it is already set, and
+/// then sets it, so the body runs at most once:
+///   * `if (version != 0) revert AlreadyInitialized(); ...; version = 1;`
+///   * `require(!initialized, "init"); initialized = true; ...`
+///   * `require(governor == address(0)); governor = governor_;`
+///
+/// The link between the guard and the flag write is what makes this precise. We
+/// only consider entry-level `GuardKind::Require` guards (the `MsgSenderCheck`
+/// and `Initializer` kinds are already handled by `has_access_control` /
+/// `is_initializer`), and we require the guard's condition to mention one of the
+/// *state variables the function writes* — i.e. the flag it re-sets. A genuinely
+/// unprotected initializer such as Parity's `initWallet` (`owner = _owner;` with
+/// no leading guard at all) has no `Require` guard, so nothing here matches and
+/// it still fires.
+fn has_one_shot_init_guard(f: &Function) -> bool {
+    // The state variables this function writes — the candidate "init flags".
+    let written = f.effects.written_vars();
+    if written.is_empty() {
+        return false;
+    }
+    f.effects.guards.iter().any(|g| {
+        // Only plain require/if-revert conditions are one-shot-flag candidates;
+        // sender checks and the `initializer` modifier are covered elsewhere.
+        if !matches!(g.kind, GuardKind::Require) {
+            return false;
+        }
+        // The guard's condition (rendered by `ir_text`, lowercased here) must
+        // reference one of the written state variables — the flag it guards.
+        // Tokenize on non-identifier characters so `version` matches the guard
+        // `version … 0` without spuriously matching a substring like
+        // `subversion`.
+        guard_references_any(&g.text, &written)
+    })
+}
+
+/// True if any of `vars` appears as a whole identifier token inside the guard's
+/// (already-lowercased) condition text. Identifier tokens are maximal runs of
+/// `[A-Za-z0-9_]`; comparison is case-insensitive on both sides.
+fn guard_references_any(guard_text: &str, vars: &[&str]) -> bool {
+    let text = guard_text.to_ascii_lowercase();
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .any(|tok| vars.iter().any(|v| v.eq_ignore_ascii_case(tok)))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -197,5 +270,101 @@ contract Vault {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "unprotected-initializer"));
+    }
+
+    // ---- manual one-shot re-init guards (must stay SILENT) ----
+
+    // Compound Comet's real `Configurator.initialize` shape: a hand-rolled
+    // version-flag one-shot guard (`if (version != 0) revert; ...; version = 1;`).
+    // It writes the privileged `governor` but cannot be called twice, so it is
+    // not a re-init takeover and must not fire.
+    const CONFIGURATOR: &str = r#"
+pragma solidity 0.8.15;
+contract ConfiguratorStorage {
+    uint public version;
+    address public governor;
+}
+contract Configurator is ConfiguratorStorage {
+    error AlreadyInitialized();
+    error InvalidAddress();
+    constructor() { version = type(uint256).max; }
+    function initialize(address governor_) public {
+        if (version != 0) revert AlreadyInitialized();
+        if (governor_ == address(0)) revert InvalidAddress();
+        governor = governor_;
+        version = 1;
+    }
+}
+"#;
+
+    // The `require(governor == address(0))` flavour the spec calls out: the
+    // privileged var doubles as the init flag. One-shot ⇒ silent.
+    const REQUIRE_ZERO: &str = r#"
+pragma solidity ^0.8.20;
+contract C {
+    address public governor;
+    function initialize(address governor_) external {
+        require(governor == address(0), "already");
+        governor = governor_;
+    }
+}
+"#;
+
+    // Hand-rolled boolean `initialized` flag (no modifier). One-shot ⇒ silent.
+    const BOOL_FLAG: &str = r#"
+pragma solidity ^0.8.20;
+contract C {
+    address public owner;
+    bool public initialized;
+    function initialize(address o) external {
+        require(!initialized, "init");
+        initialized = true;
+        owner = o;
+    }
+}
+"#;
+
+    // Parity's `initWallet` shape: writes privileged `owner` with NO leading
+    // guard of any kind — genuinely re-callable by anyone. MUST still fire.
+    const PARITY: &str = r#"
+pragma solidity ^0.8.20;
+contract ParityWallet {
+    address public owner;
+    function initWallet(address _owner) external {
+        owner = _owner;
+    }
+}
+"#;
+
+    #[test]
+    fn silent_on_configurator_version_guard() {
+        let fs = run(CONFIGURATOR);
+        assert!(
+            !fs.iter().any(|f| f.detector == "unprotected-initializer"),
+            "Configurator version-flag one-shot init must be suppressed: {:?}",
+            fs.iter().filter(|f| f.detector == "unprotected-initializer").collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn silent_on_require_governor_zero() {
+        let fs = run(REQUIRE_ZERO);
+        assert!(!fs.iter().any(|f| f.detector == "unprotected-initializer"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_manual_bool_flag() {
+        let fs = run(BOOL_FLAG);
+        assert!(!fs.iter().any(|f| f.detector == "unprotected-initializer"), "{:?}", fs);
+    }
+
+    #[test]
+    fn fires_on_unguarded_parity_shape() {
+        let fs = run(PARITY);
+        assert!(
+            fs.iter().any(|f| f.detector == "unprotected-initializer"),
+            "genuinely unguarded initializer (no leading flag check) must still fire: {:?}",
+            fs
+        );
     }
 }

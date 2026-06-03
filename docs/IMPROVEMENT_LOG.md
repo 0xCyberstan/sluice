@@ -647,3 +647,28 @@ them, each with a regression test from the REAL FP site + a hard recall guard (r
   selector + twap → 0, reentrancy/oracle down to genuine hits only. ~764 engine tests (+22 regression, all from real
   shapes) + corpus 20/20 + 8/8 + 5 real-hack harnesses, 0 warnings. STILL OPEN (next wave): upgradeable-proxy
   over-severity on a standard OZ proxy; the `transient`-keyword parser gap (EntryPoint.sol skipped). _done._
+
+### Real-code precision wave 2 — 5-agent FP fixes (Compound Comet + Aave triage) + a parser recall win
+Triaged Compound Comet + Morpho-blue (both untuned) + the Aave carry-overs. Morpho-blue: **0 Crit/High** (clean
+precision signal). Comet's 26 Highs were the work. 5 agents (note: worktree isolation didn't apply this round — agents
+co-edited the main checkout on disjoint files; cargo's build-lock serialized compiles; a single authoritative gate
+verified the combined state):
+- **oracle-manipulation** — stop flagging Chainlink/oracle-feed reads (`getPrice`→`latestRoundData`, IPriceFeed/
+  AggregatorV3 handles) as flash-manipulable spot prices (that's oracle-staleness's domain). **Comet 15→6** (the 6
+  remaining = the genuine donatable `balanceOf(this)`/getReserves shape). Cream/Harvest/bZx/gamma/jimbo/midas retained.
+- **access-control** — don't flag empty/no-op `fallback`/`receive` (Timelock FP); suppress guarded one-shot
+  initializers (`if(version!=0) revert`) + permissionless no-privileged-write `deploy`. **Comet 10→2.** Parity retained.
+- **upgradeable** — downgrade a guarded one-shot OZ-proxy `initialize`/constructor delegatecall (EIP-1967
+  `_implementation()==address(0)` / `initializer` modifier / bool flag) Critical→Low. **Aave Critical 1→0.** Parity +
+  delegatecall/uninitialized_proxy TPs retained.
+- **unprotected-initializer** — suppress the guarded one-shot init idiom (leading Require referencing a written
+  init-flag). **Comet 2→0.** Parity retained.
+- **parser (sluice-parse)** — offset-preserving `transient`-keyword (Solidity 0.8.28+) recovery → **EntryPoint.sol
+  0→1 contract/35 fns; AA core/ 0→10 contracts/110 fns.** A RECALL win (was silently skipping the file).
+- **Re-benchmark (after):** Aave **0 Crit** / 1 High (defensible reentrancy); Comet **26→9** High (17 FPs eliminated;
+  9 defensible = 6 donatable-balance oracle + 3 `absorb` bad-debt-socialization); Morpho 0/0; EntryPoint now scannable.
+  132 detectors, ~790 engine tests (+~30 real-shape regressions) + corpus 20/20 + 8/8 + 5 real-hack harnesses, 0 warnings.
+- **Wave-3 backlog (surfaced by the agents):** (a) `effects.rs::mk_guard` doesn't recognize OZ `_msgSender()` as a
+  msg.sender guard → residual access-control/centralization FPs (CometProxyAdmin) — a root fix helps several detectors;
+  (b) engine output nondeterminism in the parallel flat_map + dedup/cap tie-breaking (full-scan counts wobble run-to-run)
+  → needs a deterministic sort before the cap. _done._

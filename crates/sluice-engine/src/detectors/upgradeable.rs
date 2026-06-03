@@ -126,6 +126,46 @@ impl Detector for UpgradeableDetector {
                     return;
                 }
 
+                // (1b2) STANDARD GUARDED PROXY INIT: the delegatecall-to-a-param
+                // (or mutable slot) lives in a proxy `initialize`/constructor that
+                // is GUARDED against re-initialization — a one-time
+                // `require(_implementation() == address(0))` / `require(!initialized)`
+                // / an `initializer`/`reinitializer` modifier, or it is a plain
+                // constructor (which the language already runs exactly once). This
+                // is the canonical OpenZeppelin upgradeable-proxy pattern: the
+                // proxy delegatecalls the *initial implementation* once at deploy.
+                // delegatecall-to-a-param is what EVERY proxy does; an init-guarded
+                // one is NOT a takeover primitive (the Parity bug was an UNGUARDED,
+                // re-callable initializer — see (1c)). Downgrade to Low/Info.
+                if is_guarded_oneshot_init(cx, f) {
+                    let where_ = if f.is_constructor() {
+                        "a constructor (runs once at deploy)"
+                    } else {
+                        "a re-init-guarded `initialize` (one-time)"
+                    };
+                    let b = FindingBuilder::new(self.id(), Category::DelegatecallStorage)
+                        .title("delegatecall to the initial implementation in a guarded proxy initializer")
+                        .severity(Severity::Low)
+                        .confidence(0.4)
+                        .dimension(Dimension::Frontier)
+                        .message(format!(
+                            "`{}` delegatecalls into `{}` from {}. This is the standard OpenZeppelin \
+                             upgradeable-proxy pattern: the proxy delegatecalls its *initial implementation* \
+                             exactly once, guarded against re-initialization. delegatecall-to-a-parameter is \
+                             what every proxy does; because the call is one-shot and init-guarded it is NOT a \
+                             re-callable takeover primitive (contrast the UNGUARDED, re-callable Parity-class \
+                             initializer, which is rated Critical/High).",
+                            f.name, target_root, where_
+                        ))
+                        .recommendation(
+                            "No action required for a standard, init-guarded proxy. Ensure the re-init guard \
+                             (`require(_implementation() == address(0))` / `initializer` modifier) cannot be \
+                             bypassed so the implementation slot can only be set once.",
+                        );
+                    out.push(cx.finish(b, f.id, span));
+                    return;
+                }
+
                 // (1c) Genuine controllable delegatecall target (mutable storage
                 // slot or caller-supplied address) — the arbitrary-write / Parity
                 // takeover primitive.
@@ -264,6 +304,71 @@ fn is_this_expr(e: &Expr) -> bool {
 /// constant/immutable target check, so it never needs to be matched here.
 fn is_self_target(recv: &Expr) -> bool {
     is_this_expr(recv)
+}
+
+// ------------------------------------------------ guarded one-shot proxy init
+
+/// True if `f` is a *guarded one-shot* proxy initializer or constructor — the
+/// context in which a delegatecall-to-a-parameter (or mutable slot) is the
+/// canonical OpenZeppelin upgradeable-proxy pattern rather than a Parity-class
+/// takeover primitive.
+///
+/// A delegatecall target that is a constructor argument / `initialize` parameter
+/// is what *every* proxy does (`new UpgradeabilityProxy(logic, data)` →
+/// `logic.delegatecall(data)`); the security question is solely whether that
+/// implementation slot can be set **more than once**. It is one-shot when:
+///
+///   * the call is in a plain **constructor** — the language guarantees it runs
+///     exactly once, so the implementation can never be re-pointed via this path; or
+///   * the call is in an `initialize`-style function that is **re-init-guarded**,
+///     either by an `initializer`/`reinitializer` modifier
+///     ([`AnalysisContext::is_initializer`]) or by a one-time sentinel
+///     `require`/`if` of the OZ form — `_implementation() == address(0)` (the
+///     EIP-1967 proxy idiom) or a boolean `!initialized` / `_initialized` flag.
+///
+/// An `initialize` with **no** such guard is the genuine Parity-class
+/// re-initializable-proxy bug and is deliberately NOT matched here, so it stays
+/// Critical/High in branch (1c). Likewise a generic `exec(target,data)` /
+/// mutable-slot `execute` (no init name, no guard) never matches.
+fn is_guarded_oneshot_init(cx: &AnalysisContext, f: &Function) -> bool {
+    // A constructor delegatecalling its `_logic` argument is the immutable-proxy
+    // variant (`UpgradeabilityProxy`): it can only run at deploy time.
+    if f.is_constructor() {
+        return true;
+    }
+
+    // Otherwise it must look like an initializer entry-point …
+    let name = f.name.to_ascii_lowercase();
+    let init_like = name == "initialize"
+        || name.starts_with("initialize")
+        || name.starts_with("__init")
+        || name.starts_with("init_")
+        || name == "init";
+    if !init_like {
+        return false;
+    }
+
+    // … AND be guarded against re-initialization.
+    // (a) an `initializer` / `reinitializer` modifier.
+    if cx.is_initializer(f) || f.has_modifier_like("initializer") {
+        return true;
+    }
+    // (b) a one-time sentinel guard in the body. We match the canonical OZ
+    //     proxy idioms on the comment-stripped, lowercased, whitespace-normalized
+    //     source so an explicit `require(_implementation() == address(0))` or a
+    //     `require(!initialized)` boolean flag both count, while a "must already
+    //     be initialized" check (`!= address(0)`) does NOT (that is not a
+    //     one-shot guard).
+    let src: String = cx.source_text(f.span).split_whitespace().collect::<Vec<_>>().join(" ");
+    let implementation_is_zero = src.contains("_implementation()")
+        && (src.contains("== address(0)") || src.contains("==address(0)"));
+    let initialized_flag = src.contains("!initialized")
+        || src.contains("!_initialized")
+        || src.contains("require(!initializing")
+        || src.contains("require(!_initializing")
+        || src.contains("initialized == false")
+        || src.contains("initialized==false");
+    implementation_is_zero || initialized_flag
 }
 
 /// True if the function body is the eth_call-only "simulate then revert" shape:
@@ -693,6 +798,163 @@ mod tests {
             us.iter().any(|f| f.title == "delegatecall to a non-constant target"
                 && f.severity == Severity::Critical),
             "an assembly `return` (committing) caller-target delegatecall must stay Critical: {us:#?}"
+        );
+    }
+
+    // --- (F) STANDARD GUARDED PROXY INIT: the canonical OpenZeppelin
+    //     upgradeable-proxy pattern — `initialize(address _logic, bytes _data)`
+    //     guarded by `require(_implementation() == address(0))`, delegatecalling
+    //     the initial implementation once at deploy. delegatecall-to-a-param is
+    //     what every proxy does; an init-guarded one is NOT a takeover primitive,
+    //     so it must be DOWNGRADED to Low/Info (not Critical). This is the exact
+    //     Aave-v3 `InitializableUpgradeabilityProxy` false positive being fixed. ---
+    const OZ_INIT_PROXY: &str = r#"
+        contract InitializableUpgradeabilityProxy {
+            function _implementation() internal view returns (address impl) {}
+            function _setImplementation(address) internal {}
+            function initialize(address _logic, bytes memory _data) public payable {
+                require(_implementation() == address(0));
+                _setImplementation(_logic);
+                if (_data.length > 0) {
+                    (bool success, ) = _logic.delegatecall(_data);
+                    require(success);
+                }
+            }
+        }
+    "#;
+
+    // The immutable-proxy variant: same delegatecall, but in a CONSTRUCTOR (runs
+    // exactly once at deploy by language semantics — Aave `UpgradeabilityProxy`).
+    const OZ_CTOR_PROXY: &str = r#"
+        contract UpgradeabilityProxy {
+            function _setImplementation(address) internal {}
+            constructor(address _logic, bytes memory _data) payable {
+                _setImplementation(_logic);
+                if (_data.length > 0) {
+                    (bool success, ) = _logic.delegatecall(_data);
+                    require(success);
+                }
+            }
+        }
+    "#;
+
+    // Guarded by an `initializer` modifier instead of the `_implementation()==0`
+    // sentinel (OZ `ERC1967Upgrade._upgradeToAndCallUUPS` style init).
+    const MODIFIER_GUARDED_INIT: &str = r#"
+        contract P {
+            bool private _initialized;
+            modifier initializer() { require(!_initialized); _initialized = true; _; }
+            function initialize(address _logic, bytes calldata _data) external initializer {
+                (bool ok, ) = _logic.delegatecall(_data);
+                require(ok);
+            }
+        }
+    "#;
+
+    // Guarded by an explicit boolean one-shot flag in the body.
+    const FLAG_GUARDED_INIT: &str = r#"
+        contract P {
+            bool public initialized;
+            function initialize(address _logic, bytes calldata _data) external {
+                require(!initialized, "init");
+                initialized = true;
+                (bool ok, ) = _logic.delegatecall(_data);
+                require(ok);
+            }
+        }
+    "#;
+
+    fn assert_guarded_proxy_init_downgraded(src: &str, label: &str) {
+        let fs = run(src);
+        let us = upg(&fs);
+        // It still surfaces (so a reviewer sees the proxy delegatecall)…
+        assert!(!us.is_empty(), "{label}: guarded proxy init should still surface a (low) note");
+        // …but never as Critical/High, and never with the Parity foreign-target
+        // takeover wording.
+        assert!(
+            us.iter().all(|f| f.severity <= Severity::Low),
+            "{label}: a guarded one-shot proxy initializer must be downgraded to Low/Info: {us:#?}"
+        );
+        assert!(
+            !us.iter().any(|f| f.message.contains("takeover primitive (Parity class)")),
+            "{label}: a guarded proxy init must not carry the Parity-takeover wording: {us:#?}"
+        );
+        assert!(
+            us.iter().any(|f| f.title.contains("guarded proxy initializer")),
+            "{label}: expected the guarded-proxy-initializer finding: {us:#?}"
+        );
+    }
+
+    #[test]
+    fn oz_initializable_proxy_is_downgraded() {
+        assert_guarded_proxy_init_downgraded(OZ_INIT_PROXY, "InitializableUpgradeabilityProxy");
+    }
+    #[test]
+    fn oz_constructor_proxy_is_downgraded() {
+        assert_guarded_proxy_init_downgraded(OZ_CTOR_PROXY, "UpgradeabilityProxy(ctor)");
+    }
+    #[test]
+    fn modifier_guarded_init_is_downgraded() {
+        assert_guarded_proxy_init_downgraded(MODIFIER_GUARDED_INIT, "initializer-modifier");
+    }
+    #[test]
+    fn flag_guarded_init_is_downgraded() {
+        assert_guarded_proxy_init_downgraded(FLAG_GUARDED_INIT, "boolean-flag-guard");
+    }
+
+    // --- (G) HARD RECALL GUARD: an UNGUARDED, re-callable `initialize` that
+    //     delegatecalls a parameter is the GENUINE Parity-class
+    //     re-initializable-proxy takeover (anyone can re-point the implementation
+    //     and run arbitrary code in this contract's storage). It must STAY
+    //     Critical — the downgrade above must not leak onto it. ---
+    const UNGUARDED_REINIT_PROXY: &str = r#"
+        contract P {
+            function initialize(address _logic, bytes calldata _data) external {
+                (bool ok, ) = _logic.delegatecall(_data);
+                require(ok);
+            }
+        }
+    "#;
+
+    #[test]
+    fn unguarded_reinit_proxy_stays_critical() {
+        let fs = run(UNGUARDED_REINIT_PROXY);
+        let us = upg(&fs);
+        assert!(
+            us.iter().any(|f| f.title == "delegatecall to a non-constant target"
+                && f.severity == Severity::Critical),
+            "an UNGUARDED re-callable initialize() that delegatecalls a param is the Parity-class \
+             takeover and must stay Critical: {us:#?}"
+        );
+        // It must NOT be softened to the guarded-proxy note.
+        assert!(
+            !us.iter().any(|f| f.title.contains("guarded proxy initializer")),
+            "an unguarded re-init proxy must not be treated as a guarded one-shot init: {us:#?}"
+        );
+    }
+
+    // A guard that requires the implementation to be ALREADY set (`!= address(0)`)
+    // is NOT a one-shot init guard — it must not trigger the downgrade.
+    const NOT_A_ONESHOT_GUARD: &str = r#"
+        contract P {
+            function _implementation() internal view returns (address) {}
+            function initialize(address _logic, bytes calldata _data) external {
+                require(_implementation() != address(0));
+                (bool ok, ) = _logic.delegatecall(_data);
+                require(ok);
+            }
+        }
+    "#;
+
+    #[test]
+    fn not_a_oneshot_guard_stays_critical() {
+        let fs = run(NOT_A_ONESHOT_GUARD);
+        let us = upg(&fs);
+        assert!(
+            us.iter().any(|f| f.title == "delegatecall to a non-constant target"
+                && f.severity == Severity::Critical),
+            "a `!= address(0)` (must-already-be-initialized) guard is not a one-shot guard; \
+             the delegatecall must stay Critical: {us:#?}"
         );
     }
 }

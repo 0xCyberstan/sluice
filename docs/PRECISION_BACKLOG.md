@@ -11,6 +11,17 @@ recovery; `is_file()` IO guard. (From the first dogfood.)
 > (real-hacks + corpus green). **STILL OPEN:** the `transient`-keyword parser gap (below); the upgradeable-proxy
 > over-severity (Aave's remaining Critical — `InitializableUpgradeabilityProxy.initialize` rated Critical on a
 > standard OZ proxy). Both queued for wave 2. Detail retained below for reference.
+>
+> **WAVE 2 DONE (2026-06-03)** — Compound Comet + Aave triage: oracle-manipulation Chainlink-feed FP (Comet 15→6),
+> access-control empty-fallback + guarded-init + permissionless-deploy FPs (Comet 10→2), upgradeable guarded-OZ-proxy
+> over-severity (Aave Crit 1→0), unprotected-initializer guarded one-shot (Comet 2→0), `transient`-keyword parser
+> recovery (EntryPoint 0→35 fns). Re-bench: Aave 0 Crit/1 High, Comet 26→9 High (rest defensible), Morpho 0/0.
+> **WAVE 3 OPEN:** (a) `effects.rs::mk_guard` doesn't recognize OZ `_msgSender()` as a msg.sender guard → residual
+> access-control/centralization FPs (e.g. CometProxyAdmin.setMarketAdminPermissionChecker) — root fix helps several
+> detectors; (b) engine output NONDETERMINISM (parallel flat_map + dedup/cap insertion-order tie-break → full-scan
+> counts wobble run-to-run) — needs a deterministic sort before the cap; (c) re-triage the Comet 6 donatable-balance
+> oracle + 3 `absorb` bad-debt Highs (defensible — decide TP vs over-flag); (d) AA `BasePaymaster.getDeposit`
+> oracle-manipulation (balance-getter, newly exposed by the parser fix — likely a balance-read-not-price refinement).
 
 ## R28 dogfood — original findings (broad scan of 7 corpora with the 132-detector binary, 2026-06-03)
 

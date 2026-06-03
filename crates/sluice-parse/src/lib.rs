@@ -292,6 +292,100 @@ fn blank_layout_directive(src: &str) -> Option<String> {
     out.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
+/// First significant byte at or after `k` — skipping ASCII whitespace and any
+/// `//`/`/* */` comment (string/char literals can't begin a state-var's
+/// data-location/visibility/name run, so they're treated like any other byte and
+/// stop the scan). Returns the offset of that byte, or `None` at EOF.
+fn next_significant(bytes: &[u8], k: usize) -> Option<usize> {
+    let mut j = k;
+    while j < bytes.len() {
+        if bytes[j].is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        // Only *comments* are skipped here, not strings: a `"…"` after `transient`
+        // would itself be a syntax error, so we let it stop the scan (no match).
+        if bytes[j] == b'/' && matches!(bytes.get(j + 1), Some(&b'/') | Some(&b'*')) {
+            match skip_comment_or_string(bytes, j) {
+                Some(next) => {
+                    j = next;
+                    continue;
+                }
+                None => return Some(j),
+            }
+        }
+        return Some(j);
+    }
+    None
+}
+
+/// Solidity 0.8.28 introduced the `transient` data-location keyword for state
+/// variables: `<type> transient [visibility] <name>;` (e.g. ERC-4337's
+/// EntryPoint: `bytes32 transient private currentUserOpHash;`). `solang-parser`
+/// 0.3.5 predates it and parses `transient` as the *variable name*, then chokes on
+/// the following `private`/identifier and rejects the **entire file** — silently
+/// dropping every contract in it from analysis.
+///
+/// We recover it the same offset-preserving way as [`blank_layout_directive`]:
+/// blank just the `transient` keyword to equal-length spaces so solang parses the
+/// declaration as an ordinary state var (`bytes32 private currentUserOpHash;`).
+/// Every byte offset is preserved, so all `Span`s still index the original source
+/// we keep for reporting, and a transient var is analyzed exactly like a normal
+/// state var (its slot semantics don't affect Sluice's logic/state-bug detectors).
+///
+/// Discrimination (so a variable/function genuinely *named* `transient` is left
+/// untouched): the keyword form is always followed by another word — the
+/// visibility (`private`/`public`/`internal`) or the variable name itself — i.e.
+/// the next significant token begins with an identifier byte. A `transient` that
+/// is itself a name is instead immediately followed by `;`, `=`, `,`, `)` or `(`
+/// (`uint256 transient;`, `transient = 1`, `function transient()`), which solang
+/// already parses, so we only blank when the next significant token starts an
+/// identifier. The scan also skips comments/strings (via
+/// [`skip_comment_or_string`]) so a `transient` mentioned in a doc-comment is
+/// never blanked.
+///
+/// Returns `None` when no such keyword is present (the common case → no
+/// allocation).
+fn blank_transient_keyword(src: &str) -> Option<String> {
+    const KW: &[u8] = b"transient";
+    if !src.contains("transient") {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        // Never match the keyword inside a comment or string literal.
+        if let Some(next) = skip_comment_or_string(bytes, i) {
+            i = next;
+            continue;
+        }
+        if i + KW.len() <= bytes.len()
+            && &bytes[i..i + KW.len()] == KW
+            && word_boundary_before(bytes, i)
+            && (i + KW.len() == bytes.len() || !is_ident_byte(bytes[i + KW.len()]))
+        {
+            // Keyword usage iff the next significant token starts an identifier
+            // (the visibility keyword or the variable name). Otherwise `transient`
+            // is itself a name (`transient;`, `transient =`, `transient(`) — leave it.
+            let after = i + KW.len();
+            if let Some(n) = next_significant(bytes, after) {
+                if is_ident_byte(bytes[n]) {
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    for b in buf.iter_mut().take(after).skip(i) {
+                        *b = b' '; // KW is pure ASCII; equal-length blanking.
+                    }
+                    i = after;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // Only ASCII bytes were overwritten with ASCII spaces → still valid UTF-8.
+    out.map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 /// Parse in-memory `(path, content)` sources into an [`Scir`].
 pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     let mut scir = Scir::new();
@@ -330,12 +424,19 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
                     "skipped: bracket-nesting depth {depth} exceeds limit {MAX_NESTING_DEPTH} (possible DoS input)"
                 ))
             } else {
-                // Recover Solidity 0.8.29 `contract X layout at <slot> is ...` headers
-                // that solang-parser 0.3.5 rejects, by blanking the directive
-                // (offset-preserving, so spans still index the original `content` we
-                // store below for reporting).
-                let blanked = blank_layout_directive(&content);
-                let parse_input: &str = blanked.as_deref().unwrap_or(&content);
+                // Recover Solidity-syntax that solang-parser 0.3.5 predates and would
+                // otherwise reject *for the whole file* (dropping every contract in it):
+                //   - 0.8.29 `contract X layout at <slot> is ...` storage-layout headers
+                //   - 0.8.28 `<type> transient <vis> <name>;` transient storage vars
+                // Each recovery blanks only the offending keyword/directive to spaces,
+                // so byte offsets are preserved and every `Span` still indexes the
+                // original `content` we store below for reporting. They compose: a file
+                // may use both, so we feed the output of one into the next (each is a
+                // no-op allocation-free `None` when its keyword is absent).
+                let blanked_layout = blank_layout_directive(&content);
+                let after_layout: &str = blanked_layout.as_deref().unwrap_or(&content);
+                let blanked_transient = blank_transient_keyword(after_layout);
+                let parse_input: &str = blanked_transient.as_deref().unwrap_or(after_layout);
                 match solang_parser::parse(parse_input, file_no as usize) {
                     Ok((unit, _comments)) => Parsed::Ok(unit),
                     Err(diags) => Parsed::Err(
@@ -1117,5 +1218,185 @@ mod tests {
         assert!(out.scir.contract_named("Real").is_some(), "real file still parsed");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recovers_solidity_0_8_28_transient_storage_var() {
+        // The `transient` data-location keyword (Solidity 0.8.28) must not drop the
+        // file. Shape mirrors ERC-4337's EntryPoint: `bytes32 transient private x;`.
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.28;
+            contract EntryLike {
+                bytes32 transient private currentUserOpHash;
+                uint256 public regular;
+                function setHash(bytes32 h) external {
+                    currentUserOpHash = h;
+                }
+            }
+            "#,
+        );
+        let c = scir
+            .contract_named("EntryLike")
+            .expect("EntryLike recovered despite `transient`");
+        // The transient var is treated as a normal state var.
+        assert!(
+            c.state_vars.iter().any(|v| v.name == "currentUserOpHash"),
+            "transient var present as a normal state var; state_vars={:?}",
+            c.state_vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
+        let set = scir.functions_of(c.id).find(|f| f.name == "setHash").expect("setHash");
+        assert!(set.effects.writes_var("currentUserOpHash"));
+        // Offset preservation: the function span still reads the real source.
+        assert!(scir.span_text(set.span).contains("currentUserOpHash = h"));
+    }
+
+    #[test]
+    fn recovers_transient_without_visibility_and_other_forms() {
+        // `<type> transient <name>;` (no visibility) and `mapping(...) transient
+        // public m;` are both keyword usages solang rejects; both must recover.
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.28;
+            contract T {
+                uint256 transient lockCount;
+                mapping(address => uint256) transient public deltas;
+                function bump() external { lockCount = lockCount + 1; }
+            }
+            "#,
+        );
+        let c = scir.contract_named("T").expect("T recovered");
+        assert!(c.state_vars.iter().any(|v| v.name == "lockCount"));
+        assert!(c.state_vars.iter().any(|v| v.name == "deltas"));
+        let bump = scir.functions_of(c.id).find(|f| f.name == "bump").expect("bump");
+        assert!(bump.effects.writes_var("lockCount"));
+    }
+
+    #[test]
+    fn transient_as_variable_name_is_not_blanked() {
+        // A variable/function genuinely *named* `transient` already parses in solang
+        // (it is followed by `;`/`=`/`(`, not another word). The recovery must leave
+        // it intact so the name is preserved.
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.20;
+            contract Named {
+                uint256 transient;
+                uint256 transientInit = 7;
+                function transient_fn() external pure returns (uint256) { return 1; }
+            }
+            "#,
+        );
+        let c = scir.contract_named("Named").expect("Named parses");
+        // The state var literally named `transient` is preserved (NOT blanked away).
+        assert!(
+            c.state_vars.iter().any(|v| v.name == "transient"),
+            "var named `transient` preserved; state_vars={:?}",
+            c.state_vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
+        assert!(c.state_vars.iter().any(|v| v.name == "transientInit"));
+        assert!(scir.functions_of(c.id).any(|f| f.name == "transient_fn"));
+    }
+
+    #[test]
+    fn transient_in_comment_is_not_blanked() {
+        // `transient` mentioned only in comments (the common case across v4-core /
+        // v4-periphery libraries) must not be touched; the contract parses normally
+        // and the comment text is irrelevant to spans.
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.20;
+            /// @notice This is a temporary library using transient storage (tstore/tload).
+            /* TODO: delete when the transient keyword lands. transient private x; */
+            contract LibLike {
+                uint256 public count;
+                function f() external { count = count + 1; }
+            }
+            "#,
+        );
+        let c = scir.contract_named("LibLike").expect("LibLike parses");
+        assert!(c.state_vars.iter().any(|v| v.name == "count"));
+        let f = scir.functions_of(c.id).find(|f| f.name == "f").expect("f");
+        // Offset preservation: span still indexes the original source past the comments.
+        assert!(scir.span_text(f.span).contains("count = count + 1"));
+    }
+
+    #[test]
+    fn transient_recovery_preserves_byte_offsets_and_line_numbers() {
+        // The recovery must be exactly offset-preserving: blanking `transient` to
+        // equal-length spaces must not move any byte after it, so a finding's line
+        // number is identical to what it would be with the keyword absent.
+        //
+        // We parse two sources that are byte-for-byte identical *except* one uses
+        // the `transient` keyword and the other replaces it with the same number of
+        // spaces (i.e. the recovery's own output). The recovered function's span —
+        // and thus its line number — must match the control exactly.
+        let with_kw = concat!(
+            "pragma solidity ^0.8.28;\n",
+            "contract C {\n",
+            "    bytes32 transient private h;\n",
+            "    function f(bytes32 x) external { h = x; }\n",
+            "}\n",
+        );
+        // `transient ` (9 chars + 1 space) → 10 spaces, preserving every later offset.
+        let control = with_kw.replace("transient ", "          ");
+        assert_eq!(with_kw.len(), control.len(), "control must be the same length");
+
+        let scir_kw = parse_one(with_kw);
+        let scir_ctl = parse_one(&control);
+
+        let line_kw = {
+            let c = scir_kw.contract_named("C").expect("C (transient) parses");
+            let f = scir_kw.functions_of(c.id).find(|f| f.name == "f").unwrap();
+            scir_kw.line_of(f.span)
+        };
+        let line_ctl = {
+            let c = scir_ctl.contract_named("C").expect("C (control) parses");
+            let f = scir_ctl.functions_of(c.id).find(|f| f.name == "f").unwrap();
+            scir_ctl.line_of(f.span)
+        };
+        assert_eq!(line_kw, line_ctl, "transient recovery must not shift line numbers");
+        assert_eq!(line_kw, 4, "function f is on source line 4 in both");
+    }
+
+    #[test]
+    fn transient_recovery_is_noop_when_keyword_absent() {
+        // A source with no `transient` keyword must not be transformed at all
+        // (returns `None`, no allocation) — guaranteeing zero offset drift for the
+        // overwhelmingly common case (and for every existing corpus/real_hacks file).
+        let src = "pragma solidity ^0.8.20;\ncontract A { uint256 x; function f() external { x = 1; } }\n";
+        assert!(blank_transient_keyword(src).is_none(), "no keyword → no transform");
+        // And a `transient` that is purely a substring of an identifier is ignored.
+        let ident = "contract B { uint256 transientBalance; }";
+        assert!(
+            blank_transient_keyword(ident).is_none(),
+            "`transientBalance` is one identifier, not the keyword"
+        );
+    }
+
+    #[test]
+    fn recovers_combined_layout_at_and_transient() {
+        // A file using *both* the 0.8.29 `layout at` header and a 0.8.28 `transient`
+        // var must recover: the two offset-preserving blanks compose.
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.29;
+            interface IFoo { function x() external view returns (uint256); }
+            contract Combined layout at 151 is IFoo {
+                uint256 transient private slotGuard;
+                uint256 public x;
+                function set(uint256 v) external { x = v; slotGuard = v; }
+            }
+            "#,
+        );
+        let c = scir
+            .contract_named("Combined")
+            .expect("Combined recovered despite `layout at` + `transient`");
+        assert!(c.bases.iter().any(|b| b == "IFoo"), "inheritance preserved");
+        assert!(c.state_vars.iter().any(|v| v.name == "slotGuard"));
+        let set = scir.functions_of(c.id).find(|f| f.name == "set").expect("set");
+        assert!(set.effects.writes_var("x"));
+        assert!(set.effects.writes_var("slotGuard"));
+        assert!(scir.span_text(set.span).contains("x = v"));
     }
 }
