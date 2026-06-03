@@ -16,3 +16,4 @@ solang-parser = { workspace = true }
 rustc-hash = { workspace = true }
 smallvec = { workspace = true }
 anyhow = { workspace = true }
+rayon = { workspace = true }

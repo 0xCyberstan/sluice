@@ -460,13 +460,7 @@ mod tests {
         let dataflow = sluice_dataflow::DataflowFacts::analyze(&scir);
         let invariants = sluice_invariant::InvariantFacts::mine(&scir);
         let frontier = sluice_frontier::FrontierFacts::analyze(&scir);
-        let cx = AnalysisContext {
-            scir: &scir,
-            dataflow: &dataflow,
-            invariants: &invariants,
-            frontier: &frontier,
-            config: &cfg,
-        };
+        let cx = AnalysisContext::new(&scir, &dataflow, &invariants, &frontier, &cfg);
         let f = func(&scir, "migrate");
         let hook = Expr::dummy(ExprKind::Ident("hook".into()));
         let fixed = Expr::dummy(ExprKind::Ident("FIXED".into()));

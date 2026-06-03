@@ -199,11 +199,11 @@ impl Detector for NettedAggregateDesyncDetector {
 /// many `OperatorDelegatorStorageV{n}` levels up), so single-level base resolution
 /// is not enough.
 fn inheritance_chain<'a>(cx: &'a AnalysisContext, c: &'a Contract) -> Vec<&'a Contract> {
-    // Index contracts by name for exact-match base resolution (last decl wins; in
-    // practice names are unique per project).
-    let by_name: FxHashMap<&str, &Contract> =
-        cx.scir.iter_contracts().map(|k| (k.name.as_str(), k)).collect();
-
+    // Resolve base names via the module's prebuilt name→contract index
+    // (`contract_named`, last-declared-wins — identical to the local map this used
+    // to rebuild per call). Rebuilding a `by_name` map over *every* contract on
+    // each call made the enclosing per-contract loop O(contracts²); the shared
+    // O(1) lookup removes that without changing which contracts are resolved.
     let mut out: Vec<&Contract> = Vec::new();
     let mut seen: FxHashSet<sluice_ir::ContractId> = FxHashSet::default();
     let mut stack: Vec<&Contract> = vec![c];
@@ -213,7 +213,7 @@ fn inheritance_chain<'a>(cx: &'a AnalysisContext, c: &'a Contract) -> Vec<&'a Co
         }
         out.push(cur);
         for base_name in &cur.bases {
-            if let Some(base) = by_name.get(base_name.as_str()) {
+            if let Some(base) = cx.scir.contract_named(base_name) {
                 if !seen.contains(&base.id) {
                     stack.push(base);
                 }

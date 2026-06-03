@@ -18,6 +18,7 @@ mod lower;
 
 use effects::EffectCollector;
 use lower::{ident_path_text, sol_type_text, Lowerer};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sluice_ir::{
     Contract, ContractId, ContractKind, Function, FunctionId, FunctionKind, Guard, GuardKind,
@@ -40,17 +41,30 @@ pub struct FileError {
 }
 
 /// Parse a list of files from disk.
-pub fn parse_paths<P: AsRef<Path>>(paths: &[P]) -> ParseOutput {
-    let mut sources = Vec::new();
+pub fn parse_paths<P: AsRef<Path> + Sync>(paths: &[P]) -> ParseOutput {
+    // Read files in parallel (many small files → I/O + UTF-8 validation overlap),
+    // collecting `Result`s in input order so the downstream `file_no` assignment
+    // and reporting order stay identical to a serial read.
+    let read: Vec<Result<(String, String), FileError>> = paths
+        .par_iter()
+        .map(|p| {
+            let path = p.as_ref();
+            match std::fs::read_to_string(path) {
+                Ok(content) => Ok((path.display().to_string(), content)),
+                Err(e) => Err(FileError {
+                    path: path.display().to_string(),
+                    message: format!("read error: {e}"),
+                }),
+            }
+        })
+        .collect();
+
+    let mut sources = Vec::with_capacity(read.len());
     let mut file_errors = Vec::new();
-    for p in paths {
-        let path = p.as_ref();
-        match std::fs::read_to_string(path) {
-            Ok(content) => sources.push((path.display().to_string(), content)),
-            Err(e) => file_errors.push(FileError {
-                path: path.display().to_string(),
-                message: format!("read error: {e}"),
-            }),
+    for r in read {
+        match r {
+            Ok(s) => sources.push(s),
+            Err(e) => file_errors.push(e),
         }
     }
     let mut out = parse_sources(sources);
@@ -181,46 +195,72 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     let mut scir = Scir::new();
     let mut file_errors = Vec::new();
 
-    // ---- Phase 0: parse every file. ----
+    // ---- Phase 0: parse every file (in parallel). ----
+    //
+    // Each file's CPU work — the O(bytes) nesting pre-scan, the `layout at`
+    // recovery, the recursive-descent `solang_parser::parse`, and the
+    // `SourceFile` line-index build — is independent, so we fan it out with
+    // rayon. Results are collected **indexed by input position** and folded back
+    // in order, so `file_no` and the order of `scir.files` / `srcs` / `units` /
+    // `file_errors` are byte-for-byte identical to the previous serial pass
+    // (determinism preserved regardless of thread scheduling).
+    enum Parsed {
+        Ok(pt::SourceUnit),
+        Err(String),
+    }
+    struct FileWork {
+        path: String,
+        file: SourceFile,
+        content: String,
+        parsed: Parsed,
+    }
+
+    let work: Vec<FileWork> = sources
+        .into_par_iter()
+        .enumerate()
+        .map(|(idx, (path, content))| {
+            let file_no = idx as u32;
+            // Pre-scan: reject pathologically nested input in O(bytes) BEFORE handing
+            // it to the parser. The parser is super-linear in bracket-nesting depth,
+            // so a ~60 KB file of nested parens would otherwise burn seconds of CPU
+            // (a hostile-input DoS). Real Solidity is never this deep.
+            let parsed = if let Some(depth) = excessive_nesting(&content, MAX_NESTING_DEPTH) {
+                Parsed::Err(format!(
+                    "skipped: bracket-nesting depth {depth} exceeds limit {MAX_NESTING_DEPTH} (possible DoS input)"
+                ))
+            } else {
+                // Recover Solidity 0.8.29 `contract X layout at <slot> is ...` headers
+                // that solang-parser 0.3.5 rejects, by blanking the directive
+                // (offset-preserving, so spans still index the original `content` we
+                // store below for reporting).
+                let blanked = blank_layout_directive(&content);
+                let parse_input: &str = blanked.as_deref().unwrap_or(&content);
+                match solang_parser::parse(parse_input, file_no as usize) {
+                    Ok((unit, _comments)) => Parsed::Ok(unit),
+                    Err(diags) => Parsed::Err(
+                        diags
+                            .first()
+                            .map(|d| d.message.clone())
+                            .unwrap_or_else(|| "parse error".into()),
+                    ),
+                }
+            };
+            let file = SourceFile::new(path.clone(), content.clone());
+            FileWork { path, file, content, parsed }
+        })
+        .collect();
+
+    // Fold the per-file results back in input order: identical to the serial loop.
     let mut units: Vec<(u32, pt::SourceUnit)> = Vec::new();
-    let mut srcs: Vec<String> = Vec::new();
-    for (path, content) in sources {
-        let file_no = srcs.len() as u32;
-        // Pre-scan: reject pathologically nested input in O(bytes) BEFORE handing
-        // it to the parser. The parser is super-linear in bracket-nesting depth,
-        // so a ~60 KB file of nested parens would otherwise burn seconds of CPU
-        // (a hostile-input DoS). Real Solidity is never this deep.
-        if let Some(depth) = excessive_nesting(&content, MAX_NESTING_DEPTH) {
-            file_errors.push(FileError {
-                path: path.clone(),
-                message: format!("skipped: bracket-nesting depth {depth} exceeds limit {MAX_NESTING_DEPTH} (possible DoS input)"),
-            });
-            scir.files.push(SourceFile::new(path, content.clone()));
-            srcs.push(content);
-            continue;
+    let mut srcs: Vec<String> = Vec::with_capacity(work.len());
+    for (idx, fw) in work.into_iter().enumerate() {
+        let file_no = idx as u32;
+        match fw.parsed {
+            Parsed::Ok(unit) => units.push((file_no, unit)),
+            Parsed::Err(message) => file_errors.push(FileError { path: fw.path, message }),
         }
-        // Recover Solidity 0.8.29 `contract X layout at <slot> is ...` headers that
-        // solang-parser 0.3.5 rejects, by blanking the directive (offset-preserving,
-        // so spans still index the original `content` we store below for reporting).
-        let blanked = blank_layout_directive(&content);
-        let parse_input: &str = blanked.as_deref().unwrap_or(&content);
-        match solang_parser::parse(parse_input, file_no as usize) {
-            Ok((unit, _comments)) => {
-                units.push((file_no, unit));
-            }
-            Err(diags) => {
-                let msg = diags
-                    .first()
-                    .map(|d| d.message.clone())
-                    .unwrap_or_else(|| "parse error".into());
-                file_errors.push(FileError { path: path.clone(), message: msg });
-            }
-        }
-        if scir.pragma_solidity.is_none() {
-            // best-effort pragma capture handled below per-unit
-        }
-        scir.files.push(SourceFile::new(path, content.clone()));
-        srcs.push(content);
+        scir.files.push(fw.file);
+        srcs.push(fw.content);
     }
 
     // ---- Phase 1: register contracts and collect global name sets. ----
@@ -289,78 +329,121 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
         }
     }
 
-    // ---- Phase 2: build contracts + functions. ----
-    let mut next_fid: u32 = 0;
-    // Track per-contract (name -> own function ids) for callee resolution.
-    let mut contract_fn_names: FxHashMap<ContractId, FxHashMap<String, FunctionId>> = FxHashMap::default();
+    // ---- Phase 2: build contracts + functions (in parallel). ----
+    //
+    // Each contract's build — lowering its state vars, every function body, and the
+    // per-function `FunctionEffects` — is independent work, but `FunctionId`s must
+    // stay identical to the old serial counter (findings reference them, and output
+    // must be byte-for-byte stable). So we PRE-ASSIGN each contract a contiguous
+    // `FunctionId` range by prefix-summing function counts over `regs` (the same
+    // order the serial `next_fid` walked), then build the contracts in parallel,
+    // each numbering its own functions from its reserved base. The results are
+    // folded back in `regs` order, so every map/order is deterministic.
+    let fn_counts: Vec<u32> = regs
+        .iter()
+        .map(|reg| {
+            reg.def
+                .parts
+                .iter()
+                .filter(|cp| matches!(cp, pt::ContractPart::FunctionDefinition(_)))
+                .count() as u32
+        })
+        .collect();
+    let mut fid_base: Vec<u32> = Vec::with_capacity(regs.len());
+    let mut acc = 0u32;
+    for &n in &fn_counts {
+        fid_base.push(acc);
+        acc += n;
+    }
 
-    for reg in &regs {
-        let def = reg.def;
-        let src = &srcs[reg.file_no as usize];
-        let cname = def.name.as_ref().map(|i| i.name.clone()).unwrap_or_default();
+    struct BuiltContract {
+        contract: Contract,
+        funcs: Vec<(FunctionId, Function)>,
+        name_map: FxHashMap<String, FunctionId>,
+    }
 
-        // Full (inherited) state-var name set for this contract.
-        let mut state_set: FxHashSet<String> = FxHashSet::default();
-        collect_state_vars(&cname, &own_state_vars, &base_names, &mut state_set, &mut FxHashSet::default());
+    let built: Vec<BuiltContract> = regs
+        .par_iter()
+        .zip(fid_base.par_iter())
+        .map(|(reg, &base_fid)| {
+            let def = reg.def;
+            let src = &srcs[reg.file_no as usize];
+            let cname = def.name.as_ref().map(|i| i.name.clone()).unwrap_or_default();
 
-        let lowerer = Lowerer {
-            file_no: reg.file_no,
-            src,
-            known_types: &known_types,
-            known_libraries: &known_libs,
-            known_lib_funcs: &known_lib_funcs,
-            depth: std::cell::Cell::new(0),
-        };
+            // Full (inherited) state-var name set for this contract.
+            let mut state_set: FxHashSet<String> = FxHashSet::default();
+            collect_state_vars(&cname, &own_state_vars, &base_names, &mut state_set, &mut FxHashSet::default());
 
-        // State variables (own).
-        let mut state_vars = Vec::new();
-        let mut using_for = Vec::new();
-        for cp in &def.parts {
-            match cp {
-                pt::ContractPart::VariableDefinition(v) => {
-                    state_vars.push(lower_state_var(v, reg.file_no));
-                }
-                pt::ContractPart::Using(u) => {
-                    if let Some(d) = lower_using(u) {
-                        using_for.push(d);
+            let lowerer = Lowerer {
+                file_no: reg.file_no,
+                src,
+                known_types: &known_types,
+                known_libraries: &known_libs,
+                known_lib_funcs: &known_lib_funcs,
+                depth: std::cell::Cell::new(0),
+            };
+
+            // State variables (own).
+            let mut state_vars = Vec::new();
+            let mut using_for = Vec::new();
+            for cp in &def.parts {
+                match cp {
+                    pt::ContractPart::VariableDefinition(v) => {
+                        state_vars.push(lower_state_var(v, reg.file_no));
                     }
+                    pt::ContractPart::Using(u) => {
+                        if let Some(d) = lower_using(u) {
+                            using_for.push(d);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        let mut fn_ids = Vec::new();
-        let mut name_map = FxHashMap::default();
-        for cp in &def.parts {
-            if let pt::ContractPart::FunctionDefinition(fd) = cp {
-                let fid = FunctionId(next_fid);
-                next_fid += 1;
-                let func = build_function(fid, reg.id, fd, &lowerer, &state_set);
-                if !func.name.is_empty() {
-                    name_map.insert(func.name.clone(), fid);
+            let mut fn_ids = Vec::new();
+            let mut funcs = Vec::new();
+            let mut name_map = FxHashMap::default();
+            let mut local_fid = base_fid;
+            for cp in &def.parts {
+                if let pt::ContractPart::FunctionDefinition(fd) = cp {
+                    let fid = FunctionId(local_fid);
+                    local_fid += 1;
+                    let func = build_function(fid, reg.id, fd, &lowerer, &state_set);
+                    if !func.name.is_empty() {
+                        name_map.insert(func.name.clone(), fid);
+                    }
+                    fn_ids.push(fid);
+                    funcs.push((fid, func));
                 }
-                fn_ids.push(fid);
-                scir.functions.insert(fid, func);
             }
-        }
-        contract_fn_names.insert(reg.id, name_map);
 
-        let contract = Contract {
-            id: reg.id,
-            name: cname.clone(),
-            kind: contract_kind(&def.ty),
-            bases: def.base.iter().map(|b| ident_path_text(&b.name)).collect(),
-            state_vars,
-            functions: fn_ids,
-            using_for,
-            file: reg.file_no,
-            span: span_of(def.loc, reg.file_no),
-        };
-        if !cname.is_empty() {
-            scir.contract_by_name.insert(cname, reg.id);
+            let contract = Contract {
+                id: reg.id,
+                name: cname,
+                kind: contract_kind(&def.ty),
+                bases: def.base.iter().map(|b| ident_path_text(&b.name)).collect(),
+                state_vars,
+                functions: fn_ids,
+                using_for,
+                file: reg.file_no,
+                span: span_of(def.loc, reg.file_no),
+            };
+            BuiltContract { contract, funcs, name_map }
+        })
+        .collect();
+
+    // Fold the per-contract results back in `regs` order — identical to serial.
+    let mut contract_fn_names: FxHashMap<ContractId, FxHashMap<String, FunctionId>> = FxHashMap::default();
+    for b in built {
+        for (fid, func) in b.funcs {
+            scir.functions.insert(fid, func);
         }
-        scir.contract_order.push(reg.id);
-        scir.contracts.insert(reg.id, contract);
+        contract_fn_names.insert(b.contract.id, b.name_map);
+        if !b.contract.name.is_empty() {
+            scir.contract_by_name.insert(b.contract.name.clone(), b.contract.id);
+        }
+        scir.contract_order.push(b.contract.id);
+        scir.contracts.insert(b.contract.id, b.contract);
     }
 
     // ---- Phase 3: resolve internal call edges (best-effort). ----

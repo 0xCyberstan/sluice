@@ -666,6 +666,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "rayon",
  "rustc-hash",
  "serde_json",
  "sluice-config",
@@ -693,6 +694,7 @@ dependencies = [
 name = "sluice-dataflow"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "rustc-hash",
  "sluice-ir",
  "sluice-parse",
@@ -762,6 +764,7 @@ name = "sluice-parse"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rayon",
  "rustc-hash",
  "sluice-ir",
  "smallvec",

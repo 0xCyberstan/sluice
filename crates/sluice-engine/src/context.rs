@@ -2,6 +2,8 @@
 //! prepared analysis dimensions, with convenience and false-positive-suppression
 //! helpers.
 
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use sluice_config::Config;
 use sluice_dataflow::{DataflowFacts, ProvenanceSet};
 use sluice_findings::{Category, Finding, FindingBuilder};
@@ -57,9 +59,47 @@ pub struct AnalysisContext<'a> {
     pub invariants: &'a InvariantFacts,
     pub frontier: &'a FrontierFacts,
     pub config: &'a Config,
+    /// Memoized comment-stripped, lowercased source text, keyed by span. Built
+    /// once (in parallel) over every function and contract span — the spans the
+    /// detectors overwhelmingly query — so the per-call `strip_comments` +
+    /// `to_ascii_lowercase` (previously redone by *each* detector for the *same*
+    /// function/contract) happens exactly once. A pure function of the span, so
+    /// the cache is order-independent and preserves determinism. Spans not in the
+    /// cache (statement/expr/operator spans) fall back to computing on the fly.
+    source_cache: FxHashMap<Span, String>,
 }
 
 impl<'a> AnalysisContext<'a> {
+    /// Build a context and precompute the per-span source-text cache in parallel.
+    pub fn new(
+        scir: &'a Scir,
+        dataflow: &'a DataflowFacts,
+        invariants: &'a InvariantFacts,
+        frontier: &'a FrontierFacts,
+        config: &'a Config,
+    ) -> Self {
+        // Collect the spans worth caching: every function body span and every
+        // contract span (deduped — many functions in one file, etc.). These are
+        // the spans `source_text` is called on by the bulk of detectors.
+        let mut spans: Vec<Span> = Vec::with_capacity(scir.functions.len() + scir.contracts.len());
+        for f in scir.all_functions() {
+            spans.push(f.span);
+        }
+        for c in scir.contracts.values() {
+            spans.push(c.span);
+        }
+        spans.sort_unstable_by_key(|s| (s.file, s.start, s.end));
+        spans.dedup();
+
+        // Strip + lowercase each once, in parallel. Pure per span ⇒ deterministic.
+        let source_cache: FxHashMap<Span, String> = spans
+            .into_par_iter()
+            .map(|s| (s, strip_comments(scir.span_text(s)).to_ascii_lowercase()))
+            .collect();
+
+        Self { scir, dataflow, invariants, frontier, config, source_cache }
+    }
+
     // -------- iteration helpers --------
 
     pub fn functions(&self) -> impl Iterator<Item = &Function> {
@@ -105,8 +145,15 @@ impl<'a> AnalysisContext<'a> {
     /// Detectors that key suppression/heuristics on keywords ("timelock", "vrf",
     /// "nonce", ...) MUST use this rather than raw `span_text`, otherwise a comment
     /// like `// no timelock here` falsely trips the keyword check.
+    ///
+    /// Function/contract spans are served from the precomputed cache (a cheap
+    /// clone of an already-stripped string); any other span is computed on the
+    /// fly. Either way the result is identical to recomputing every time.
     pub fn source_text(&self, span: Span) -> String {
-        strip_comments(self.scir.span_text(span)).to_ascii_lowercase()
+        match self.source_cache.get(&span) {
+            Some(s) => s.clone(),
+            None => strip_comments(self.scir.span_text(span)).to_ascii_lowercase(),
+        }
     }
 
     // -------- value-flow queries --------

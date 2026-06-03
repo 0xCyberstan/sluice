@@ -12,6 +12,7 @@
 //! return-provenance fixpoint over the whole module (callee returns refine
 //! caller flows). Sound as an over-approximation for reachability.
 
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sluice_ir::{
     Builtin, Call, CallKind, Expr, ExprKind, Function, FunctionId, GuardKind, Lit, Scir, ValueSource,
@@ -133,10 +134,17 @@ impl DataflowFacts {
         // point are no longer invisible.
         let edges = internal_call_edges(scir);
 
+        // Stable list of functions to drive the per-function map in parallel.
+        // `build_flow` is a pure function of (`scir`, `f`, current `facts`) and
+        // writes nothing shared, so computing the per-function flows in parallel
+        // yields the exact same `FxHashMap` regardless of thread scheduling.
+        let funcs: Vec<&Function> = scir.all_functions().collect();
+
         // Seed local flows (internal-call returns + param_in unknown initially).
-        for f in scir.all_functions() {
-            facts.per_fn.insert(f.id, build_flow(scir, f, &facts));
-        }
+        facts.per_fn = funcs
+            .par_iter()
+            .map(|f| (f.id, build_flow(scir, f, &facts)))
+            .collect();
 
         // Joint fixpoint over return-provenance AND parameter-provenance.
         for _ in 0..MAX_ROUNDS {
@@ -147,10 +155,10 @@ impl DataflowFacts {
 
             // (b) Recompute flows: callee returns from the snapshot, parameter
             //     seeds from the freshly-computed param_in.
-            let mut new_per_fn: FxHashMap<FunctionId, FnFlow> = FxHashMap::default();
-            for f in scir.all_functions() {
-                new_per_fn.insert(f.id, build_flow(scir, f, &facts));
-            }
+            let new_per_fn: FxHashMap<FunctionId, FnFlow> = funcs
+                .par_iter()
+                .map(|f| (f.id, build_flow(scir, f, &facts)))
+                .collect();
 
             let changed = new_per_fn != snapshot.per_fn || facts.param_in != snapshot.param_in;
             facts.per_fn = new_per_fn;

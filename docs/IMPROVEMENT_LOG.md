@@ -252,7 +252,15 @@ R7–R9 were all novel-detector rounds; the roadmap says interleave the optimiza
   stream, taint/hint queries, name-classifiers) into a `detectors/prelude` + a `detector!{}` authoring macro to kill the
   per-detector boilerplate (measure "lines/concepts to add a detector" before/after); migrate 3-4 detectors onto it as proof.
 - **WF3:** R11 novel-bug research on a fresh target (karak/morpho) + a full dogfood re-measure of all 64 detectors.
-- _status: **WF2 (architecture) + WF3 done & integrated**; WF1 (performance) still benchmarking._
+- _status: **DONE** — all three integrated._ WF1 (performance): rayon-parallelized file read + parse + IR-build
+  (sluice-parse) + per-function dataflow fixpoint + the detector phase; removed an O(contracts²) hot path in
+  netted-aggregate-desync's inheritance-chain rebuild; added a parallel one-time `source_text` cache in
+  AnalysisContext::new. **2.55× faster on 4,418 files, 3.27× on 13,254** (parse 880→335ms, dataflow 342→180ms,
+  detectors 623→146ms). Also **fixed a pre-existing run-to-run nondeterminism** (a HashSet-iteration var pick → pinned
+  to the lexicographically-smallest), so output is now byte-stable. Verified in main: findings byte-identical to the R9
+  baseline (olympus 92 / etherfi 126 / pendle 81), md5-stable across runs, 285 tests, 0 warnings. (Integration caught a
+  cross-round conflict: WF1's new private `source_cache` field broke a struct-literal `AnalysisContext{..}` in the arch
+  round's prelude test — fixed by routing it through `AnalysisContext::new`.)
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector

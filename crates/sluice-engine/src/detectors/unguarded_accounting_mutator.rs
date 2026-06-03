@@ -356,8 +356,10 @@ fn guarded_sibling(
         if g_touch.is_empty() {
             continue;
         }
-        // Strongest: the guarded sibling touches the SAME accounting var.
-        if let Some(shared) = touched.iter().find(|v| g_touch.contains(*v)) {
+        // Strongest: the guarded sibling touches the SAME accounting var. Pick the
+        // lexicographically smallest shared var so the reported figure is stable
+        // regardless of `HashSet` iteration order (determinism).
+        if let Some(shared) = touched.iter().filter(|v| g_touch.contains(*v)).min() {
             return Some((g.name.clone(), shared.clone()));
         }
         // Fallback: same `emergency*`/`track*` accounting family. Record but keep
@@ -366,8 +368,9 @@ fn guarded_sibling(
             && f_family.is_some()
             && accounting_family(&g.name) == f_family
         {
-            // Report the candidate's own touched var as the at-risk figure.
-            if let Some(v) = touched.iter().next() {
+            // Report the candidate's own touched var as the at-risk figure (the
+            // lexicographically smallest, for a stable, order-independent choice).
+            if let Some(v) = touched.iter().min() {
                 family_fallback = Some((g.name.clone(), v.clone()));
             }
         }

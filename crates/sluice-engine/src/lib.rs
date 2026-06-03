@@ -56,7 +56,7 @@ pub fn analyze_sources(sources: Vec<(String, String)>, cfg: &Config) -> EngineRe
 }
 
 /// Analyze files from disk.
-pub fn analyze_paths<P: AsRef<std::path::Path>>(paths: &[P], cfg: &Config) -> EngineResult {
+pub fn analyze_paths<P: AsRef<std::path::Path> + Sync>(paths: &[P], cfg: &Config) -> EngineResult {
     let parsed = sluice_parse::parse_paths(paths);
     let parse_errors = parsed
         .file_errors
@@ -81,13 +81,7 @@ pub fn analyze_scir(scir: Scir, cfg: &Config) -> EngineResult {
     };
 
     let (findings, raw_n, det_n) = {
-        let cx = AnalysisContext {
-            scir: &scir,
-            dataflow: &dataflow,
-            invariants: &invariants,
-            frontier: &frontier,
-            config: cfg,
-        };
+        let cx = AnalysisContext::new(&scir, &dataflow, &invariants, &frontier, cfg);
 
         let dets = builtin_detectors();
         let enabled: Vec<&Box<dyn Detector>> =

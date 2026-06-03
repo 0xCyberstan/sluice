@@ -23,3 +23,7 @@ walkdir    = { workspace = true }
 colored    = { workspace = true }
 serde_json = { workspace = true }
 rustc-hash = { workspace = true }
+
+# Only for `examples/profile_phases.rs` (local profiling; NOT used by the binary).
+[dev-dependencies]
+rayon = { workspace = true }
