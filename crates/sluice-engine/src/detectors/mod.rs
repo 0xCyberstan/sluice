@@ -134,6 +134,13 @@ pub mod respected_gametype_snapshot_swap;
 // Round 17 — OP fault-proof bond + L1->L2 aliasing.
 pub mod refund_credit_pre_verdict;
 pub mod conditional_sender_aliasing;
+// Round 19 — EigenLayer AVS-middleware (quorum / BLS-registry / churn).
+pub mod apk_membership_desync;
+pub mod verify_snapshot_block_caller_trust;
+pub mod churn_stale_stake_double_count;
+pub mod index_registry_pop_swap_stale;
+pub mod ejection_ratelimit_live_base;
+pub mod reregister_cooldown_bitmap_residue;
 
 use crate::detector::Detector;
 
@@ -279,6 +286,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         // Round 17 — OP fault-proof bond + L1->L2 aliasing.
         Box::new(refund_credit_pre_verdict::RefundCreditPreVerdictDetector),
         Box::new(conditional_sender_aliasing::ConditionalSenderAliasingDetector),
+        // Round 19 — EigenLayer AVS-middleware classes.
+        Box::new(apk_membership_desync::ApkMembershipDesyncDetector),
+        Box::new(verify_snapshot_block_caller_trust::VerifySnapshotBlockCallerTrustDetector),
+        Box::new(churn_stale_stake_double_count::ChurnStaleStakeDoubleCountDetector),
+        Box::new(index_registry_pop_swap_stale::IndexRegistryPopSwapStaleDetector),
+        Box::new(ejection_ratelimit_live_base::EjectionRatelimitLiveBaseDetector),
+        Box::new(reregister_cooldown_bitmap_residue::ReregisterCooldownBitmapResidueDetector),
     ]
 }
 

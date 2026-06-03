@@ -439,6 +439,25 @@ Audit method: scanned 12 source roots (all exit 0, 0.06–4.9s, ≤290MB; olympu
 5. **ejection-ratelimit-live-base-bypass** — auto-ejection rate-limit budget = percentage of a LIVE base (manipulable).
 6. **reregister-cooldown-vs-bitmap-residue** — deregistration clears the quorum bitmap but leaves residue enabling re-register-cooldown bypass.
 AVS verification is EigenLayer's trust root (high payout). Full signatures in the R18 WF3 transcript.
+
+### Round 19 — 6 EigenLayer AVS-middleware detectors — covers the AVS verification trust root
+- **Result:** +6 → **110 active** (66 novel classes across 8 domains). Authored by 6 worktree agents via the prelude.
+  Independent dogfood: **5 of 6 fire on real eigenlayer-middleware** (apk-membership-desync = forged-aggregate-sig,
+  verify-snapshot-block-caller-trust = stale-stake threshold bypass, churn-stale-stake-double-count, ejection-ratelimit-live-base,
+  reregister-cooldown-bitmap-residue); index-registry-pop-swap-stale is fixture-only here (IndexRegistry correctly updates its
+  index). **0 R19 FPs on all 6 codebases** — incl. 0 on eigenlayer CORE (confirming the classes are middleware-specific, not
+  generic). 603 tests, 0 warnings, corpus 20/20 + 8/8; the R18 precision gains held (olympus 85 / etherfi 109 / pendle 93 / etc.).
+  The AVS verification surface (BLS aggregate-key/membership, stake-snapshot trust, churn/ejection/reregister) is now covered.
+
+#### R20 backlog (R19 WF3 — olympus-v3: a distinct ARCHITECTURE = Default-Framework module-permission + algorithmic-stability; exact file:line on disk; non-overlap vs the 110)
+1. **PolicyPermissionDeclarationGap** — a Policy calls a module `permissioned` selector ABSENT from its own `requestPermissions()` array (called-but-undeclared = live DoS; declared-but-uncalled = latent over-grant). A cross-policy/module static check unique to the Kernel two-table permission contract. Operator.sol:200-213 vs its RANGE/TRSRY/MINTR calls; Kernel.sol:110-116,314-315,376-392. (≠ AccessControl/Centralization = caller-side modifiers.)
+2. **ModuleActiveFlagPrivilegeScope** — a global module kill-switch (`activate`/`deactivate`, a scalar bool flipper behind the flat `permissioned` channel) gating `onlyWhileActive` on mint/withdraw → any grantee can halt the protocol. OlympusMinter.sol:84-91, OlympusTreasury.sol:163-170.
+3. **WallCapacityRegenDesync** — RBS wall capacity debited by swap with no matching regen/threshold/approval co-update (spread across Operator+OlympusRange). Operator.sol:578-581,644-690; OlympusRange.sol:86-157.
+4. **ModuleUpgradeStateMigrationDrop** — `UpgradeModule`/`MigrateKernel` swaps a module without copying state; default `INIT` is a no-op → new version starts zeroed. Kernel.sol _upgradeModule.
+5. **LifecycleRoleRevokeGap** — a ROLES-system role granted to a policy is never revoked on Kernel deactivation → stale privilege.
+6. **KeeperRewardTimestampAuction** — keeper incentive scaled by `block.timestamp`-elapsed, caller-mintable (Heart).
+7. **BackingSpotInflationFromUnbufferedPrice** — emission/bond payout sized from an instantaneous `getLastPrice`/pool spot. EmissionManager.sol.
+Adds a 9th surface: framework-ARCHITECTURE-specific classes (the Default-Framework Kernel/module/policy permission model), not just a value domain. Full signatures in the R19 WF3 transcript.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector
