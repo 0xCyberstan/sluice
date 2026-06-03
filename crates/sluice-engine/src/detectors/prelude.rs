@@ -61,7 +61,7 @@
 use crate::context::AnalysisContext;
 use sluice_findings::Finding;
 use sluice_ir::{
-    Builtin, Call, CallKind, Contract, Expr, ExprKind, Function, FunctionId, Lit, Span, StmtKind,
+    Builtin, Call, CallKind, Contract, Expr, ExprKind, Function, FunctionId, Lit, Span, Stmt, StmtKind,
     ValueSource,
 };
 
@@ -1004,6 +1004,383 @@ fn is_zero_literal(e: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+// =========================================== credited-value provenance (B1)
+//
+// The `value-source-discipline` detector (LoopFi H-01) needs to answer, for the
+// amount expression `A` of a credit sink (a mint / transfer-to-caller / per-user
+// slot write): *where does `A` come from?* Specifically — does it derive from a
+// **live self-balance read** (`address(this).balance`, `balanceOf(this)`) rather
+// than from a **tracked accounting var** (`balances`/`totalSupply`/`shares`…)?
+//
+// This is a body-local taint, generalizing `backing_spot_inflation::spot_tainted
+// _locals`. It is a per-binding taint anchored at the assignment site (not a
+// function-level union) — the IR is a normalized tree with no SSA, so a value
+// reassigned across statements (`x = balance; … x = balance - x;`) is handled by
+// classifying each binding and letting the LATER binding's class win for reads
+// after it. We approximate that with a small fixpoint that records, for each
+// local, the union of provenance classes its bindings carry, plus a `balance_
+// delta` flag that, when set on a binding, SUPPRESSES the raw self-balance class
+// for that local (the `_fillQuote` safe idiom — see S1).
+
+/// The provenance summary of a credited value, computed by [`credited_value_provenance`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CreditedProvenance {
+    /// The value reaches a live self-balance read (`address(this).balance`,
+    /// `this.balance`, `balanceOf(address(this))`) — directly or through a local
+    /// seeded from one — and that read was NOT consumed into a balance-delta.
+    pub self_balance: bool,
+    /// The value reaches a **tracked accounting var** of the contract — a state
+    /// variable with an accounting-shaped name (`balances`/`totalSupply`/
+    /// `shares`/`stake`…). The denominator of the value-source invariant.
+    pub tracked: bool,
+    /// The value is (or derives from) a **balance delta** — a `Binary{Sub}` whose
+    /// both sides reach a self-balance read (`amt = balance - before`), the safe
+    /// `_fillQuote` idiom. A balance-delta is NOT raw self-balance (S1).
+    pub balance_delta: bool,
+}
+
+impl CreditedProvenance {
+    /// The H-01 predicate core: the value is self-balance-derived and NOT a
+    /// tracked-var-derived quantity. (Balance-delta already suppresses
+    /// `self_balance`, so it fails this too.)
+    pub fn is_undisciplined_self_balance(self) -> bool {
+        self.self_balance && !self.tracked
+    }
+}
+
+/// Compute the provenance of a credited value `amount` within function `f`:
+/// does it derive from a live self-balance read vs. a tracked accounting var,
+/// and is it a balance-delta? Generalizes `backing_spot_inflation::spot_tainted
+/// _locals` to the self-balance source plus the tracked-var denominator.
+///
+/// The taint runs over the whole body to a small fixpoint (a couple of copy
+/// hops), then the supplied `amount` expression is classified against the
+/// resulting local-name → class map. A binding tagged `balance_delta` does not
+/// propagate the raw self-balance class — that is the S1 suppression baked into
+/// the taint itself.
+pub fn credited_value_provenance(cx: &AnalysisContext, f: &Function, amount: &Expr) -> CreditedProvenance {
+    credited_value_provenance_at(cx, f, amount.span)
+}
+
+/// **Flow-sensitive** twin of [`credited_value_provenance`]: classify the amount
+/// expression located at `amount_span`, using only the bindings that reach it
+/// along the path through `f`'s body. This is the design's "per-binding taint
+/// anchored at the assignment site, not a function-level union" — without it, a
+/// local reassigned in two sibling branches (LoopFi's `claimedAmount`: tracked in
+/// the ETH branch, raw self-balance in the token branch) would be conflated into
+/// `self_balance && tracked` and the predicate would never fire. The walk forks
+/// the taint at every `if`/loop boundary so each branch classifies against only
+/// its own preceding bindings.
+pub fn credited_value_provenance_at(
+    cx: &AnalysisContext,
+    f: &Function,
+    amount_span: Span,
+) -> CreditedProvenance {
+    let mut result: Option<CreditedProvenance> = None;
+    let mut taint = ValueTaint::default();
+    walk_for_span(cx, f, &f.body, &mut taint, amount_span, &mut result);
+    result.unwrap_or_default()
+}
+
+/// Per-local provenance classes, keyed by variable name. Public so detectors can
+/// drive a flow-sensitive scan; cloned at branch boundaries.
+#[derive(Debug, Clone, Default)]
+pub struct ValueTaint {
+    self_balance: std::collections::HashSet<String>,
+    tracked: std::collections::HashSet<String>,
+    balance_delta: std::collections::HashSet<String>,
+}
+
+impl ValueTaint {
+    /// Apply one `name = rhs` binding to the taint, in flow order. A balance-delta
+    /// RHS (S1) tags `balance_delta` and clears any prior self-balance for `name`;
+    /// otherwise `name` takes the classes its RHS carries (and is cleared of any
+    /// class the RHS does not carry, so a reassignment overwrites — flow order).
+    pub fn apply_binding(&mut self, cx: &AnalysisContext, f: &Function, name: &str, rhs: &Expr) {
+        if is_balance_delta_rhs(cx, f, rhs, self) {
+            self.balance_delta.insert(name.to_string());
+            self.self_balance.remove(name);
+            self.tracked.remove(name);
+            return;
+        }
+        let c = classify_value(cx, f, rhs, self);
+        set_membership(&mut self.self_balance, name, c.self_balance);
+        set_membership(&mut self.tracked, name, c.tracked);
+        // A fresh non-delta binding is no longer a delta.
+        self.balance_delta.remove(name);
+    }
+}
+
+fn set_membership(set: &mut std::collections::HashSet<String>, name: &str, present: bool) {
+    if present {
+        set.insert(name.to_string());
+    } else {
+        set.remove(name);
+    }
+}
+
+/// Walk a statement list in flow order, threading `taint`. When a statement whose
+/// expression-subtree contains `target_span` is reached, classify the value at
+/// `target_span` against the taint accumulated so far and record it in `result`.
+/// Branches fork the taint (each gets its own clone) so sibling-branch bindings
+/// of the same local are not conflated.
+fn walk_for_span(
+    cx: &AnalysisContext,
+    f: &Function,
+    stmts: &[Stmt],
+    taint: &mut ValueTaint,
+    target_span: Span,
+    result: &mut Option<CreditedProvenance>,
+) {
+    for s in stmts {
+        if result.is_some() {
+            return;
+        }
+        // If this statement's expressions contain the target, classify now (before
+        // applying this statement's own binding — the credit reads the value as it
+        // stands on entry to the sink statement).
+        if stmt_contains_span(s, target_span) {
+            if let Some(target) = find_expr_by_span(s, target_span) {
+                *result = Some(classify_value(cx, f, target, taint));
+                return;
+            }
+        }
+        match &s.kind {
+            StmtKind::VarDecl { name: Some(n), init: Some(init), .. } => {
+                taint.apply_binding(cx, f, n, init);
+            }
+            StmtKind::Expr(Expr { kind: ExprKind::Assign { target, value, .. }, .. }) => {
+                if let ExprKind::Ident(n) = &target.kind {
+                    taint.apply_binding(cx, f, n, value.as_ref());
+                }
+            }
+            StmtKind::If { then_branch, else_branch, .. } => {
+                let mut tb = taint.clone();
+                walk_for_span(cx, f, then_branch, &mut tb, target_span, result);
+                if result.is_some() {
+                    return;
+                }
+                let mut eb = taint.clone();
+                walk_for_span(cx, f, else_branch, &mut eb, target_span, result);
+                if result.is_some() {
+                    return;
+                }
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::DoWhile { body, .. }
+            | StmtKind::For { body, .. }
+            | StmtKind::Block { stmts: body, .. } => {
+                let mut bb = taint.clone();
+                walk_for_span(cx, f, body, &mut bb, target_span, result);
+                if result.is_some() {
+                    return;
+                }
+            }
+            StmtKind::Try { body, catches, .. } => {
+                let mut bb = taint.clone();
+                walk_for_span(cx, f, body, &mut bb, target_span, result);
+                for c in catches {
+                    if result.is_some() {
+                        return;
+                    }
+                    let mut cb = taint.clone();
+                    walk_for_span(cx, f, &c.body, &mut cb, target_span, result);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Does any expression in `s` (NOT descending into nested statements) contain
+/// `span`? Used to decide whether the credit value lives in this statement.
+fn stmt_contains_span(s: &Stmt, span: Span) -> bool {
+    let mut hit = false;
+    // Only this statement's own expressions (visit_exprs descends nested stmts via
+    // `visit`, but we drive nested statements ourselves; so guard by checking the
+    // immediate expression slots only).
+    match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Emit(e) => e.visit(&mut |x| if x.span == span { hit = true }),
+        StmtKind::VarDecl { init: Some(e), .. } => e.visit(&mut |x| if x.span == span { hit = true }),
+        StmtKind::Return(Some(e)) => e.visit(&mut |x| if x.span == span { hit = true }),
+        StmtKind::Revert { args, .. } => {
+            for a in args {
+                a.visit(&mut |x| if x.span == span { hit = true });
+            }
+        }
+        _ => {}
+    }
+    hit
+}
+
+/// The expression with exactly `span` inside statement `s`'s own expressions.
+fn find_expr_by_span(s: &Stmt, span: Span) -> Option<&Expr> {
+    fn in_expr(e: &Expr, span: Span) -> Option<&Expr> {
+        let mut found: Option<&Expr> = None;
+        e.visit(&mut |x| {
+            if found.is_none() && x.span == span {
+                found = Some(x);
+            }
+        });
+        found
+    }
+    match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Emit(e) => in_expr(e, span),
+        StmtKind::VarDecl { init: Some(e), .. } => in_expr(e, span),
+        StmtKind::Return(Some(e)) => in_expr(e, span),
+        StmtKind::Revert { args, .. } => args.iter().find_map(|a| in_expr(a, span)),
+        _ => None,
+    }
+}
+
+/// Classify an expression against the current taint map.
+fn classify_value(cx: &AnalysisContext, f: &Function, e: &Expr, t: &ValueTaint) -> CreditedProvenance {
+    let mut out = CreditedProvenance::default();
+    e.visit(&mut |x| {
+        match &x.kind {
+            // A direct self-balance read: `address(this).balance` / `this.balance`.
+            ExprKind::Member { base, member } if member == "balance" && expr_is_self_address(base) => {
+                out.self_balance = true;
+            }
+            // `balanceOf(address(this))` / `balanceOf(this)`.
+            ExprKind::Call(c)
+                if c.func_name.as_deref() == Some("balanceOf")
+                    && c.args.first().map(expr_is_self_address).unwrap_or(false) =>
+            {
+                out.self_balance = true;
+            }
+            // A local: inherit whichever classes it carries.
+            ExprKind::Ident(n) => {
+                if t.balance_delta.contains(n) {
+                    out.balance_delta = true;
+                } else if t.self_balance.contains(n) {
+                    out.self_balance = true;
+                }
+                if t.tracked.contains(n) {
+                    out.tracked = true;
+                }
+                // A bare read of a tracked accounting STATE var (e.g. `totalSupply`).
+                if is_tracked_accounting_var(cx, f, n) {
+                    out.tracked = true;
+                }
+            }
+            // An index / member of a tracked accounting state var (`balances[..]`,
+            // `userStake` derived from `balances[msg.sender][_token]`).
+            ExprKind::Index { base, .. } => {
+                if let Some(root) = root_ident_str(base) {
+                    if is_tracked_accounting_var(cx, f, root) {
+                        out.tracked = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    out
+}
+
+/// Is `rhs` a balance-delta / balance-excess — a `Binary{Sub}` (anywhere in the
+/// expression) whose **minuend (LHS) reaches a self-balance read**? This is the
+/// safe "skim only the change/excess" idiom (S1), the deliberate inverse of the
+/// LoopFi-H-01 raw-balance credit. Two real shapes it must cover:
+///
+///   * `_fillQuote`: `amt = address(this).balance - balanceBefore` — the *change*
+///     in the contract's balance (the subtrahend is a prior self-balance read).
+///   * Reserve `RewardableLib`: `amt = balanceOf(address(this)) - liabilities[t]`
+///     — the *excess* over what is already accounted for (the subtrahend is a
+///     tracked liability ledger).
+///
+/// In both, the credited value is `balance − <baseline-already-accounted-for>`,
+/// so pre-existing balance and unrelated inflows are excluded by construction —
+/// the over-credit cannot occur. The subtrahend may therefore be ANYTHING (a
+/// prior balance, a tracked var, a constant); only the minuend must be the live
+/// self-balance. (An attacker-controlled subtrahend would only *reduce* the
+/// credit, never inflate it past the contract's balance, so it is not the H-01
+/// class.)
+fn is_balance_delta_rhs(cx: &AnalysisContext, f: &Function, rhs: &Expr, t: &ValueTaint) -> bool {
+    let mut hit = false;
+    rhs.visit(&mut |x| {
+        if hit {
+            return;
+        }
+        if let ExprKind::Binary { op: sluice_ir::BinOp::Sub, lhs, .. } = &x.kind {
+            let l = classify_value(cx, f, lhs, t);
+            if l.self_balance || expr_reaches_self_balance(lhs, t) {
+                hit = true;
+            }
+        }
+    });
+    hit
+}
+
+/// Does `e` reach a self-balance read, considering both direct reads and locals
+/// already classified self-balance? (A lighter check used inside the delta test,
+/// which must see the `before` operand's self-balance origin even before the
+/// fixpoint has propagated it fully.)
+fn expr_reaches_self_balance(e: &Expr, t: &ValueTaint) -> bool {
+    let mut hit = false;
+    e.visit(&mut |x| {
+        if hit {
+            return;
+        }
+        match &x.kind {
+            ExprKind::Member { base, member } if member == "balance" && expr_is_self_address(base) => {
+                hit = true;
+            }
+            ExprKind::Call(c)
+                if c.func_name.as_deref() == Some("balanceOf")
+                    && c.args.first().map(expr_is_self_address).unwrap_or(false) =>
+            {
+                hit = true;
+            }
+            ExprKind::Ident(n) if t.self_balance.contains(n) => hit = true,
+            _ => {}
+        }
+    });
+    hit
+}
+
+/// True if `e` is `address(this)` / `payable(this)` (a `TypeCast` of `this`) or
+/// the bare `this`. The prelude-local twin of the dataflow recognizer.
+pub fn expr_is_self_address(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => n == "this",
+        ExprKind::Call(c) if c.kind == CallKind::TypeCast => c.args.iter().any(expr_is_self_address),
+        _ => false,
+    }
+}
+
+/// Is `name` a **tracked accounting state variable** of `f`'s contract — a state
+/// var (settable, i.e. not constant/immutable) whose name reads like protocol
+/// bookkeeping (`balances`/`totalSupply`/`shares`/`stake`/`deposits`…)? This is
+/// the heuristic denominator of the value-source invariant (the design's
+/// `TrackedVars`, recovered on demand here for B1).
+pub fn is_tracked_accounting_var(cx: &AnalysisContext, f: &Function, name: &str) -> bool {
+    let Some(c) = cx.contract_of(f.id) else { return false };
+    // Must be a real settable state var (a local/param coincidentally named
+    // `total…` must not count — only the contract's own bookkeeping).
+    if !is_settable_state_var(c, name) {
+        return false;
+    }
+    is_tracked_accounting_name(name)
+}
+
+/// Does `name` read like a tracked accounting/bookkeeping quantity? Narrower than
+/// the generic `is_accounting_name` (which includes `price`/`rate`/`amount` —
+/// those are not the *conserved ledger* a credit must derive from). The conserved
+/// quantities a credit should be sized from: per-user/aggregate balances, the
+/// supply/shares total, staked principal, accumulated deposits.
+pub fn is_tracked_accounting_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    [
+        "balance", "balances", "totalsupply", "supply", "share", "shares", "stake",
+        "staked", "deposit", "deposits", "totalassets", "totallp", "principal", "ledger",
+        "owed", "credit", "accounted",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
 }
 
 #[cfg(test)]

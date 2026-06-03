@@ -190,6 +190,8 @@ pub enum Category {
     FundingIndexSettleOrdering,
     OICapCheckedBeforeFillCallout,
     MarkVsIndexPriceInconsistency,
+    // ---- PHASE B1: invariant engine — value-source discipline (LoopFi H-01) ----
+    ValueSourceDiscipline,
     Other,
 }
 
@@ -340,6 +342,7 @@ impl Category {
             FundingIndexSettleOrdering => "funding-index-settle-ordering",
             OICapCheckedBeforeFillCallout => "oi-cap-checked-before-fill-callout",
             MarkVsIndexPriceInconsistency => "mark-vs-index-price-inconsistency",
+            ValueSourceDiscipline => "value-source-discipline",
             Other => "other",
         }
     }
@@ -472,6 +475,7 @@ impl Category {
             FundingIndexSettleOrdering => &["CWE-682", "CWE-696"],
             OICapCheckedBeforeFillCallout => &["CWE-367", "CWE-691"],
             MarkVsIndexPriceInconsistency => &["CWE-682", "CWE-840"],
+            ValueSourceDiscipline => &["CWE-840", "CWE-682"],
             _ => &[],
         }
     }

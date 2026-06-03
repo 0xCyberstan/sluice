@@ -1,0 +1,99 @@
+{
+  "name": "2022-12-tigris",
+  "repo": "code-423n4/2022-12-tigris",
+  "commit": "a2896b60eec8815409d946580ce0ce0392851f00",
+  "local_path": "~/Data/bench/2022-12-tigris",
+  "scope_dirs": ["contracts"],
+  "audit_url": "https://code4rena.com/reports/2022-12-tigris",
+  "note": "Representative High/Medium set re-derived from the published report and grounded to the clone's source lines. Function names match the source (e.g. _bridgeMint, _checkDelay, verifyPrice).",
+  "known_findings": [
+    {
+      "id": "H-verifyprice-chainlink-staleness",
+      "severity": "High",
+      "contract": "TradingLibrary",
+      "function": "verifyPrice",
+      "file": "contracts/utils/TradingLibrary.sol",
+      "line": 112,
+      "bug_class": "oracle-staleness",
+      "in_class": true,
+      "summary": "verifyPrice uses Chainlink latestAnswer() only as a ±2% sanity band and never checks updatedAt/round freshness, so a stale Chainlink price (or a node price within 2% of a stale value) is accepted as a valid mark price."
+    },
+    {
+      "id": "H-bridgemint-public",
+      "severity": "High",
+      "contract": "GovNFT",
+      "function": "_bridgeMint",
+      "file": "contracts/GovNFT.sol",
+      "line": 64,
+      "bug_class": "access-control",
+      "in_class": true,
+      "summary": "_bridgeMint is declared public with no access control, so anyone can mint GovNFTs directly instead of only the LayerZero receive path, inflating governance/reward NFT supply."
+    },
+    {
+      "id": "H-verifyprice-sig-replay",
+      "severity": "High",
+      "contract": "TradingLibrary",
+      "function": "verifyPrice",
+      "file": "contracts/utils/TradingLibrary.sol",
+      "line": 102,
+      "bug_class": "signature-replay",
+      "in_class": true,
+      "summary": "The node-signed PriceData (recovered via ECDSA) has no nonce or single-use binding; within the _validSignatureTimer window the same signature can be replayed across multiple orders/positions to pin a favorable price."
+    },
+    {
+      "id": "H-addtoposition-price-manip",
+      "severity": "High",
+      "contract": "Trading",
+      "function": "addToPosition",
+      "file": "contracts/Trading.sol",
+      "line": 295,
+      "bug_class": "accounting-invariant",
+      "in_class": false,
+      "summary": "addToPosition recomputes the entry price as a margin-weighted average of the old position price and the new verified price; this protocol-specific averaging can be gamed to manipulate the effective entry/liquidation price (economic invariant, not a modeled sink)."
+    },
+    {
+      "id": "H-handleopenfees-referral",
+      "severity": "High",
+      "contract": "Trading",
+      "function": "_handleOpenFees",
+      "file": "contracts/Trading.sol",
+      "line": 689,
+      "bug_class": "economic-fee-accounting",
+      "in_class": false,
+      "summary": "Open-fee / referral-fee accounting in _handleOpenFees can be manipulated (self-referral, fee-multiplier interactions) to reduce or redirect fees — a protocol-specific economic accounting bug."
+    },
+    {
+      "id": "M-stablevault-decimals",
+      "severity": "Medium",
+      "contract": "StableVault",
+      "function": "deposit",
+      "file": "contracts/StableVault.sol",
+      "line": 49,
+      "bug_class": "decimals-assumption",
+      "in_class": true,
+      "summary": "deposit/withdraw scale by 10**(18 - token.decimals()); a margin token with more than 18 decimals underflows the exponent (and the assumption breaks for non-18-decimal tokens), corrupting the tigAsset mint/redeem amount."
+    },
+    {
+      "id": "M-checkdelay-blocknumber",
+      "severity": "Medium",
+      "contract": "Trading",
+      "function": "_checkDelay",
+      "file": "contracts/Trading.sol",
+      "line": 861,
+      "bug_class": "block-number-as-time",
+      "in_class": true,
+      "summary": "_checkDelay enforces the anti-front-run open/close delay using block.number + blockDelay; block production rate is chain-dependent and irregular (L2 sequencer), so the intended time delay is not enforced as designed."
+    },
+    {
+      "id": "M-removemargin-liqprice",
+      "severity": "Medium",
+      "contract": "Trading",
+      "function": "removeMargin",
+      "file": "contracts/Trading.sol",
+      "line": 413,
+      "bug_class": "accounting-invariant",
+      "in_class": false,
+      "summary": "removeMargin lets a trader withdraw margin and shift the liquidation price adversely relative to the protocol's solvency intent — a protocol-specific margin/liquidation accounting invariant, not a modeled detector class."
+    }
+  ]
+}

@@ -1,0 +1,241 @@
+{
+  "name": "2023-04-frankencoin",
+  "repo": "code-423n4/2023-04-frankencoin",
+  "commit": "0761a287999fa3efac5c9fa9b70fcef5eeecc213",
+  "local_path": "~/Data/bench/2023-04-frankencoin",
+  "scope_dirs": ["contracts"],
+  "audit_url": "https://code4rena.com/reports/2023-04-frankencoin",
+  "known_findings": [
+    {
+      "id": "H-01",
+      "severity": "High",
+      "contract": "MintingHub",
+      "function": "launchChallenge",
+      "file": "contracts/MintingHub.sol",
+      "line": 140,
+      "bug_class": "frontrunning-deleverage",
+      "in_class": false,
+      "summary": "Position owner frontruns a challenge by repaying debt and lowering the liquidation price, making the challenger lose collateral in the auction."
+    },
+    {
+      "id": "H-02",
+      "severity": "High",
+      "contract": "Position",
+      "function": "withdraw",
+      "file": "contracts/Position.sol",
+      "line": 250,
+      "bug_class": "double-entry-token",
+      "in_class": true,
+      "summary": "A double-entrypoint collateral token lets the owner withdraw the underlying via the legacy address (token != address(collateral)) without repaying ZCHF, stealing collateral. withdraw() only routes through withdrawCollateral when token == address(collateral)."
+    },
+    {
+      "id": "H-03",
+      "severity": "High",
+      "contract": "Position",
+      "function": "internalWithdrawCollateral",
+      "file": "contracts/Position.sol",
+      "line": 268,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "Owner sends collateral directly to the position before a challenge finishes so balance>=minimum, avoiding the cooldown extension and re-minting profitably."
+    },
+    {
+      "id": "H-04",
+      "severity": "High",
+      "contract": "MintingHub",
+      "function": "end",
+      "file": "contracts/MintingHub.sol",
+      "line": 252,
+      "bug_class": "dos-on-revert",
+      "in_class": false,
+      "summary": "Transferring position ownership to address(0) makes the owner payout transfer in end() revert, permanently locking challenger collateral and bidder funds."
+    },
+    {
+      "id": "H-05",
+      "severity": "High",
+      "contract": "Position",
+      "function": "tryAvertChallenge",
+      "file": "contracts/Position.sol",
+      "line": 307,
+      "bug_class": "integer-overflow",
+      "in_class": true,
+      "summary": "Setting price to type(uint256).max overflows price*_collateralAmount in the bid/avert check (and the analogous adjustPrice path), reverting challenge resolution and blocking liquidation of bad positions."
+    },
+    {
+      "id": "H-06",
+      "severity": "High",
+      "contract": "MintingHub",
+      "function": "end",
+      "file": "contracts/MintingHub.sol",
+      "line": 252,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "Self-challenging a position created at an inflated price lets an attacker extract the 2% CHALLENGER_REWARD from reserves repeatedly, draining the protocol / minting for free."
+    },
+    {
+      "id": "M-01",
+      "severity": "Medium",
+      "contract": "Equity",
+      "function": "restructureCapTable",
+      "file": "contracts/Equity.sol",
+      "line": 309,
+      "bug_class": "loop-index-logic",
+      "in_class": false,
+      "summary": "Loop burns addressesToWipe[0] every iteration instead of addressesToWipe[i], so only the first address is wiped."
+    },
+    {
+      "id": "M-02",
+      "severity": "Medium",
+      "contract": "Position",
+      "function": "reduceLimitForClone",
+      "file": "contracts/Position.sol",
+      "line": 97,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "Cloning with _minimum equal to the remaining limit reduces the original position's limit to zero, denying the owner further minting."
+    },
+    {
+      "id": "M-03",
+      "severity": "Medium",
+      "contract": "Equity",
+      "function": "calculateSharesInternal",
+      "file": "contracts/Equity.sol",
+      "line": 268,
+      "bug_class": "share-inflation",
+      "in_class": true,
+      "summary": "Redeeming below the 1000e18 totalShares floor lets an attacker manipulate the share/asset ratio so later depositors get fewer shares (first-depositor / inflation class)."
+    },
+    {
+      "id": "M-04",
+      "severity": "Medium",
+      "contract": "Equity",
+      "function": "anchorTime",
+      "file": "contracts/Equity.sol",
+      "line": 173,
+      "bug_class": "block-number-as-time",
+      "in_class": true,
+      "summary": "Holding-duration vote-weight timing uses block.number, which ticks irregularly on L2s like Optimism, breaking the 90-day minimum holding gate."
+    },
+    {
+      "id": "M-05",
+      "severity": "Medium",
+      "contract": "Position",
+      "function": "deny",
+      "file": "contracts/Position.sol",
+      "line": 109,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "deny() sets cooldown = expiration, so the owner of a denied (never-started) position cannot withdraw collateral until the position expires."
+    },
+    {
+      "id": "M-06",
+      "severity": "Medium",
+      "contract": "MintingHub",
+      "function": "launchChallenge",
+      "file": "contracts/MintingHub.sol",
+      "line": 140,
+      "bug_class": "griefing-collusion",
+      "in_class": false,
+      "summary": "Colluding challenger+bidder repeatedly launch and avert minimal challenges to keep the position under the 1-day minting restriction, griefing the owner."
+    },
+    {
+      "id": "M-07",
+      "severity": "Medium",
+      "contract": "MintingHub",
+      "function": "end",
+      "file": "contracts/MintingHub.sol",
+      "line": 252,
+      "bug_class": "dos-on-revert",
+      "in_class": false,
+      "summary": "The serial ZCHF/collateral transfers in end() can revert (zero-amount transfer or blacklisted recipient), locking all challenge funds; needs a pull / postpone path."
+    },
+    {
+      "id": "M-08",
+      "severity": "Medium",
+      "contract": "Position",
+      "function": "initializeClone",
+      "file": "contracts/Position.sol",
+      "line": 80,
+      "bug_class": "rounding-direction",
+      "in_class": true,
+      "summary": "Clone price = _mint*1e18/_coll rounds down; the rounded-down price can fail the collateral invariant and revert valid clone mints (should round up)."
+    },
+    {
+      "id": "M-09",
+      "severity": "Medium",
+      "contract": "Position",
+      "function": "adjustPrice",
+      "file": "contracts/Position.sol",
+      "line": 163,
+      "bug_class": "rounding-direction",
+      "in_class": true,
+      "summary": "Rounding/precision loss in the collateral-vs-price check can make legitimate position adjustments revert."
+    },
+    {
+      "id": "M-10",
+      "severity": "Medium",
+      "contract": "Equity",
+      "function": "onTokenTransfer",
+      "file": "contracts/Equity.sol",
+      "line": 241,
+      "bug_class": "slippage",
+      "in_class": true,
+      "summary": "FPS mint (onTokenTransfer) and redeem provide no minimum-out / slippage bound, so users can be sandwiched on the bonding-curve price."
+    },
+    {
+      "id": "M-11",
+      "severity": "Medium",
+      "contract": "MintingHub",
+      "function": "bid",
+      "file": "contracts/MintingHub.sol",
+      "line": 199,
+      "bug_class": "frontrunning-ordering",
+      "in_class": false,
+      "summary": "A later challenger can bid on an earlier challenge to bump its end time, ordering their own challenge to settle first and claim the reward."
+    },
+    {
+      "id": "M-12",
+      "severity": "Medium",
+      "contract": "MintingHub",
+      "function": "end",
+      "file": "contracts/MintingHub.sol",
+      "line": 252,
+      "bug_class": "design-economic",
+      "in_class": false,
+      "summary": "Fixed challenge period ignores network congestion / volatility, so auctions can settle at unfair prices."
+    },
+    {
+      "id": "M-13",
+      "severity": "Medium",
+      "contract": "Frankencoin",
+      "function": "suggestMinter",
+      "file": "contracts/Frankencoin.sol",
+      "line": 83,
+      "bug_class": "lifecycle-role-revoke-gap",
+      "in_class": true,
+      "summary": "Once a minter passes its application period (isMinter true) there is no path to pause or remove it; denyMinter only works during the window."
+    },
+    {
+      "id": "M-14",
+      "severity": "Medium",
+      "contract": "PositionFactory",
+      "function": "createNewPosition",
+      "file": "contracts/PositionFactory.sol",
+      "line": 13,
+      "bug_class": "reorg-create",
+      "in_class": false,
+      "summary": "Factory creates positions without nonce/salt binding, so a chain reorg can let a position address be reused / re-pointed."
+    },
+    {
+      "id": "M-15",
+      "severity": "Medium",
+      "contract": "Frankencoin",
+      "function": "notifyLoss",
+      "file": "contracts/Frankencoin.sol",
+      "line": 280,
+      "bug_class": "frontrunning-ordering",
+      "in_class": false,
+      "summary": "notifyLoss can be frontrun by redeem, letting FPS holders exit before the loss is booked and dumping the loss on remaining holders."
+    }
+  ]
+}

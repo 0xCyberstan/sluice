@@ -1,0 +1,176 @@
+{
+  "name": "2023-06-stader",
+  "repo": "code-423n4/2023-06-stader",
+  "commit": "86c27eb6b1fb6e0928aaa906614a2d1c6e7543e3",
+  "local_path": "~/Data/bench/2023-06-stader",
+  "scope_dirs": ["contracts"],
+  "audit_url": "https://code4rena.com/reports/2023-06-stader-labs",
+  "note": "Several findings name multiple instances of the same bug across sibling contracts; the manifest pins the primary instance's contract/file/line. M-03's function is markValidatorReadyToDeposit (the report's markValidatorStatusAsReadyToDeposit is a paraphrase).",
+  "known_findings": [
+    {
+      "id": "H-01",
+      "severity": "High",
+      "contract": "VaultProxy",
+      "function": "initialise",
+      "file": "contracts/VaultProxy.sol",
+      "line": 20,
+      "bug_class": "unprotected-initializer",
+      "in_class": true,
+      "summary": "initialise() has no access control (only an isInitialized flag); an attacker can initialise a fresh proxy and, because the proxy delegatecalls the vault implementation, drive a selfdestruct."
+    },
+    {
+      "id": "M-01",
+      "severity": "Medium",
+      "contract": "StaderConfig",
+      "function": "updateAdmin",
+      "file": "contracts/StaderConfig.sol",
+      "line": 176,
+      "bug_class": "logic-role-revoke",
+      "in_class": false,
+      "summary": "updateAdmin revokes DEFAULT_ADMIN_ROLE then grants it; setting the same address loses admin access (protocol-specific role lifecycle)."
+    },
+    {
+      "id": "M-02",
+      "severity": "Medium",
+      "contract": "SocializingPool",
+      "function": "pause",
+      "file": "contracts/SocializingPool.sol",
+      "line": 17,
+      "bug_class": "missing-implementation",
+      "in_class": false,
+      "summary": "Several Pausable contracts (SocializingPool, StaderOracle, OperatorRewardsCollector, Auction) never expose pause()/unpause(), so pausing is impossible."
+    },
+    {
+      "id": "M-03",
+      "severity": "Medium",
+      "contract": "PermissionlessNodeRegistry",
+      "function": "markValidatorReadyToDeposit",
+      "file": "contracts/PermissionlessNodeRegistry.sol",
+      "line": 183,
+      "bug_class": "centralization",
+      "in_class": true,
+      "summary": "A single Stader OPERATOR unilaterally validates validators (markValidatorReadyToDeposit) with no appeal path — a centralization / single-point-of-failure on a privileged role."
+    },
+    {
+      "id": "M-04",
+      "severity": "Medium",
+      "contract": "PoolUtils",
+      "function": "updatePoolAddress",
+      "file": "contracts/PoolUtils.sol",
+      "line": 55,
+      "bug_class": "logic-conflicting-require",
+      "in_class": false,
+      "summary": "updatePoolAddress always reverts for an existing poolId due to mutually exclusive validation conditions."
+    },
+    {
+      "id": "M-05",
+      "severity": "Medium",
+      "contract": "StaderOracle",
+      "function": "submitExchangeRateData",
+      "file": "contracts/StaderOracle.sol",
+      "line": 107,
+      "bug_class": "consensus-quorum-logic",
+      "in_class": false,
+      "summary": "Consensus uses strict-equal submission counting vs a threshold that can never be met after trusted nodes are removed."
+    },
+    {
+      "id": "M-06",
+      "severity": "Medium",
+      "contract": "SDCollateral",
+      "function": "slashValidatorSD",
+      "file": "contracts/SDCollateral.sol",
+      "line": 78,
+      "bug_class": "accounting-error",
+      "in_class": false,
+      "summary": "slashValidatorSD slashes only poolThreshold.minThreshold rather than the actual penalty, under-slashing larger penalties."
+    },
+    {
+      "id": "M-07",
+      "severity": "Medium",
+      "contract": "Auction",
+      "function": "addBid",
+      "file": "contracts/Auction.sol",
+      "line": 62,
+      "bug_class": "design-pause-asymmetry",
+      "in_class": false,
+      "summary": "When Auction is paused, addBid is blocked but the lot still closes, letting a last-minute MEV bidder win all lots."
+    },
+    {
+      "id": "M-08",
+      "severity": "Medium",
+      "contract": "StaderOracle",
+      "function": "submitSDPrice",
+      "file": "contracts/StaderOracle.sol",
+      "line": 270,
+      "bug_class": "oracle-data-corruption",
+      "in_class": false,
+      "summary": "SD price median is built from submissions across different reporting blocks, corrupting the aggregated value (protocol-specific oracle aggregation logic)."
+    },
+    {
+      "id": "M-09",
+      "severity": "Medium",
+      "contract": "StaderStakePoolsManager",
+      "function": "depositETHOverTargetWeight",
+      "file": "contracts/StaderStakePoolsManager.sol",
+      "line": 215,
+      "bug_class": "accounting-state-advance",
+      "in_class": false,
+      "summary": "poolIdArrayIndexForExcessDeposit / lastExcessETHDepositBlock advance even when balance is insufficient, letting deposits be mis-routed."
+    },
+    {
+      "id": "M-10",
+      "severity": "Medium",
+      "contract": "VaultProxy",
+      "function": "initialise",
+      "file": "contracts/VaultProxy.sol",
+      "line": 35,
+      "bug_class": "logic-zero-owner",
+      "in_class": false,
+      "summary": "initialise sets owner = staderConfig.getAdmin(); if the admin mapping is unset, owner becomes address(0) (protocol-specific init dependency, distinct from the modeled missing-zero-check sink)."
+    },
+    {
+      "id": "M-11",
+      "severity": "Medium",
+      "contract": "ValidatorWithdrawalVault",
+      "function": "distributeRewards",
+      "file": "contracts/ValidatorWithdrawalVault.sol",
+      "line": 30,
+      "bug_class": "access-control",
+      "in_class": true,
+      "summary": "distributeRewards is permissionless and can be front-run to push a validator's balance below threshold, making it slashable."
+    },
+    {
+      "id": "M-12",
+      "severity": "Medium",
+      "contract": "ValidatorWithdrawalVault",
+      "function": "settleFunds",
+      "file": "contracts/ValidatorWithdrawalVault.sol",
+      "line": 54,
+      "bug_class": "accounting-error",
+      "in_class": false,
+      "summary": "settleFunds ignores the NodeELRewardVault balance when computing penalty coverage, over-charging the operator."
+    },
+    {
+      "id": "M-13",
+      "severity": "Medium",
+      "contract": "Auction",
+      "function": "createLot",
+      "file": "contracts/Auction.sol",
+      "line": 48,
+      "bug_class": "design-fixed-endblock",
+      "in_class": false,
+      "summary": "Fixed endBlock with no extension gives no incentive to bid early; only last-block MEV bids."
+    },
+    {
+      "id": "M-14",
+      "severity": "Medium",
+      "contract": "StaderOracle",
+      "function": "getPORFeedData",
+      "file": "contracts/StaderOracle.sol",
+      "line": 637,
+      "bug_class": "oracle-staleness",
+      "in_class": true,
+      "summary": "getPORFeedData uses latestRoundData() and discards updatedAt/answeredInRound, accepting stale/incorrect Proof-of-Reserve data."
+    }
+  ]
+}

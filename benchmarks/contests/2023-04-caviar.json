@@ -1,0 +1,77 @@
+{
+  "name": "2023-04-caviar",
+  "repo": "code-423n4/2023-04-caviar",
+  "commit": "5c87f7d69c6fac29eb253b5c7b2fb4a9f23f8750",
+  "local_path": "~/Data/bench/2023-04-caviar",
+  "scope_dirs": ["src"],
+  "audit_url": "https://code4rena.com/reports/2023-04-caviar",
+  "note": "Caviar Private Pools (NFT AMM). Representative High/Medium set grounded to the clone's source lines.",
+  "known_findings": [
+    {
+      "id": "H-royalty-per-item",
+      "severity": "High",
+      "contract": "PrivatePool",
+      "function": "buy",
+      "file": "src/PrivatePool.sol",
+      "line": 234,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "buy()/sell() compute the royalty using a single per-item sale price (salePrice = netAmount / tokenIds.length) even when NFTs have different weights, so royalties are mis-paid; with weighted NFTs an attacker can under/over-pay royalties (protocol-specific fee accounting)."
+    },
+    {
+      "id": "H-flashloan-fee",
+      "severity": "High",
+      "contract": "PrivatePool",
+      "function": "flashLoan",
+      "file": "src/PrivatePool.sol",
+      "line": 623,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "flashLoan pulls the ERC20 fee from msg.sender after the callback and only checks msg.value for the ETH case; the flashloaned NFT is removed from the pool's effective inventory for the duration, letting a borrower grief pricing / availability without proportional cost (protocol-specific fee/inventory accounting)."
+    },
+    {
+      "id": "M-execute-arbitrary-call",
+      "severity": "Medium",
+      "contract": "PrivatePool",
+      "function": "execute",
+      "file": "src/PrivatePool.sol",
+      "line": 459,
+      "bug_class": "access-control",
+      "in_class": true,
+      "summary": "execute() lets the owner make an arbitrary target.call{value:msg.value}(data); the owner can approve/transfer NFTs or tokens held by the pool (including users' flash-loaned or in-flight assets), an unrestricted privileged external-call sink."
+    },
+    {
+      "id": "M-setvirtualreserves-reprice",
+      "severity": "Medium",
+      "contract": "PrivatePool",
+      "function": "setVirtualReserves",
+      "file": "src/PrivatePool.sol",
+      "line": 538,
+      "bug_class": "centralization",
+      "in_class": true,
+      "summary": "setVirtualReserves lets the pool owner reprice the AMM at will with no bound or timelock, so the owner can front-run a pending buy/sell to extract value — an over-powerful privileged role (centralization)."
+    },
+    {
+      "id": "M-missing-deadline",
+      "severity": "Medium",
+      "contract": "PrivatePool",
+      "function": "change",
+      "file": "src/PrivatePool.sol",
+      "line": 385,
+      "bug_class": "missing-deadline",
+      "in_class": true,
+      "summary": "PrivatePool.buy/sell/change accept no deadline parameter (only the EthRouter wrappers do); a transaction can sit in the mempool and execute later at a stale price, with no user-supplied expiry to bound it."
+    },
+    {
+      "id": "M-ethrouter-royalty-recipient",
+      "severity": "Medium",
+      "contract": "EthRouter",
+      "function": "sell",
+      "file": "src/EthRouter.sol",
+      "line": 152,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "EthRouter royalty payment trusts the royalty recipient/amount returned for each NFT; a malicious NFT/registry can direct or inflate the royalty leg of a sell, a protocol-specific external-data accounting issue."
+    }
+  ]
+}

@@ -460,10 +460,26 @@ mod tests {
 
     #[test]
     fn out_of_class_has_no_compatible_categories() {
-        assert!(compatible_categories("accounting-invariant").is_empty());
+        // Economic/logic invariants the pattern set does not model still map to
+        // nothing (catchable only by the location-only ceiling).
         assert!(compatible_categories("economic-invariant").is_empty());
         // An unknown class also yields none (cannot silently match on class).
         assert!(compatible_categories("totally-made-up").is_empty());
+    }
+
+    #[test]
+    fn value_source_discipline_maps_precisely_no_spurious_channel() {
+        // PHASE B1: the LoopFi-H-01 class is now modeled by the invariant engine's
+        // value-source-discipline detector. The catch must score via the PRECISE
+        // `value-source-discipline` bug_class — it stays out-of-class for the tally
+        // (governed by the manifest `in_class` flag), so catching it moves
+        // *out-of-class* recall.
+        assert_eq!(compatible_categories("value-source-discipline"), &["ValueSourceDiscipline"]);
+        // Anti-spurious-channel: the coarse `accounting-invariant` label also tags
+        // two UNRELATED Tigris price/margin findings. It must NOT map to any modeled
+        // category, so a `ValueSourceDiscipline` emission landing near those Tigris
+        // lines cannot falsely score them as caught.
+        assert!(compatible_categories("accounting-invariant").is_empty());
     }
 
     #[test]

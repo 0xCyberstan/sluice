@@ -330,6 +330,15 @@ pub enum ValueSource {
     /// A price-like quantity: `balanceOf(pool)`, `getReserves`, `slot0`,
     /// `pricePerShare`, `get_virtual_price`, or `totalSupply` used as a divisor.
     PriceLike,
+    /// The contract's own live native/token balance: `address(this).balance`,
+    /// `this.balance`, or `balanceOf(address(this))`/`balanceOf(this)`. Unlike
+    /// [`ValueSource::PriceLike`] (an *external* pool spot that flash-loans can
+    /// move against the contract), this is the contract reading its *own* holdings
+    /// — but crediting a user a value derived from it (rather than from a tracked
+    /// accounting var) is the LoopFi-H-01 class: any unrelated inflow (a prior
+    /// balance, a second caller's funds, a forced send) is folded into one user's
+    /// credit. The `value-source-discipline` detector keys on this.
+    SelfBalance,
     /// `block.timestamp`, `block.number`, `block.prevrandao`, `blockhash`, etc.
     BlockEnv,
     /// Read from contract storage (a state variable).

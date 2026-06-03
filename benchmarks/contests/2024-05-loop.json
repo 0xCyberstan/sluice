@@ -13,7 +13,7 @@
       "function": "_claim",
       "file": "src/PrelaunchPoints.sol",
       "line": 262,
-      "bug_class": "accounting-invariant",
+      "bug_class": "value-source-discipline",
       "in_class": false,
       "summary": "_claim sets claimedAmount = address(this).balance after the swap, so any pre-existing ETH balance (or a second claimer's funds) is credited to one user, over-minting lpETH 1:1 against an inflated balance. Should track the swap's actual output, not the contract balance."
     },

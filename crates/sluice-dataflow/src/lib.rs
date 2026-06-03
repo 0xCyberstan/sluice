@@ -36,6 +36,7 @@ mod bits {
     pub const STORAGE: u16 = 1 << 7;
     pub const CONSTANT: u16 = 1 << 8;
     pub const UNKNOWN: u16 = 1 << 9;
+    pub const SELF_BALANCE: u16 = 1 << 10;
 }
 
 fn bit_of(s: ValueSource) -> u16 {
@@ -50,6 +51,7 @@ fn bit_of(s: ValueSource) -> u16 {
         ValueSource::StorageState => bits::STORAGE,
         ValueSource::Constant => bits::CONSTANT,
         ValueSource::Unknown => bits::UNKNOWN,
+        ValueSource::SelfBalance => bits::SELF_BALANCE,
     }
 }
 
@@ -86,6 +88,12 @@ impl ProvenanceSet {
     /// Derives from a manipulable spot-price source.
     pub fn is_price_like(self) -> bool {
         self.0 & bits::PRICE_LIKE != 0
+    }
+    /// Derives from a read of the contract's own live balance
+    /// (`address(this).balance` / `this.balance` / `balanceOf(address(this))`).
+    /// The `value-source-discipline` detector keys a caller-credit on this.
+    pub fn is_self_balance(self) -> bool {
+        self.0 & bits::SELF_BALANCE != 0
     }
     /// Flows from outside the contract's own trusted state.
     pub fn is_externally_influenced(self) -> bool {
@@ -257,6 +265,28 @@ fn is_this_or_sender(e: &Expr) -> bool {
     }
 }
 
+/// True if `c` is a `balanceOf(...)` whose first argument is `address(this)` /
+/// `this` (the contract's OWN balance) — but NOT `msg.sender`. This is the
+/// stricter sibling of [`balance_of_self_or_sender`]: it must be the contract's
+/// own holdings, so a `balanceOf(msg.sender)` (the caller's balance) is excluded.
+fn balance_of_self(c: &Call) -> bool {
+    let Some(arg) = c.args.first() else { return false };
+    is_self_address(arg)
+}
+
+/// True if `e` is `address(this)` (a `TypeCast` of `this`) or the bare `this`.
+/// Used to recognize `address(this).balance` and `balanceOf(address(this))`.
+fn is_self_address(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => n == "this",
+        // `address(this)` / `payable(this)` — a TypeCast over `this`.
+        ExprKind::Call(inner) if inner.kind == CallKind::TypeCast => {
+            inner.args.iter().any(is_self_address)
+        }
+        _ => false,
+    }
+}
+
 // ------------------------------------------------------------------ internals
 
 fn build_flow(scir: &Scir, f: &Function, facts: &DataflowFacts) -> FnFlow {
@@ -343,6 +373,15 @@ fn eval(facts: &DataflowFacts, scir: &Scir, fid: FunctionId, flow: &FnFlow, e: &
             }
         }
         ExprKind::Member { base, member } => {
+            // `address(this).balance` / `this.balance` — the contract reading its
+            // own live native balance. Labelled SelfBalance so the
+            // value-source-discipline detector can tell a self-balance-derived
+            // credit from a tracked-accounting-var credit. (The base here is a
+            // `TypeCast`/`this`, not a bare `Ident`, so this must precede the
+            // identifier-base match below.)
+            if member == "balance" && is_self_address(base) {
+                return ProvenanceSet::of(ValueSource::SelfBalance);
+            }
             if let ExprKind::Ident(b) = &base.kind {
                 match (b.as_str(), member.as_str()) {
                     ("msg", "sender") => return ProvenanceSet::of(ValueSource::MsgSender),
@@ -398,6 +437,16 @@ fn eval_call(facts: &DataflowFacts, scir: &Scir, fid: FunctionId, flow: &FnFlow,
     // Spot-price reads.
     if is_spot_price_call(c) {
         return ProvenanceSet::of(ValueSource::PriceLike).with(ValueSource::ExternalReturn);
+    }
+    // `balanceOf(address(this))` / `balanceOf(this)` — the contract reading its
+    // OWN token holdings. `is_spot_price_call` deliberately excludes this (it is
+    // not a manipulable pool spot), so without this arm the read fell through to
+    // a generic `ExternalReturn` and the self-balance provenance was dropped.
+    // Label it SelfBalance (it is still an external read, so keep ExternalReturn)
+    // — the value-source-discipline detector needs this. NOTE: `balanceOf(msg.
+    // sender)` is the CALLER's balance, not the contract's own, so it is excluded.
+    if c.func_name.as_deref() == Some("balanceOf") && balance_of_self(c) {
+        return ProvenanceSet::of(ValueSource::SelfBalance).with(ValueSource::ExternalReturn);
     }
     match c.kind {
         CallKind::External | CallKind::LowLevelCall | CallKind::StaticCall => {

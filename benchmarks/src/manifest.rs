@@ -122,7 +122,18 @@ pub fn compatible_categories(bug_class: &str) -> &'static [&'static str] {
         "access-control" | "missing-access-control" => {
             &["AccessControl", "UnprotectedInitializer", "TxOriginAuth", "Centralization", "ArbitraryTransfer"]
         }
+        // Single over-powerful operator / governance SPOF: the modeled
+        // `Centralization` detector, with `AccessControl` as the sibling an
+        // over-broad privileged role is also commonly emitted under.
+        "centralization" => &["Centralization", "AccessControl"],
         "unprotected-initializer" => &["UnprotectedInitializer", "AccessControl", "UninitializedProxy"],
+        // A privileged role/minter that, once granted, has no pause/revoke path:
+        // the modeled `LifecycleRoleRevokeGap` detector (with `AccessControl` as
+        // the sibling access-control-shaped catch).
+        "lifecycle-role-revoke-gap" => &["LifecycleRoleRevokeGap", "AccessControl"],
+        // A token with a second legitimate entrypoint (proxy / legacy address)
+        // bypassing a `token == address(collateral)` style check.
+        "double-entry-token" => &["DoubleEntryToken", "ArbitraryTransfer", "UnsafeErc20"],
         "unchecked-return" => &["UncheckedReturn", "UnsafeErc20"],
         "unsafe-erc20" => &["UnsafeErc20", "UncheckedReturn", "FeeOnTransfer"],
         "fee-on-transfer" => &["FeeOnTransfer", "UnsafeErc20"],
@@ -136,18 +147,53 @@ pub fn compatible_categories(bug_class: &str) -> &'static [&'static str] {
         "unbounded-loop" => &["UnboundedLoop", "DenialOfService"],
         "weak-randomness" => &["WeakRandomness"],
         "timestamp" | "timestamp-dependence" => &["TimestampDependence", "BlockNumberTime"],
+        // Using block.number as a proxy for elapsed wall-clock time (irregular
+        // across chains / L2 sequencers): the modeled `BlockNumberTime` detector.
+        "block-number-as-time" => &["BlockNumberTime", "TimestampDependence"],
         "flashloan-governance" => &["FlashLoanGovernance", "GovernanceTimelock"],
         "delegatecall" => &["DelegatecallStorage", "UninitializedProxy", "SelectorCollision"],
         "bridge-verification" => &["BridgeVerification", "UntrustedCallTarget"],
         "missing-solvency-check" => &["MissingSolvencyCheck"],
+        // Crediting a caller from a live raw-balance read (`address(this).balance`)
+        // instead of a tracked accounting var — the invariant-engine class (PHASE
+        // B1, LoopFi H-01). Mapped to the modeled `ValueSourceDiscipline` detector
+        // so the catch scores as recall. NOTE: orthogonal to the per-finding
+        // `in_class` flag — H-01 stays `in_class: false` (a protocol-specific
+        // accounting invariant in the taxonomy), so catching it moves *out-of-class*
+        // recall. Kept distinct from the coarse `accounting-invariant` label (which
+        // also tags two unrelated Tigris price/margin findings) so this detector
+        // cannot spuriously "catch" those.
+        "value-source-discipline" => &["ValueSourceDiscipline"],
         // ---- out-of-class (protocol-specific): no modeled category ----
         // accounting / economic / logic invariants the pattern set does not model.
+        // Listed explicitly (rather than only via the `_` arm) so the corpus's
+        // out-of-class labels are documented and a typo'd in-class key can't slip
+        // through silently.
         "accounting-invariant"
+        | "accounting-logic"
+        | "accounting-error"
+        | "accounting-state-advance"
         | "economic-invariant"
         | "economic-reward-accounting"
+        | "economic-fee-accounting"
+        | "design-economic"
+        | "design-pause-asymmetry"
+        | "design-fixed-endblock"
+        | "dos-on-revert"
+        | "frontrunning-deleverage"
+        | "frontrunning-ordering"
+        | "griefing-collusion"
+        | "loop-index-logic"
+        | "reorg-create"
+        | "consensus-quorum-logic"
+        | "oracle-data-corruption"
+        | "missing-implementation"
         | "logic"
         | "logic-allowlist"
         | "logic-calldata-validation"
+        | "logic-role-revoke"
+        | "logic-conflicting-require"
+        | "logic-zero-owner"
         | "invariant" => &[],
         // Unknown class: treat as out-of-class (empty), so it cannot silently
         // match on class — only the location-only fallback can catch it.
