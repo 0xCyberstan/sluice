@@ -178,6 +178,10 @@ pub enum Category {
     ShadowedStateVar,
     EncodePackedCollision,
     LockedEther,
+    // ---- Round 23: Uniswap v4 hook / flash-accounting classes ----
+    V4CallbackMissingPoolManagerAuth,
+    HookReturnDeltaPermissionGap,
+    HookPermissionBodyBitmapMismatch,
     Other,
 }
 
@@ -319,6 +323,9 @@ impl Category {
             ShadowedStateVar => "shadowed-state-var",
             EncodePackedCollision => "encodepacked-collision",
             LockedEther => "locked-ether",
+            V4CallbackMissingPoolManagerAuth => "v4-callback-missing-pool-manager-auth",
+            HookReturnDeltaPermissionGap => "hook-return-delta-permission-gap",
+            HookPermissionBodyBitmapMismatch => "hook-permission-body-bitmap-mismatch",
             Other => "other",
         }
     }
@@ -442,6 +449,9 @@ impl Category {
             ShadowedStateVar => &["SWC-119", "CWE-710"],
             EncodePackedCollision => &["SWC-133", "CWE-694"],
             LockedEther => &["CWE-664"],
+            V4CallbackMissingPoolManagerAuth => &["CWE-862", "CWE-284"],
+            HookReturnDeltaPermissionGap => &["CWE-682", "CWE-840"],
+            HookPermissionBodyBitmapMismatch => &["CWE-684"],
             _ => &[],
         }
     }
