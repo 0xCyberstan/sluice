@@ -5,7 +5,7 @@ use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::detectors::visit_calls;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{CallKind, Expr, ExprKind, Function, StmtKind};
+use sluice_ir::{CallKind, Contract, ContractId, Expr, ExprKind, Function, StmtKind};
 use std::collections::HashSet;
 
 pub struct UpgradeableDetector;
@@ -41,8 +41,10 @@ impl Detector for UpgradeableDetector {
                 })
                 .unwrap_or_default();
             // Does this function look like eth_call-only simulation dev-tooling:
-            // the only non-call top-level statement is an unconditional revert?
-            let simulation_shape = is_simulation_revert_shape(f);
+            // the only non-call top-level statement is an unconditional revert
+            // (including an `assembly { revert(...) }` bubble-up — the
+            // `StaticDelegateCallable.staticDelegateCall` shape)?
+            let simulation_shape = is_simulation_revert_shape(cx, f);
 
             visit_calls(f, |c, span| {
                 if c.kind != CallKind::DelegateCall {
@@ -171,17 +173,14 @@ impl Detector for UpgradeableDetector {
             if !upgradeable || !has_initializer {
                 continue;
             }
-            let ctor = cx.scir.functions_of(c.id).find(|f| f.is_constructor());
-            // The implementation is locked if the constructor calls
-            // `_disableInitializers()` OR carries the `initializer` modifier
-            // (`constructor() initializer {}` — an equally valid, common idiom).
-            let disables = ctor
-                .map(|f| {
-                    cx.source_text(f.span).contains("_disableinitializers")
-                        || cx.is_initializer(f)
-                        || f.has_modifier_like("initializer")
-                })
-                .unwrap_or(false);
+            // The implementation is locked if a constructor *anywhere in the
+            // inheritance chain* calls `_disableInitializers()` OR carries the
+            // `initializer` modifier (`constructor() initializer {}` — an equally
+            // valid, common idiom). Symbiotic's `BaseDelegator`/`Vault` declare no
+            // `_disableInitializers()` of their own but extend `Entity` /
+            // `MigratableEntity`, whose constructors DO call it — so a
+            // direct-constructor-only check false-positives on the whole family.
+            let disables = chain_disables_initializers(cx, c);
             if !disables {
                 let span = c.span;
                 let b = FindingBuilder::new(self.id(), Category::UninitializedProxy)
@@ -201,6 +200,46 @@ impl Detector for UpgradeableDetector {
         }
         out
     }
+}
+
+// --------------------------------------------------- inheritance-chain helpers
+
+/// True if a constructor *anywhere in `c`'s inheritance chain* (`c` itself plus
+/// the transitive closure of its declared base contracts, resolved by name)
+/// locks the implementation — by calling `_disableInitializers()` or by carrying
+/// an `initializer`/`reinitializer` modifier on the constructor.
+///
+/// Walking the chain (not just `c`'s own constructor) is what clears the
+/// Symbiotic `BaseDelegator`/`Vault`/`BaseSlasher`/`VaultTokenized` family: each
+/// derived constructor delegates to a base (`Entity` / `MigratableEntity`) whose
+/// constructor calls `_disableInitializers()`. A base init call always runs
+/// before the derived body, so the implementation IS locked.
+fn chain_disables_initializers(cx: &AnalysisContext, c: &Contract) -> bool {
+    let mut seen: HashSet<ContractId> = HashSet::new();
+    let mut frontier: Vec<ContractId> = vec![c.id];
+    while let Some(cid) = frontier.pop() {
+        if !seen.insert(cid) {
+            continue;
+        }
+        let Some(cur) = cx.scir.contract(cid) else { continue };
+        if let Some(ctor) = cx.scir.functions_of(cid).find(|f| f.is_constructor()) {
+            if cx.source_text(ctor.span).contains("_disableinitializers")
+                || cx.is_initializer(ctor)
+                || ctor.has_modifier_like("initializer")
+            {
+                return true;
+            }
+        }
+        // Resolve each declared base name to its (last-declared) contract.
+        for base in &cur.bases {
+            if let Some(bid) = cx.scir.contract_by_name.get(base) {
+                if !seen.contains(bid) {
+                    frontier.push(*bid);
+                }
+            }
+        }
+    }
+    false
 }
 
 // --------------------------------------------------------------- self-call helpers
@@ -233,7 +272,16 @@ fn is_self_target(recv: &Expr) -> bool {
 /// non-call statement is an unconditional revert. This distinguishes a
 /// `simulate(target, data){ target.delegatecall(data); revert(...); }` dev helper
 /// from a genuine committing `exec(target, data){ target.delegatecall(data); }`.
-fn is_simulation_revert_shape(f: &Function) -> bool {
+///
+/// The mandatory revert may be expressed three ways, all recognized here:
+///   * a `revert Error(...)` statement,
+///   * a bare `revert(...)` builtin call expression, or
+///   * an `assembly { revert(add(32, p), mload(p)) }` bubble-up block — the
+///     `StaticDelegateCallable.staticDelegateCall` pattern. A Yul block whose
+///     only terminator is `return(...)` is NOT a revert (it commits and returns),
+///     so we check the assembly source for `revert(` specifically rather than
+///     trusting the generic `has_terminator` flag.
+fn is_simulation_revert_shape(cx: &AnalysisContext, f: &Function) -> bool {
     let mut has_uncond_revert = false;
     for s in &f.body {
         match &s.kind {
@@ -241,7 +289,20 @@ fn is_simulation_revert_shape(f: &Function) -> bool {
             // bare `revert(...)` builtin call expression at the top level.
             StmtKind::Revert { .. } => has_uncond_revert = true,
             StmtKind::Expr(e) if is_revert_call(e) => has_uncond_revert = true,
-            // Pure plumbing around the delegatecall is fine.
+            // A Yul `assembly { revert(...) }` bubble-up is a mandatory revert iff
+            // its terminator is a `revert` (not a committing `return`).
+            StmtKind::Assembly { has_terminator: true, .. } => {
+                let asm = cx.source_text(s.span);
+                if asm.contains("revert(") || asm.contains("selfdestruct(") {
+                    has_uncond_revert = true;
+                } else {
+                    // A top-level `return(...)`/other Yul terminator commits — this
+                    // is not the always-reverts simulation shape.
+                    return false;
+                }
+            }
+            // Pure plumbing around the delegatecall is fine (incl. an assembly
+            // block that merely reads/writes scratch without a terminator).
             StmtKind::Expr(_) | StmtKind::VarDecl { .. } | StmtKind::Block { .. } => {}
             StmtKind::Assembly { .. } => {}
             // Anything that can commit state or branch around the revert
@@ -493,6 +554,145 @@ mod tests {
             us.iter().any(|f| f.title == "delegatecall to a non-constant target"
                 && f.severity == Severity::Critical),
             "a returning (committing) caller-target delegatecall must stay Critical: {us:#?}"
+        );
+    }
+
+    // --- (D) Fix 2a: ancestor `_disableInitializers()`. A derived upgradeable
+    //     contract whose OWN constructor omits `_disableInitializers()` but whose
+    //     base constructor calls it is locked — must NOT raise the
+    //     "uninitialized implementation" finding. (Symbiotic
+    //     `BaseDelegator`→`Entity`, `Vault`→`MigratableEntity`.) ---
+    const ANCESTOR_DISABLES: &str = r#"
+        abstract contract Initializable {
+            function _disableInitializers() internal {}
+        }
+        abstract contract Entity is Initializable {
+            address public immutable FACTORY;
+            constructor(address factory) {
+                _disableInitializers();
+                FACTORY = factory;
+            }
+            function initialize(bytes calldata data) external {}
+        }
+        contract BaseDelegator is Entity {
+            address public immutable NETWORK_REGISTRY;
+            constructor(address networkRegistry, address delegatorFactory) Entity(delegatorFactory) {
+                NETWORK_REGISTRY = networkRegistry;
+            }
+        }
+    "#;
+
+    // Two levels deep: derived -> Vault -> MigratableEntity (which disables).
+    const ANCESTOR_DISABLES_TWO_LEVELS: &str = r#"
+        abstract contract Initializable {
+            function _disableInitializers() internal {}
+        }
+        abstract contract MigratableEntity is Initializable {
+            constructor(address factory) { _disableInitializers(); }
+            function initialize(bytes calldata data) external {}
+        }
+        contract Vault is MigratableEntity {
+            constructor(address f) MigratableEntity(f) {}
+        }
+        contract VaultTokenized is Vault {
+            constructor(address f) Vault(f) {}
+        }
+    "#;
+
+    #[test]
+    fn silent_on_ancestor_disableinit() {
+        for (src, label) in [(ANCESTOR_DISABLES, "BaseDelegator/Entity"), (ANCESTOR_DISABLES_TWO_LEVELS, "VaultTokenized/MigratableEntity")] {
+            let fs = run(src);
+            let us = upg(&fs);
+            assert!(
+                !us.iter().any(|f| f.title.contains("uninitialized")),
+                "{label}: an ancestor-constructor `_disableInitializers()` must suppress the uninitialized-impl finding: {us:#?}"
+            );
+        }
+    }
+
+    // Retained TP: NO constructor anywhere in the chain disables initializers, so
+    // the implementation can be initialized by anyone. (Pendle `AddressProvider`
+    // has no ctor at all; `PendlePrincipalToken`'s ctor + bases never disable.) ---
+    const NO_DISABLE_IN_CHAIN: &str = r#"
+        abstract contract Initializable {
+            function _disableInitializers() internal {}
+        }
+        abstract contract BoringOwnableUpgradeableV2 is Initializable {
+            address public owner;
+            function __BoringOwnableV2_init(address o) internal { owner = o; }
+        }
+        contract AddressProvider is BoringOwnableUpgradeableV2 {
+            mapping(uint256 => address) public get;
+            function initialize(address _owner) external { __BoringOwnableV2_init(_owner); }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_no_disableinit_in_chain() {
+        let fs = run(NO_DISABLE_IN_CHAIN);
+        let us = upg(&fs);
+        assert!(
+            us.iter().any(|f| f.title.contains("uninitialized")),
+            "an upgradeable impl whose whole chain omits `_disableInitializers()` must still fire: {us:#?}"
+        );
+    }
+
+    // --- (E) Fix 2b: an `assembly { revert(...) }` bubble-up after a
+    //     caller-supplied delegatecall is the eth_call simulation shape
+    //     (`StaticDelegateCallable.staticDelegateCall`). It must be capped below
+    //     Critical, NOT raised as the Critical foreign-target takeover. ---
+    const STATIC_DELEGATE_CALL: &str = r#"
+        abstract contract StaticDelegateCallable {
+            function staticDelegateCall(address target, bytes calldata data) external {
+                (bool success, bytes memory returndata) = target.delegatecall(data);
+                bytes memory revertData = abi.encode(success, returndata);
+                assembly {
+                    revert(add(32, revertData), mload(revertData))
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_simulation_staticdelegate() {
+        let fs = run(STATIC_DELEGATE_CALL);
+        let us = upg(&fs);
+        // It still fires (correct to flag a controllable-target delegatecall)...
+        assert!(!us.is_empty(), "staticDelegateCall should still be flagged");
+        // ...but the mandatory assembly-revert caps it below Critical.
+        assert!(
+            us.iter().all(|f| f.severity < Severity::Critical),
+            "an assembly-revert simulation hook must be capped below Critical: {us:#?}"
+        );
+        // And it carries the simulate/revert wording, not the foreign-target one.
+        assert!(
+            us.iter().any(|f| f.title.contains("simulate/revert")),
+            "expected the simulate/revert-helper finding for the assembly-revert hook: {us:#?}"
+        );
+    }
+
+    // Guard: a near-twin whose assembly block `return(...)`s (commits) instead of
+    // reverting must NOT be downgraded — it stays the Critical foreign-target.
+    const ASM_RETURN_COMMITS: &str = r#"
+        contract Exec {
+            function run(address target, bytes calldata data) external {
+                (bool ok, bytes memory r) = target.delegatecall(data);
+                assembly {
+                    return(add(32, r), mload(r))
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn asm_return_commit_stays_critical() {
+        let fs = run(ASM_RETURN_COMMITS);
+        let us = upg(&fs);
+        assert!(
+            us.iter().any(|f| f.title == "delegatecall to a non-constant target"
+                && f.severity == Severity::Critical),
+            "an assembly `return` (committing) caller-target delegatecall must stay Critical: {us:#?}"
         );
     }
 }

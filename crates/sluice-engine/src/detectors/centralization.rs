@@ -29,12 +29,15 @@
 //!     setter (`set*Fee` / `setRouter` / `migrate`) that also moves funds is the
 //!     more serious configuration-reroute case → **Medium**; a plain steerable
 //!     fund mover → **Low**.
-//!   * **Info — preset-destination fund mover** — a body that *does* move funds
-//!     but only to a **fixed / preset / internal** destination (a state var, a
-//!     constant, a per-`id` mapping entry, or a bare `approve` to a fixed
+//!   * **Suppressed — preset-destination fund mover** — a body that *does* move
+//!     funds but only to a **fixed / preset / internal** destination (a state
+//!     var, a constant, a per-`id` mapping entry, or a bare `approve` to a fixed
 //!     spender) and is not a routing setter. It moves protocol funds along a
 //!     hard-wired path rather than re-routing *user* funds to an attacker-chosen
-//!     address, so it is informational, not a rug.
+//!     address — not an admin-can-rug risk. This was previously an Info note but
+//!     is **pure noise** (the destination is hard-wired, so there is nothing for
+//!     an admin to steer), so the sub-class is now suppressed entirely; the class
+//!     reserves its output for the steerable-reroute tiers (Low/Medium/High).
 //!   * **Info — token-rescue** — `recover*` / `sweep*` / `rescue*` that sends to a
 //!     **fixed / immutable / preset** recipient: a token-rescue, not a rug.
 //!   * **Soft — "Privileged parameter setter (no timelock)"** at Info — a
@@ -99,7 +102,6 @@ pub struct CentralizationDetector;
 const STRONG_TITLE: &str = "Privileged admin can move/re-route user funds with no timelock";
 const SOFT_TITLE: &str = "Privileged parameter setter (no timelock)";
 const RESCUE_TITLE: &str = "Privileged token-rescue to a fixed recipient";
-const FIXED_DEST_TITLE: &str = "Privileged admin moves protocol funds to a preset destination";
 
 impl Detector for CentralizationDetector {
     fn id(&self) -> &'static str {
@@ -293,15 +295,15 @@ impl Detector for CentralizationDetector {
                 // internal** destination (a state var, a constant, a per-`id`
                 // mapping entry, or a bare `approve` to a fixed spender). This
                 // routes protocol funds along a hard-wired path rather than
-                // re-routing user funds to an attacker-chosen address — a trust
-                // note, not a rug → Info.
-                out.push(self.finding(
-                    cx,
-                    f,
-                    FIXED_DEST_TITLE,
-                    Severity::Info,
-                    fixed_dest_msg(&contract.name, &f.name),
-                ));
+                // re-routing user funds to an attacker-chosen address — the
+                // detector's own message classed it "a preset destination — not an
+                // admin-can-rug risk — informational". That preset-destination Info
+                // sub-class is pure noise (it flags a hard-wired internal flow, not
+                // a discretionary admin who can rug), so it is **suppressed
+                // entirely**: this class now reserves its output for the
+                // steerable-reroute tiers (Low/Medium/High). The kept tiers above
+                // (caller-chosen move, steerable mint/burn, recipient-address
+                // re-point, routing-setter-that-moves-funds) are unaffected.
                 continue;
             }
 
@@ -391,19 +393,9 @@ fn soft_msg(contract: &str, func: &str) -> String {
     )
 }
 
-fn fixed_dest_msg(contract: &str, func: &str) -> String {
-    format!(
-        "`{}.{}` is an access-controlled function that moves funds (a token transfer / ETH \
-         send / approve) only to a fixed, preset, or internal destination — a state variable, a \
-         constant, a per-id mapping entry, or an `approve` to a fixed spender — not to a \
-         caller-chosen address, and it neither mints/burns supply nor re-points a \
-         recipient/treasury address. It routes protocol funds along a hard-wired path rather \
-         than re-routing user funds to an attacker-chosen destination, so it is informational \
-         rather than an admin-can-rug risk — but note the contract has no timelock, so verify \
-         the preset destination is the intended one.",
-        contract, func
-    )
-}
+// (The former `fixed_dest_msg` / FIXED_DEST_TITLE preset-destination Info
+// sub-class was removed: that tier is now suppressed entirely — see the
+// fund-flow arm in `run`.)
 
 // ----------------------------------------------------------------- helpers
 
@@ -1811,7 +1803,9 @@ mod tests {
     // Preset-destination fund mover: an `onlyOwner` transfer whose destination is
     // a fixed *state variable* (not a caller-chosen param), with no mint/burn and
     // no recipient-address re-point. It moves protocol funds along a hard-wired
-    // path → Info (the FIXED_DEST tier), never Low+.
+    // path — the former FIXED_DEST Info sub-class, now SUPPRESSED ENTIRELY (Fix 2:
+    // the "preset destination — not an admin-can-rug risk — informational" tier is
+    // pure noise; the destination is hard-wired so there is nothing to steer).
     const PRESET_DEST_MOVER: &str = r#"
         pragma solidity ^0.8.0;
         interface IERC20 { function safeTransfer(address to, uint256 a) external; }
@@ -1827,19 +1821,78 @@ mod tests {
         }
     "#;
 
+    // Fix 2 — the preset-destination fund-mover sub-class is now silent.
     #[test]
-    fn preset_destination_mover_is_info() {
+    fn preset_destination_mover_is_silent() {
         let fs = run(PRESET_DEST_MOVER);
         let c = central(&fs);
-        assert!(!c.is_empty(), "a preset-destination fund mover should still be reported");
         assert!(
-            c.iter().all(|f| f.severity == Severity::Info),
-            "a fund move only to a fixed/preset destination must be Info, not Low+: {:?}",
+            c.is_empty(),
+            "preset-destination fund mover (FIXED_DEST sub-class) must be suppressed entirely: {:?}",
             c
         );
+    }
+
+    // A second preset-destination shape: an `approve` to a fixed (state-var)
+    // spender under an admin guard. No caller-chosen dest, no mint/burn, no
+    // recipient re-point → was the FIXED_DEST Info tier → now silent.
+    const PRESET_APPROVE_FIXED_SPENDER: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IERC20 { function approve(address s, uint256 a) external returns (bool); }
+        contract Pool {
+            address public owner;
+            address public router;
+            IERC20 public token;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            // approves a FIXED, preset router (state var) — hard-wired path
+            function reapprove(uint256 a) external onlyOwner {
+                token.approve(router, a);
+            }
+        }
+    "#;
+
+    #[test]
+    fn preset_approve_fixed_spender_is_silent() {
+        let fs = run(PRESET_APPROVE_FIXED_SPENDER);
+        let c = central(&fs);
         assert!(
-            c.iter().all(|f| !f.title.contains("move/re-route user funds")),
-            "preset-destination mover must not carry the strong rug title: {:?}",
+            c.is_empty(),
+            "approve to a fixed/preset spender (FIXED_DEST sub-class) must be suppressed: {:?}",
+            c
+        );
+    }
+
+    // Over-suppression guard for Fix 2: suppressing the FIXED_DEST Info tier must
+    // NOT silence the steerable tiers. The exact-task Medium shape — a
+    // routing-shaped setter (`setFeeReceiver`) that *also* moves funds (a transfer
+    // to a fixed dest) — must STILL fire Medium with the strong title (the
+    // `StakedPendle.setFeeReceiver` / `BackingEigen.mint`-class output is reserved
+    // here). Without the routing-setter name this body would have been FIXED_DEST.
+    const ROUTING_SETTER_MOVES_TO_FIXED_DEST: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IERC20 { function safeTransfer(address to, uint256 a) external; }
+        contract Fees {
+            address public owner;
+            address public feeReceiver;
+            IERC20 public token;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            // routing-shaped name + a real fund move (to a fixed dest) => Medium,
+            // strong title — NOT the suppressed FIXED_DEST tier.
+            function setFeeReceiver() external onlyOwner {
+                token.safeTransfer(feeReceiver, 1);
+            }
+        }
+    "#;
+
+    #[test]
+    fn routing_setter_that_moves_funds_still_fires_medium() {
+        let fs = run(ROUTING_SETTER_MOVES_TO_FIXED_DEST);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.severity == Severity::Medium
+                && f.title.contains("move/re-route user funds")),
+            "a routing-shaped setter that moves funds must still fire Medium (not be \
+             swallowed by the FIXED_DEST suppression): {:?}",
             c
         );
     }

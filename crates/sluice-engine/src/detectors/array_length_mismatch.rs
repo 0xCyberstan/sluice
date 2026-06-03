@@ -23,8 +23,18 @@
 //! a `LengthMismatch` revert.
 //!
 //! ## False-positive suppression (precision first)
-//!   * Suppress when the source contains a `.length ==` / `.length !=` comparison
-//!     or a `LengthMismatch`-style custom error/revert — the guard is present.
+//!   * Suppress when **two or more array params are never co-indexed inside the
+//!     *same* loop body** — arrays iterated in *separate, independent* loops
+//!     (each loop touches only one array) cannot mismatch against each other.
+//!     This is the `redeemDueInterestAndRewards(sys, yts, markets)` shape: three
+//!     standalone `for` loops, no shared iteration.
+//!   * Suppress when the function body carries a length-equality guard covering
+//!     every co-indexed pair, scanning the **whole body** (not just the loop
+//!     header). The guard may be written directly (`require(a.length ==
+//!     b.length)`, `if (a.length != b.length) revert`) OR through a
+//!     *length-alias* local (`uint256 len = a.length; require(len == b.length)`,
+//!     the `LimitRouterBase.setLnFeeRateRoots` shape). A `LengthMismatch`-style
+//!     custom error/revert is also treated as a guard.
 //!   * Suppress when only one array parameter is actually indexed in a loop
 //!     (single-array iteration cannot mismatch).
 //!
@@ -35,8 +45,8 @@
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{ExprKind, Function, Span, Stmt, StmtKind};
-use std::collections::HashSet;
+use sluice_ir::{BinOp, Builtin, CallKind, Expr, ExprKind, Function, Span, Stmt, StmtKind};
+use std::collections::{HashMap, HashSet};
 
 pub struct ArrayLengthMismatchDetector;
 
@@ -75,16 +85,30 @@ impl Detector for ArrayLengthMismatchDetector {
                 continue;
             }
 
-            // (2) The function must loop and co-index two or more of those array
-            //     parameters within the loop body.
-            let indexed = indexed_array_params_in_loops(f, &array_params);
-            if indexed.len() < 2 {
+            // (2) The function must contain at least one loop whose body
+            //     co-indexes two or more of those array parameters *together*.
+            //     Arrays iterated in SEPARATE, independent loops (each loop body
+            //     subscripting only one array) share no iteration index and cannot
+            //     mismatch against one another — this is the `redeemDueInterest…`
+            //     three-independent-loops shape, which we do NOT flag.
+            let coindexed_groups = coindexed_groups_per_loop(f, &array_params);
+            let Some(indexed) = coindexed_groups
+                .iter()
+                .max_by_key(|g| g.len())
+                .filter(|g| g.len() >= 2)
+            else {
                 continue;
-            }
+            };
 
             // (3) FP suppression: a length-equality guard (or a LengthMismatch
-            //     revert) is present in the source.
-            if source_requires_equal_lengths(&cx.source_text(f.span)) {
+            //     revert) is present *anywhere in the body* covering every
+            //     co-indexed pair. We scan the whole function — not just the loop
+            //     header — and resolve length-alias locals (`len = a.length`) so a
+            //     `require(len == b.length)` three lines above the loop still
+            //     counts (the `LimitRouterBase.setLnFeeRateRoots` shape).
+            if source_requires_equal_lengths(&cx.source_text(f.span))
+                || coindexed_group_is_length_guarded(f, indexed)
+            {
                 continue;
             }
 
@@ -123,14 +147,18 @@ impl Detector for ArrayLengthMismatchDetector {
 
 // ------------------------------------------------------------------- helpers
 
-/// The set of array-parameter names that are subscripted (`param[expr]`) inside
-/// at least one loop body. Only names present in `array_params` are counted, and
-/// indexing must occur *within a loop* (a one-off `a[0]` outside a loop is not
-/// the co-iteration pattern we target).
-fn indexed_array_params_in_loops<'a>(f: &'a Function, array_params: &HashSet<&'a str>) -> HashSet<&'a str> {
-    let mut found: HashSet<&'a str> = HashSet::new();
+/// For every loop body reachable in `f`, the set of array-parameter names
+/// subscripted (`param[expr]`) *within that loop body*. One entry per loop. Only
+/// names in `array_params` are counted. A loop whose body subscripts two or more
+/// distinct array params is a genuine parallel-array (co-indexed) iteration; a
+/// loop touching a single array, or arrays spread across *separate* loops, is
+/// not. (Indexing must occur within a loop — a one-off `a[0]` outside a loop is
+/// not the co-iteration pattern we target.)
+fn coindexed_groups_per_loop<'a>(f: &'a Function, array_params: &HashSet<&'a str>) -> Vec<HashSet<&'a str>> {
+    let mut groups: Vec<HashSet<&'a str>> = Vec::new();
     for s in &f.body {
         visit_loops(s, &mut |loop_body| {
+            let mut found: HashSet<&'a str> = HashSet::new();
             for ls in loop_body {
                 ls.visit_exprs(&mut |e| {
                     if let ExprKind::Index { base, index: Some(_) } = &e.kind {
@@ -142,9 +170,10 @@ fn indexed_array_params_in_loops<'a>(f: &'a Function, array_params: &HashSet<&'a
                     }
                 });
             }
+            groups.push(found);
         });
     }
-    found
+    groups
 }
 
 /// Span of the first subscript on an array parameter inside a loop (best-effort
@@ -198,6 +227,157 @@ fn source_requires_equal_lengths(src: &str) -> bool {
     compact.contains("length==") || compact.contains("length!=")
 }
 
+// --------------------------------------------------- whole-body guard analysis
+
+/// True if a length-equality guard somewhere in `f`'s body covers *every*
+/// co-indexed array in `group` — i.e. the lengths are transitively forced equal,
+/// so a mismatch reverts. The guard graph is built from the WHOLE body (not just
+/// the loop header) and resolves *length-alias* locals: a local bound to
+/// `arr.length` (`uint256 len = arr.length;`) stands in for `arr.length` in a
+/// later comparison. `group` is "fully guarded" when, restricted to the group's
+/// arrays, the guarded `==`/`!=` pairs connect them into a single component.
+fn coindexed_group_is_length_guarded(f: &Function, group: &HashSet<&str>) -> bool {
+    if group.len() < 2 {
+        return true;
+    }
+    // (a) length-alias locals: `local -> array` for `local = array.length`.
+    let mut alias: HashMap<String, String> = HashMap::new();
+    collect_length_aliases(&f.body, &mut alias);
+
+    // (b) guarded length-equality pairs harvested from guard positions only
+    //     (`require`/`assert` args and `if`/loop conditions) so an incidental
+    //     `a.length == b.length` *value* expression is not mistaken for a guard.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    collect_guard_length_pairs(&f.body, &alias, &mut pairs);
+    if pairs.is_empty() {
+        return false;
+    }
+
+    // (c) union-find connectivity over the group's array names.
+    let names: Vec<&str> = group.iter().copied().collect();
+    let idx = |n: &str| names.iter().position(|m| *m == n);
+    let mut parent: Vec<usize> = (0..names.len()).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut c = x;
+        while parent[c] != r {
+            let n = parent[c];
+            parent[c] = r;
+            c = n;
+        }
+        r
+    }
+    for (a, b) in &pairs {
+        if let (Some(ia), Some(ib)) = (idx(a), idx(b)) {
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            parent[ra] = rb;
+        }
+    }
+    let root0 = find(&mut parent, 0);
+    (0..names.len()).all(|i| find(&mut parent, i) == root0)
+}
+
+/// Record `local -> array` for every `local = array.length` binding (a `VarDecl`
+/// initializer or a plain `Assign`), scanning the whole statement tree.
+fn collect_length_aliases(body: &[Stmt], out: &mut HashMap<String, String>) {
+    for s in body {
+        s.visit(&mut |inner| match &inner.kind {
+            StmtKind::VarDecl { name: Some(local), init: Some(e), .. } => {
+                if let Some(arr) = length_base(e) {
+                    out.insert(local.clone(), arr.to_string());
+                }
+            }
+            StmtKind::Expr(e) => {
+                if let ExprKind::Assign { target, value, .. } = &e.kind {
+                    if let (ExprKind::Ident(local), Some(arr)) = (&target.kind, length_base(value)) {
+                        out.insert(local.clone(), arr.to_string());
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+}
+
+/// Harvest unordered array-name pairs from length-equality comparisons that sit
+/// in a *guard* position: the argument of a `require`/`assert`, or the condition
+/// of an `if`/`while`/`for`/`do-while`. Each comparison side must resolve to an
+/// array length (`arr.length` directly, or a length-alias local).
+fn collect_guard_length_pairs(body: &[Stmt], alias: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
+    // First collect the guard-position condition expressions, then harvest pairs
+    // from each (avoids a closure double-borrowing `out`).
+    let mut conds: Vec<&Expr> = Vec::new();
+    for s in body {
+        s.visit(&mut |inner| match &inner.kind {
+            StmtKind::If { cond, .. } | StmtKind::While { cond, .. } | StmtKind::DoWhile { cond, .. } => {
+                conds.push(cond)
+            }
+            StmtKind::For { cond: Some(cond), .. } => conds.push(cond),
+            StmtKind::Expr(e) => {
+                // `require(a.length == b.length, ...)` / `assert(...)`: take the
+                // first argument (the predicate) as a guard condition.
+                e.visit(&mut |sub| {
+                    if let ExprKind::Call(c) = &sub.kind {
+                        if matches!(
+                            c.kind,
+                            CallKind::Builtin(Builtin::Require) | CallKind::Builtin(Builtin::Assert)
+                        ) {
+                            if let Some(first) = c.args.first() {
+                                conds.push(first);
+                            }
+                        }
+                    }
+                });
+            }
+            _ => {}
+        });
+    }
+    for cond in conds {
+        harvest_eq_pairs(cond, alias, out);
+    }
+}
+
+/// Walk `e`, recording an unordered `(arr_a, arr_b)` pair for every `==`/`!=`
+/// comparison whose two sides each resolve to an array length.
+fn harvest_eq_pairs(e: &Expr, alias: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
+    e.visit(&mut |sub| {
+        if let ExprKind::Binary { op: BinOp::Eq | BinOp::Ne, lhs, rhs } = &sub.kind {
+            if let (Some(a), Some(b)) = (length_operand(lhs, alias), length_operand(rhs, alias)) {
+                if a != b {
+                    out.push((a, b));
+                }
+            }
+        }
+    });
+}
+
+/// If `e` is `arr.length`, return `arr`.
+fn length_base(e: &Expr) -> Option<&str> {
+    if let ExprKind::Member { base, member } = &e.kind {
+        if member == "length" {
+            return base.simple_name();
+        }
+    }
+    None
+}
+
+/// Resolve a comparison operand to the underlying array name when it denotes an
+/// array length: either `arr.length` directly, or a length-alias local
+/// (`len` where `len = arr.length`).
+fn length_operand(e: &Expr, alias: &HashMap<String, String>) -> Option<String> {
+    if let Some(arr) = length_base(e) {
+        return Some(arr.to_string());
+    }
+    if let ExprKind::Ident(name) = &e.kind {
+        return alias.get(name).cloned();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -244,5 +424,127 @@ contract Airdrop {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "array-length-mismatch"));
+    }
+
+    fn fired(fs: &[sluice_findings::Finding]) -> bool {
+        fs.iter().any(|f| f.detector == "array-length-mismatch")
+    }
+
+    // --- Fix 1a: whole-body guard via a length-alias local. The guard
+    //     `require(len == lnFeeRateRoots.length)` sits three lines ABOVE the loop
+    //     and references the local `len = YTs.length`, not `YTs.length` directly.
+    //     The pre-fix detector only looked at the loop header and missed it.
+    //     (Pendle `LimitRouterBase.setLnFeeRateRoots:476`.) ---
+    const GUARDED_VIA_ALIAS_LOCAL: &str = r#"
+contract LimitRouterBase {
+    uint256 constant MAX = 100;
+    mapping(address => uint256) __lnFeeRateRoot;
+    function setLnFeeRateRoots(address[] memory YTs, uint256[] memory lnFeeRateRoots, bool allowZeroFees) public {
+        uint256 len = YTs.length;
+        require(len == lnFeeRateRoots.length, "length mismatch");
+        for (uint256 i = 0; i < len; i++) {
+            require(lnFeeRateRoots[i] > 0 || allowZeroFees, "zero");
+            __lnFeeRateRoot[YTs[i]] = lnFeeRateRoots[i];
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn silent_on_guarded_via_alias_local() {
+        assert!(!fired(&run(GUARDED_VIA_ALIAS_LOCAL)), "alias-local length guard must suppress");
+    }
+
+    // Same body but with the alias guard REMOVED: now genuinely unguarded, so it
+    // must fire (proves the suppression is the guard, not the shape).
+    const GUARDED_VIA_ALIAS_LOCAL_NO_GUARD: &str = r#"
+contract LimitRouterBase {
+    mapping(address => uint256) __lnFeeRateRoot;
+    function setLnFeeRateRoots(address[] memory YTs, uint256[] memory lnFeeRateRoots, bool allowZeroFees) public {
+        uint256 len = YTs.length;
+        for (uint256 i = 0; i < len; i++) {
+            __lnFeeRateRoot[YTs[i]] = lnFeeRateRoots[i];
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn fires_when_alias_guard_absent() {
+        assert!(fired(&run(GUARDED_VIA_ALIAS_LOCAL_NO_GUARD)), "unguarded co-indexed loop must fire");
+    }
+
+    // --- Fix 1b: three INDEPENDENT loops, each iterating ONE array by its own
+    //     `.length`; no two arrays share an iteration index, so no mismatch is
+    //     possible. (Pendle `ActionMiscV3.redeemDueInterestAndRewards:79`.) ---
+    const INDEPENDENT_LOOPS: &str = r#"
+interface ISY { function claimRewards(address u) external; }
+interface IYT { function redeem(address u) external; }
+interface IMkt { function redeemRewards(address u) external; }
+contract ActionMiscV3 {
+    function redeemDueInterestAndRewards(
+        address user,
+        address[] calldata sys,
+        address[] calldata yts,
+        address[] calldata markets
+    ) external {
+        for (uint256 i = 0; i < sys.length; ++i) { ISY(sys[i]).claimRewards(user); }
+        for (uint256 i = 0; i < yts.length; ++i) { IYT(yts[i]).redeem(user); }
+        for (uint256 i = 0; i < markets.length; ++i) { IMkt(markets[i]).redeemRewards(user); }
+    }
+}
+"#;
+
+    #[test]
+    fn silent_on_independent_loops() {
+        assert!(!fired(&run(INDEPENDENT_LOOPS)), "independent single-array loops must not be flagged");
+    }
+
+    // --- Retained TP 1: three arrays co-indexed by the SAME `i` in ONE loop with
+    //     no equal-length check. (EigenLayer `DelegationManager.completeQueuedWithdrawals:220`.) ---
+    const TP_DELEGATIONMANAGER: &str = r#"
+contract DelegationManager {
+    function _complete(bytes32 w, address[] memory t, bool r) internal {}
+    function completeQueuedWithdrawals(
+        bytes32[] calldata withdrawals,
+        address[][] calldata tokens,
+        bool[] calldata receiveAsTokens
+    ) external {
+        uint256 n = withdrawals.length;
+        for (uint256 i; i < n; ++i) {
+            _complete(withdrawals[i], tokens[i], receiveAsTokens[i]);
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn fires_on_coindexed_no_guard_delegationmanager() {
+        // `n = withdrawals.length` is a bound, NOT a cross-array equality guard.
+        assert!(fired(&run(TP_DELEGATIONMANAGER)), "co-indexed arrays w/o equal-length guard must fire");
+    }
+
+    // --- Retained TP 2: two arrays (`swaps`, `netSwaps`) co-indexed in a loop,
+    //     with only an *allocation* `new uint256[](swaps.length)` (not a guard).
+    //     (Pendle `ActionMiscV3.swapTokensToTokens:184`.) ---
+    const TP_SWAPTOKENS: &str = r#"
+struct SwapDataExtra { address tokenIn; }
+contract ActionMiscV3 {
+    function _transferIn(address t, address from, uint256 a) internal {}
+    function swapTokensToTokens(
+        SwapDataExtra[] calldata swaps,
+        uint256[] calldata netSwaps
+    ) external payable returns (uint256[] memory netOut) {
+        netOut = new uint256[](swaps.length);
+        for (uint256 i = 0; i < swaps.length; ++i) {
+            _transferIn(swaps[i].tokenIn, msg.sender, netSwaps[i]);
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn fires_on_coindexed_no_guard_swaptokens() {
+        assert!(fired(&run(TP_SWAPTOKENS)), "allocation `new[](a.length)` is not an equal-length guard");
     }
 }

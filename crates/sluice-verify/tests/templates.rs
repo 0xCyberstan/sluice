@@ -17,14 +17,6 @@ fn analyze(path: &str, src: &str) -> (Scir, Vec<Finding>) {
     (res.scir, res.findings)
 }
 
-/// First finding whose detector id equals `det`.
-fn find_by_detector<'a>(findings: &'a [Finding], det: &str) -> &'a Finding {
-    findings
-        .iter()
-        .find(|f| f.detector == det)
-        .unwrap_or_else(|| panic!("no finding from detector `{det}`; got: {:?}", detectors(findings)))
-}
-
 /// First finding in any of the given categories (by slug).
 fn find_by_category<'a>(findings: &'a [Finding], slugs: &[&str]) -> &'a Finding {
     findings
@@ -293,9 +285,11 @@ contract Lottery {
 fn interface_target_falls_back_to_name_only_stub() {
     // A finding anchored to an interface (non-concrete) → T3 name-only stub,
     // no `import {..} from` of a concrete source.
+    // `>=0.8.0` is a genuinely-wide range floating-pragma always flags (durable
+    // against caret-suppression tuning) — gives a deterministic finding to re-point.
     let src = r#"
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity >=0.8.0;
 
 contract Bank {
     mapping(address => uint256) public bal;

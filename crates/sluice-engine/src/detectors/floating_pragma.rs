@@ -37,11 +37,34 @@
 //!     or without a leading `=`: `pragma solidity 0.8.20;` and
 //!     `pragma solidity =0.8.20;` both suppress. (A bare `0.8.20` is Solidity's
 //!     implicit-`=` exact pin.)
+//!   * A **near-pinned caret on a recent minor** — a single-clause caret of the
+//!     form `^0.8.y` with `y >= 20` (`^0.8.20`, `^0.8.27`, …) — is silent. A
+//!     caret only widens the *patch/minor* digit (`^0.8.20` admits `0.8.20 ..
+//!     <0.9.0`), and across the recent `0.8.20+` releases the admitted window is
+//!     a handful of patch-compatible compilers with no behavioural cliff, so the
+//!     reproducibility hazard is near-zero. This near-pinned form is the bulk of
+//!     the lint's volume and almost never a real finding, so it is suppressed —
+//!     while every *genuinely wide* range is preserved (see below).
 //!   * A source unit with **no** `pragma solidity` directive at all (an
 //!     interface-only `.sol`, an `abicoder`/`experimental`-only file) is silent —
 //!     there is no unpinned version constraint to flag.
 //!   * `pragma abicoder v2;` / `pragma experimental ...;` are not version
 //!     pragmas and never match.
+//!
+//! ## What is kept (the genuinely-wide signal is preserved)
+//!
+//! An Info finding is still emitted for every range that is genuinely wide /
+//! unbounded, i.e. carries real reproducibility (and sometimes overflow) risk:
+//!
+//!   * any **comparator / open** range — `>=`, `>`, `<`, `<=` (`>=0.5.0`,
+//!     `>=0.7.0 <0.9.0`, `>0.8.0`), including a wildcard `*`;
+//!   * a `||` **union** of versions (`0.7.6 || 0.8.20`);
+//!   * a **caret on an old minor** — `^0.8.y` with `y < 20` (`^0.8.0` admits the
+//!     entire `0.8.x` line; `^0.8.17`), or any caret that can resolve **below
+//!     0.8.0** (`^0.7.6`), which additionally carries the implicit-overflow risk.
+//!
+//! Only the recent-minor caret (`^0.8.>=20`) is demoted to silence; everything
+//! wider keeps its Info signal.
 //!
 //! ## Reporting granularity
 //!
@@ -190,11 +213,60 @@ fn classify_constraint(constraint: &str) -> Option<Floating> {
         return None;
     }
 
+    // Near-pinned recent-minor caret (`^0.8.y`, y>=20): suppress. A single-clause
+    // caret with no comparator / union only widens the patch/minor digit, and on
+    // the recent `0.8.20+` line the admitted window is a few patch-compatible
+    // compilers with no behavioural cliff — near-zero real risk and the bulk of
+    // this lint's volume. Every wider range (comparator, union, an old-minor or
+    // below-0.8 caret) falls through and is still reported.
+    if is_caret && !has_range && !is_union && is_near_pinned_recent_caret(t) {
+        return None;
+    }
+
     Some(Floating {
         text: t.to_string(),
         is_caret,
         below_0_8: range_admits_below_0_8(t),
     })
+}
+
+/// Is `t` a **near-pinned recent-minor caret** — a single `^0.8.y` clause with
+/// `y >= 20`? Such a caret admits only a tight band of recent, patch-compatible
+/// `0.8.x` compilers (`^0.8.27` → `0.8.27 .. <0.9.0`) with no behavioural cliff,
+/// so its reproducibility hazard is negligible and it is suppressed.
+///
+/// Strictly conservative — returns `false` (keep firing) for anything that is not
+/// exactly this shape:
+///   * not a single `^0.MAJOR.MINOR` clause (extra whitespace is tolerated, but a
+///     second clause / comparator / union is rejected by the caller before this);
+///   * a major other than `0` (`^1.2.3`) — the `0.x` caret semantics do not apply;
+///   * a minor below `20` (`^0.8.0`, `^0.8.17`) — a genuinely wide `0.8.x` window;
+///   * a major-8 line other than `0.8` (`^0.7.6`, handled as below-0.8) — kept.
+fn is_near_pinned_recent_caret(t: &str) -> bool {
+    // Strip the leading caret and any whitespace; the remainder must be exactly
+    // one `0.8.<minor>` version token (optionally with a trailing patch we ignore).
+    let rest = t.trim_start_matches('^').trim();
+    // Split into dot-separated numeric components: major.minor.patch.
+    let mut parts = rest.split('.');
+    let (Some(major), Some(line), Some(minor)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    // No further components / trailing junk (a fourth `.` segment, a space, a
+    // comparator) — keep this strictly a bare `^0.8.y`.
+    if parts.next().is_some() {
+        return false;
+    }
+    // Every component must be purely numeric (reject `^0.8.x`, `^0.8.*`, ranges).
+    if !is_all_digits(major) || !is_all_digits(line) || !is_all_digits(minor) {
+        return false;
+    }
+    // The recent-`0.8` line, minor >= 20.
+    major == "0" && line == "8" && minor.parse::<u32>().map_or(false, |m| m >= 20)
+}
+
+/// True iff `s` is non-empty and every byte is an ASCII digit.
+fn is_all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Best-effort: does the (floating) constraint admit a compiler **below 0.8.0**?
@@ -350,9 +422,10 @@ mod tests {
         run(src).iter().any(|f| f.detector == "floating-pragma")
     }
 
-    // FIRES — a caret (unpinned) pragma.
+    // FIRES — a caret on an OLD minor (`^0.8.0` admits the whole 0.8.x line: a
+    // genuinely wide range, kept).
     const UNSAFE_CARET: &str = r#"
-        pragma solidity ^0.8.20;
+        pragma solidity ^0.8.0;
         contract A { uint256 x; function f() external { x = 1; } }
     "#;
 
@@ -409,9 +482,10 @@ mod tests {
 
     #[test]
     fn at_most_one_per_file() {
-        // Two contracts, one file, one pragma -> exactly one floating-pragma finding.
+        // Two contracts, one file, one (kept, old-minor caret) pragma -> exactly
+        // one floating-pragma finding.
         let src = r#"
-            pragma solidity ^0.8.20;
+            pragma solidity ^0.8.0;
             contract A { function f() external {} }
             contract B { function g() external {} }
         "#;
@@ -443,30 +517,111 @@ mod tests {
         // per-file `contract`=path discriminator keeps them from de-duping by line).
         let res = analyze_sources(
             vec![
-                ("a.sol".into(), "pragma solidity ^0.8.20;\ncontract A { function f() external {} }".into()),
+                ("a.sol".into(), "pragma solidity ^0.8.0;\ncontract A { function f() external {} }".into()),
                 ("b.sol".into(), "pragma solidity ^0.8.19;\ncontract B { function g() external {} }".into()),
                 ("c.sol".into(), "pragma solidity 0.8.20;\ncontract C { function h() external {} }".into()),
+                ("d.sol".into(), "pragma solidity ^0.8.27;\ncontract D { function k() external {} }".into()),
             ],
             &Config::default(),
         );
         let hits: Vec<_> = res.findings.iter().filter(|f| f.detector == "floating-pragma").collect();
-        // a.sol + b.sol float; c.sol is pinned (silent).
+        // a.sol + b.sol are wide (old-minor carets) and fire; c.sol is pinned
+        // (silent); d.sol is a near-pinned recent-minor caret `^0.8.27` (silent).
         assert_eq!(hits.len(), 2, "{:?}", hits);
         assert!(hits.iter().any(|f| f.file == "a.sol"));
         assert!(hits.iter().any(|f| f.file == "b.sol"));
         assert!(!hits.iter().any(|f| f.file == "c.sol"));
+        assert!(!hits.iter().any(|f| f.file == "d.sol"));
     }
 
     #[test]
     fn classify_constraint_unit() {
+        // Pinned — suppressed.
         assert!(classify_constraint("0.8.20").is_none());
         assert!(classify_constraint("=0.8.20").is_none());
-        assert!(classify_constraint("^0.8.20").is_some());
+        // Near-pinned recent-minor caret (`^0.8.y`, y>=20) — now suppressed.
+        assert!(classify_constraint("^0.8.20").is_none());
+        assert!(classify_constraint("^0.8.27").is_none());
+        // Old-minor / wide caret — kept.
+        assert!(classify_constraint("^0.8.0").is_some());
+        assert!(classify_constraint("^0.8.19").is_some());
+        // Comparator / union — kept.
         assert!(classify_constraint(">=0.7.0 <0.9.0").is_some());
+        assert!(classify_constraint(">=0.5.0").is_some());
         assert!(classify_constraint("0.7.6 || 0.8.20").is_some());
         assert!(range_admits_below_0_8("^0.7.6"));
         assert!(range_admits_below_0_8(">=0.6.0 <0.8.0"));
         assert!(!range_admits_below_0_8("^0.8.20"));
         assert!(!range_admits_below_0_8(">=0.8.0 <0.9.0"));
+    }
+
+    // SILENT — a near-pinned caret on a recent minor (`^0.8.y`, y>=20). This is
+    // the bulk of the lint's volume and carries near-zero real risk, so it is
+    // suppressed (Fix 1).
+    #[test]
+    fn silent_on_near_pinned_recent_caret() {
+        assert!(!fired("pragma solidity ^0.8.20;\ncontract A { function f() external {} }"));
+        assert!(!fired("pragma solidity ^0.8.27;\ncontract A { function f() external {} }"));
+        assert!(!fired("pragma solidity ^0.8.29;\ncontract A { function f() external {} }"));
+        // Whitespace around the constraint must not defeat the suppression.
+        assert!(!fired("pragma solidity   ^0.8.25  ;\ncontract A { function f() external {} }"));
+    }
+
+    // FIRES — a caret on an OLD minor stays Info: `^0.8.0` admits the entire
+    // 0.8.x line, `^0.8.17`/`^0.8.19` admit a wide band. The genuinely-wide
+    // signal is preserved (Fix 1 keep-set).
+    #[test]
+    fn fires_on_old_minor_caret() {
+        assert!(fired("pragma solidity ^0.8.0;\ncontract A { function f() external {} }"));
+        assert!(fired("pragma solidity ^0.8.17;\ncontract A { function f() external {} }"));
+        assert!(fired("pragma solidity ^0.8.19;\ncontract A { function f() external {} }"));
+    }
+
+    // FIRES — comparator / open / union ranges are genuinely wide and kept,
+    // regardless of the recent-minor cutoff (which only applies to a bare caret).
+    #[test]
+    fn fires_on_wide_ranges() {
+        assert!(fired("pragma solidity >=0.5.0;\ncontract A { function f() external {} }"));
+        assert!(fired("pragma solidity >0.8.0;\ncontract A { function f() external {} }"));
+        assert!(fired("pragma solidity >=0.8.0 <0.9.0;\ncontract A { function f() external {} }"));
+        // A `||` union pairing a recent pin is still a multi-version range.
+        assert!(fired("pragma solidity 0.7.6 || 0.8.27;\ncontract A { function f() external {} }"));
+    }
+
+    // The recent-minor cutoff is exactly y>=20: `^0.8.19` fires, `^0.8.20` does not.
+    #[test]
+    fn near_pinned_cutoff_is_minor_20() {
+        assert!(fired("pragma solidity ^0.8.19;\ncontract A { function f() external {} }"));
+        assert!(!fired("pragma solidity ^0.8.20;\ncontract A { function f() external {} }"));
+    }
+
+    // A caret that can resolve BELOW 0.8.0 is always kept (wide + overflow risk),
+    // never caught by the recent-minor suppression.
+    #[test]
+    fn fires_on_below_0_8_caret() {
+        assert!(fired("pragma solidity ^0.7.6;\ncontract A { function f() external {} }"));
+    }
+
+    // Unit-level coverage of the near-pinned classifier across edge shapes.
+    #[test]
+    fn is_near_pinned_recent_caret_unit() {
+        assert!(is_near_pinned_recent_caret("^0.8.20"));
+        assert!(is_near_pinned_recent_caret("^0.8.27"));
+        assert!(is_near_pinned_recent_caret("^0.8.100"));
+        // Below the cutoff / old minor.
+        assert!(!is_near_pinned_recent_caret("^0.8.19"));
+        assert!(!is_near_pinned_recent_caret("^0.8.0"));
+        // Different lines / majors.
+        assert!(!is_near_pinned_recent_caret("^0.7.20"));
+        assert!(!is_near_pinned_recent_caret("^0.9.20"));
+        assert!(!is_near_pinned_recent_caret("^1.8.20"));
+        // Not a bare 3-component numeric caret.
+        assert!(!is_near_pinned_recent_caret("^0.8")); // no patch -> wide 0.8.x
+        assert!(!is_near_pinned_recent_caret("^0.8.x"));
+        assert!(!is_near_pinned_recent_caret("^0.8.20.1"));
+        // NB: this helper inspects only the version token (the leading `^` is
+        // stripped); `classify_constraint` calls it strictly behind an `is_caret`
+        // guard, so a caret-less `0.8.20` never reaches it (and is suppressed
+        // earlier by the pinned-exact check regardless).
     }
 }

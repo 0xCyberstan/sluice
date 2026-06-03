@@ -193,6 +193,14 @@ fn discover_sol_files(root: &Path, cfg: &Config) -> Vec<PathBuf> {
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().map(|e| e == "sol").unwrap_or(false) {
+            // Skip `.sol`-*suffixed directories* (e.g. Forge's `docs/autogen/`
+            // artifact dirs named `Foo.sol/`). They match the extension filter but
+            // are not files; feeding one to the reader yields an
+            // "Is a directory (os error 21)" parse error for every entry. The
+            // metadata probe (following symlinks) keeps only real files.
+            if !std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+                continue;
+            }
             let s = path.to_string_lossy();
             if !cfg.is_excluded(&s) {
                 files.push(path.to_path_buf());

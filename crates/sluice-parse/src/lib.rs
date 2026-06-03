@@ -45,17 +45,26 @@ pub fn parse_paths<P: AsRef<Path> + Sync>(paths: &[P]) -> ParseOutput {
     // Read files in parallel (many small files → I/O + UTF-8 validation overlap),
     // collecting `Result`s in input order so the downstream `file_no` assignment
     // and reporting order stay identical to a serial read.
+    //
+    // A `.sol`-*suffixed directory* (e.g. Forge's `docs/autogen/` artifact dirs
+    // named `Foo.sol/`) reaches here when a caller's path-walk matched on the
+    // extension alone; `read_to_string` on it returns "Is a directory (os error
+    // 21)". The metadata probe skips any non-file silently (`None`) — neither a
+    // source nor a `FileError` — so directory entries never pollute the report.
     let read: Vec<Result<(String, String), FileError>> = paths
         .par_iter()
-        .map(|p| {
+        .filter_map(|p| {
             let path = p.as_ref();
-            match std::fs::read_to_string(path) {
+            if !std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+                return None;
+            }
+            Some(match std::fs::read_to_string(path) {
                 Ok(content) => Ok((path.display().to_string(), content)),
                 Err(e) => Err(FileError {
                     path: path.display().to_string(),
                     message: format!("read error: {e}"),
                 }),
-            }
+            })
         })
         .collect();
 
@@ -110,13 +119,62 @@ fn word_boundary_before(bytes: &[u8], i: usize) -> bool {
     i == 0 || !is_ident_byte(bytes[i - 1])
 }
 
+/// If a comment or string/char literal *begins* at `k`, return the offset just
+/// past its end; otherwise `None`. Lets the `layout at` scanners step over
+/// regions where Solidity tokens (`is`, `{`, `;`, the `layout` keyword itself)
+/// may appear as plain text rather than syntax — e.g. the `/// … layout at 151 …`
+/// doc-comments above an EIP-7201 contract header. Conservative: an unterminated
+/// block comment / string runs to EOF (returns `bytes.len()`), matching how the
+/// parser would treat it.
+fn skip_comment_or_string(bytes: &[u8], k: usize) -> Option<usize> {
+    match bytes[k] {
+        // `//` line comment → to end of line (newline kept for line numbers).
+        b'/' if bytes.get(k + 1) == Some(&b'/') => {
+            let mut j = k + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        // `/* … */` block comment.
+        b'/' if bytes.get(k + 1) == Some(&b'*') => {
+            let mut j = k + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            // Past the closing `*/`, or EOF if unterminated.
+            Some((j + 2).min(bytes.len()))
+        }
+        // `"…"` / `'…'` string or char literal (Solidity has no multi-line raw
+        // strings; a `\` escapes the next byte, including the quote).
+        q @ (b'"' | b'\'') => {
+            let mut j = k + 1;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' => j += 2,
+                    b if b == q => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+            Some(bytes.len())
+        }
+        _ => None,
+    }
+}
+
 /// End (exclusive) of a `layout at <expr>` directive: the offset of the `is`
 /// keyword or the `{` that begins the contract body, scanning at bracket depth 0.
-/// Returns `None` if neither is found before a `;`/EOF (malformed → don't touch).
+/// Comments and string literals are skipped so a stray `is`/`{`/`;` inside them
+/// can't truncate the directive early. Returns `None` if neither is found before
+/// a `;`/EOF (malformed → don't touch).
 fn find_layout_expr_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth: i32 = 0;
     let mut k = start;
     while k < bytes.len() {
+        if let Some(next) = skip_comment_or_string(bytes, k) {
+            k = next;
+            continue;
+        }
         match bytes[k] {
             b'(' | b'[' => depth += 1,
             b')' | b']' => depth -= 1,
@@ -136,13 +194,26 @@ fn find_layout_expr_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-/// Solidity 0.8.29 introduced the `contract X layout at <slot> is ...` custom
-/// storage-layout directive (EIP-7201 era). `solang-parser` 0.3.5 predates it and
-/// rejects the **entire file**, silently dropping every contract in it from
-/// analysis. We blank the `layout at <expr>` span with spaces — preserving every
-/// byte offset, so all `Span`s still line up with the original source we keep for
-/// reporting — before handing the text to the parser. Returns `None` when the
-/// directive is absent (the overwhelmingly common case → no allocation).
+/// Solidity 0.8.29 introduced the custom storage-layout directive, in two forms:
+/// a standalone `contract X layout at <slot> { … }` and the inherited-layout
+/// header `contract X layout at <slot> is Base, … { … }` (EIP-7201 era).
+/// `solang-parser` 0.3.5 predates both and rejects the **entire file**, silently
+/// dropping every contract in it from analysis. We blank the `layout at <expr>`
+/// span with spaces — preserving every byte offset, so all `Span`s still line up
+/// with the original source we keep for reporting — before handing the text to
+/// the parser. The `is Base, …` clause (when present) is left intact, so the
+/// recovered contract still parses with its full inheritance list.
+///
+/// The scan steps over comments and string literals (via
+/// [`skip_comment_or_string`]): real contracts carry doc-comments that mention
+/// the directive (e.g. EigenLayer's `AllocationManagerView` has three
+/// `/// … layout at 151 …` lines above the header). A comment-blind match there
+/// would start blanking inside the comment and run forward through the genuine
+/// `contract …` keyword to the first real `is`/`{`, corrupting the header — which
+/// is exactly the "header form not handled" failure this guards against.
+///
+/// Returns `None` when the directive is absent (the overwhelmingly common case
+/// → no allocation).
 fn blank_layout_directive(src: &str) -> Option<String> {
     const KW: &[u8] = b"layout";
     if !src.contains("layout") {
@@ -151,8 +222,16 @@ fn blank_layout_directive(src: &str) -> Option<String> {
     let bytes = src.as_bytes();
     let mut out: Option<Vec<u8>> = None;
     let mut i = 0;
-    while i + KW.len() <= bytes.len() {
-        if &bytes[i..i + KW.len()] == KW && word_boundary_before(bytes, i) {
+    while i < bytes.len() {
+        // Never match the keyword inside a comment or string literal.
+        if let Some(next) = skip_comment_or_string(bytes, i) {
+            i = next;
+            continue;
+        }
+        if i + KW.len() <= bytes.len()
+            && &bytes[i..i + KW.len()] == KW
+            && word_boundary_before(bytes, i)
+        {
             // After `layout`: whitespace, then the `at` keyword, then whitespace.
             let mut j = i + KW.len();
             let ws_start = j;
@@ -913,5 +992,92 @@ mod tests {
         ]);
         assert!(!out.file_errors.is_empty());
         assert!(out.scir.contract_named("A").is_some());
+    }
+
+    #[test]
+    fn recovers_layout_at_header_with_directive_in_doc_comments() {
+        // Shape of EigenLayer's `AllocationManagerView.sol`: the `layout at 151`
+        // directive is mentioned in `///` and `/* */` comments *above* the genuine
+        // `contract … layout at 151 is …` header. A comment-blind recovery starts
+        // blanking inside a comment and runs forward through the `contract` keyword
+        // to the first real `is`/`{`, corrupting the header so solang rejects the
+        // whole file (the "header form not handled" bug). The recovery must ignore
+        // the comment mentions and blank only the real directive.
+        let out = parse_sources(vec![(
+            "AllocationManagerView.sol".into(),
+            r#"
+            pragma solidity ^0.8.29; // Minimum for `layout at` directive.
+            interface IView { function v() external view returns (uint256); }
+            interface IStore {}
+            /// @dev The `layout at 151` directive specifies that storage should be
+            ///      placed starting at storage slot 151; this is calculated from
+            ///      the main contract layout. It uses `layout at 151` to align.
+            /* block comment also naming layout at 151 is/{ ; tokens inside */
+            contract AllocationManagerView layout at 151 is IView, IStore {
+                uint256 public x;
+                function set(uint256 v) external { x = v; }
+            }
+            "#
+            .into(),
+        )]);
+        assert!(
+            out.file_errors.is_empty(),
+            "no parse/skip error expected; got {:?}",
+            out.file_errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let scir = out.scir;
+        let c = scir
+            .contract_named("AllocationManagerView")
+            .expect("contract recovered despite `layout at` in doc-comments");
+        // Full inheritance list after the directive is preserved.
+        assert!(c.bases.iter().any(|b| b == "IView"));
+        assert!(c.bases.iter().any(|b| b == "IStore"));
+        let set = scir.functions_of(c.id).find(|f| f.name == "set").expect("set");
+        assert!(set.effects.writes_var("x"));
+        // Offset preservation: spans still index the original (unblanked) source.
+        assert!(scir.span_text(set.span).contains("x = v"));
+    }
+
+    #[test]
+    fn layout_keyword_inside_string_is_not_a_directive() {
+        // A `layout at N` appearing inside a string literal must not be blanked
+        // (it isn't a directive); the contract parses normally.
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.20;
+            contract S {
+                string public note = "use layout at 151 is best practice";
+                function f() external pure returns (uint256) { return 1; }
+            }
+            "#,
+        );
+        let c = scir.contract_named("S").expect("S parses");
+        assert!(scir.functions_of(c.id).any(|f| f.name == "f"));
+    }
+
+    #[test]
+    fn dot_sol_directory_is_skipped_without_error() {
+        // Forge's `docs/autogen/` emits `.sol`-*suffixed directories*. If a caller
+        // collected one as a path, `parse_paths` must skip it silently (no
+        // "Is a directory" FileError) while still reading the real sibling file.
+        let base = std::env::temp_dir().join(format!("sluice_parse_dirtest_{}", std::process::id()));
+        let dir_named_sol = base.join("Artifact.sol"); // a DIRECTORY ending in .sol
+        std::fs::create_dir_all(&dir_named_sol).unwrap();
+        let real = base.join("Real.sol");
+        std::fs::write(&real, "contract Real { function f() public {} }").unwrap();
+
+        let out = parse_paths(&[dir_named_sol.clone(), real.clone()]);
+
+        // No error of any kind from the directory entry.
+        assert!(
+            !out.file_errors.iter().any(|e| e.message.contains("Is a directory")
+                || e.message.to_ascii_lowercase().contains("directory")),
+            "directory entry must be skipped silently; errors={:?}",
+            out.file_errors.iter().map(|e| (&e.path, &e.message)).collect::<Vec<_>>()
+        );
+        // The real sibling file still parsed.
+        assert!(out.scir.contract_named("Real").is_some(), "real file still parsed");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

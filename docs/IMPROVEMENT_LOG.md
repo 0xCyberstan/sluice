@@ -537,3 +537,24 @@ just fixtures). Opens the **10th surface: Uniswap v4 (hooks + singleton flash-ac
   corpus 20/20 + 8/8 + 5 real-hack harnesses + 7 PoC-template tests, 0 warnings. Deferred to a round with a real
   hook/integrator corpus (per the R23 corpus-reality check): Spec 3 V4PayerSpoofSettleDrain + the live-positive
   validation of the two bitmap detectors. _done._
+
+### Round 24 — PRECISION round (dogfood-measured FP reduction on load-bearing detectors + 2 engine bugs)
+Executed `docs/PRECISION_BACKLOG.md` via 3 worktree agents; measured on EigenLayer/Symbiotic/Pendle with recall
+fully preserved (corpus + all real-hack harnesses green throughout).
+- **floating-pragma:** suppress near-pinned recent caret `^0.8.{>=20}`; keep wide/unbounded ranges (`>=`/`>`/`*`) +
+  old-minor carets. EL 94→30, Symbiotic 34→32, Pendle 205→204 (removals were exactly the recent-caret forms).
+- **centralization-risk:** removed the FIXED_DEST Info "preset destination" sub-class entirely (self-labeled
+  non-actionable); Medium/High/Low findings verified **set-identical** before/after. EL 9→5, Sym 3→2, Pendle 10→8.
+- **array-length-mismatch:** per-loop co-index grouping (kills the independent-loops FP) + whole-body length-guard
+  scan with length-alias resolution (union-find over guarded pairs). 6→4; cited FPs gone, real TPs retained.
+- **upgradeable:** walk the full inheritance chain for an ancestor-constructor `_disableInitializers()` (kills the
+  Symbiotic Entity/MigratableEntity FPs); downgrade assembly-mandatory-revert simulation hooks (`staticDelegateCall`)
+  Critical→Medium. 15→11; Furucombo/Parity still fire.
+- **Engine bugs:** parser now skips comments/strings in the `layout at` scan → the `contract … layout at N is …`
+  header form (EigenLayer `AllocationManagerView.sol`) parses (was silently dropped, 1 contract); `is_file()` guard
+  in both the CLI walk and the library reader → Symbiotic's 64 `.sol`-suffixed autogen DIRECTORIES no longer error
+  (64 "Is a directory" → 0).
+- **Result:** **126 detectors** (unchanged). 702 engine tests (+17) + 9 parse + corpus 20/20 + 8/8 + 5 real-hack
+  harnesses + 7 PoC-template tests, **0 warnings**; removed a stale dead-code test helper; fixed one PoC-template
+  test fixture that had relied on the now-suppressed `^0.8.20`. Net measured noise across the 3 repos: floating-pragma
+  −67, centralization −7, array-length −2, upgradeable −4 — all FPs/noise, recall intact. _done._
