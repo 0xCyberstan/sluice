@@ -170,6 +170,14 @@ pub enum Category {
     LifecycleRoleRevokeGap,
     KeeperRewardTimestampAuction,
     BackingSpotInflation,
+    // ---- Round 21: canonical-baseline (SWC table-stakes) classes ----
+    MissingEventEmit,
+    FloatingPragma,
+    StrictBalanceEquality,
+    DeprecatedEthSend,
+    ShadowedStateVar,
+    EncodePackedCollision,
+    LockedEther,
     Other,
 }
 
@@ -304,6 +312,13 @@ impl Category {
             LifecycleRoleRevokeGap => "lifecycle-role-revoke-gap",
             KeeperRewardTimestampAuction => "keeper-reward-timestamp-auction",
             BackingSpotInflation => "backing-spot-inflation",
+            MissingEventEmit => "missing-event-emit",
+            FloatingPragma => "floating-pragma",
+            StrictBalanceEquality => "strict-balance-equality",
+            DeprecatedEthSend => "deprecated-eth-send",
+            ShadowedStateVar => "shadowed-state-var",
+            EncodePackedCollision => "encodepacked-collision",
+            LockedEther => "locked-ether",
             Other => "other",
         }
     }
@@ -420,6 +435,13 @@ impl Category {
             LifecycleRoleRevokeGap => &["CWE-266", "CWE-284"],
             KeeperRewardTimestampAuction => &["SWC-116", "CWE-829"],
             BackingSpotInflation => &["CWE-1339", "CWE-682"],
+            MissingEventEmit => &["CWE-778"],
+            FloatingPragma => &["SWC-103"],
+            StrictBalanceEquality => &["SWC-132", "CWE-697"],
+            DeprecatedEthSend => &["SWC-134", "CWE-691"],
+            ShadowedStateVar => &["SWC-119", "CWE-710"],
+            EncodePackedCollision => &["SWC-133", "CWE-694"],
+            LockedEther => &["CWE-664"],
             _ => &[],
         }
     }
