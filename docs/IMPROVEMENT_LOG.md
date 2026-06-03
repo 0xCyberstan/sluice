@@ -709,3 +709,28 @@ verified the combined state):
   it misses protocol-specific invariant/accounting logic bugs (the bulk of real contest Highs). Strengthen the
   consensus-invariant dimension to catch accounting-invariant violations (hard, high-value; the design's killer feature
   isn't yet catching balance-accounting invariants like LoopFi H-01). _done._
+
+### Real-code precision wave 4 — 5-agent FP fixes (Lido/LoopFi-driven) → real-code Crit/High essentially cleared
+5 detector fixes from the wave-3 triage (all worktree-isolated, disjoint files, recall-guarded):
+- **reentrancy (#1 FP source)** — the parser mis-types bound library helpers living in excluded dep trees (SafeMath
+  `.sub/.add`, `.mulDiv`, UnstructuredStorage `.setLowUint128`) as External calls → bogus arming. Added a value-helper
+  exclusion + CEI-downgrade (a post-call write only qualifies if it wasn't already settled before the call) + cross-fn
+  config-guard tightening. **StETH _mint/_burn/_transferShares 3→0; LoopFi _claim/withdraw/_processLock 3→0; Aave
+  _claimRewards gone.** Every reentrancy hack retained (Cream/Lendf.me/curve/xsurge/orion/revest/Pendle).
+- **twap-manipulation** — de-lexicalized: require a real oracle CALL (`observe`/`price0CumulativeLast` on a handle),
+  not the "observe" identifier substring. **Lido removeObserver 1→0.**
+- **integer-issues** — suppress casts that can't truncate (`msg.value` into ≥96-bit, BP-bounded, access-gated incl. the
+  `_requireSender` helper). **Lido 20→16.**
+- **unchecked-return** — trusted in-protocol tokens (WETH9/stETH/wstETH, immutable/constant) Medium→Low; arbitrary
+  tokens stay Medium; Permit2 still suppressed.
+- **access-control** — recognize ECDSA-signature-gated auth (recover + a revert-gating use of the signer). **Lido
+  pauseDeposits 1→0;** Parity retained.
+- **CUMULATIVE real-code benchmark after 4 waves (Crit / High):** Aave **0/0** (from 1+4), Lido **0/0** (from 0/5 all-FP),
+  Morpho **0/0**, Uniswap universal-router **0/0**, Compound Comet **0/9** (from 0/26; the 9 are defensible — 3 `absorb`
+  bad-debt + 6 donatable-`balanceOf(this)`), LoopFi **0/2** (from 0/3; defensible erc777-reentrancy). **The clear FPs are
+  eliminated across all 6; what remains is defensible "review-this", not noise. Recall fully preserved** (corpus 20/20 +
+  8/8 + all real-hack harnesses green throughout). 132 detectors, ~840 engine tests, 0 warnings, deterministic output.
+- **WAVE-5 residuals:** erc777-reentrancy needs the same CEI-downgrade (LoopFi 2); Comet donatable-balance + `absorb`
+  re-triage (defensible — decide TP vs over-flag); integer-issues local-copy-bound residuals; parser Solidity-0.4.24
+  (`LidoTemplate.sol`); selector/encodepacked de-dup. + the STRATEGIC recall frontier (invariant-prover, not pattern
+  matcher — the deep, high-value direction). _done._

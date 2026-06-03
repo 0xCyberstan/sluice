@@ -14,7 +14,7 @@ use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::detectors::visit_calls;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{BinOp, CallKind, Expr, ExprKind, UnOp};
+use sluice_ir::{BinOp, CallKind, Expr, ExprKind, UnOp, ValueSource};
 
 pub struct IntegerIssuesDetector;
 
@@ -136,6 +136,22 @@ impl Detector for IntegerIssuesDetector {
                 // `request.amountOfEEth` (a `uint96` struct field) be proven safe.
                 let widths = value_widths(cx, f, &fields);
 
+                // SUPPRESSION (H) — BASIS-POINTS BOUNDED: names that a preceding
+                // guard pins to `<= TOTAL_BASIS_POINTS` / `<= 10000` / `<= MAX_*BP`
+                // (or a `_requireSane*`-style helper) so a downcast to `uint16`+ of a
+                // basis-points value cannot truncate (10000 < 2^14). Built once per
+                // function. See `basis_points_bounds`.
+                let bp = basis_points_bounds(cx, f);
+
+                // SUPPRESSION (I) — ACCESS-GATED CONFIG: the function is gated by an
+                // access-control sender check (an `only*` / role modifier, a body
+                // `_requireSender(...)`, or a `require(msg.sender == ...)` classified
+                // as a `MsgSenderCheck`). A cast operand that is a *plain parameter*
+                // of such a function is a privileged configuration value chosen by a
+                // trusted role — not unbounded attacker input — so it is not a
+                // realistic silent-truncation vector. Computed once per function.
+                let access_gated = is_access_gated(cx, f);
+
                 // DEDUPE: collapse repeated same-width downcasts inside one function
                 // (e.g. `x += uint128(a); y += uint128(b);`) to a single finding,
                 // keyed by target bit width so two genuinely different-width
@@ -229,6 +245,66 @@ impl Detector for IntegerIssuesDetector {
                         return;
                     }
 
+                    // SUPPRESSION (H) — MSG.VALUE INTO A WIDE TARGET: native ETH is
+                    // capped by the total supply (~1.2e26 wei < 2^96), so casting a
+                    // `msg.value`-derived amount to a target of width >= 96 bits
+                    // (`uint96`/`uint128`/`int104`/...) physically cannot truncate —
+                    // the high bits dropped are always zero. We require BOTH a wide
+                    // target (>= 96) AND `msg.value` provenance on the operand, so a
+                    // genuine narrowing of a `msg.value`-derived value to `uint64`
+                    // (or below) still fires. The dataflow propagates `MsgValue`
+                    // through the wrapping `int256(...)` cast / arithmetic, so
+                    // `int104(int256(msg.value))` and `uint128(msg.value)` are both
+                    // caught. (Lido PredepositGuarantee._topUpNodeOperatorBalance,
+                    // VaultHub.fund.)
+                    if bits >= 96 {
+                        let prov = cx.provenance_of(f.id, arg);
+                        if prov.contains(ValueSource::MsgValue) {
+                            return;
+                        }
+                    }
+
+                    // SUPPRESSION (I) — BASIS-POINTS BOUNDED: a basis-points value
+                    // (identifier matching `*BP`/`*Bps`/`*BasisPoints`/`bp`) that a
+                    // preceding `require(x <= TOTAL_BASIS_POINTS/10000/MAX_*BP)` or a
+                    // `_requireSane*` helper pins below ~10000 (< 2^14) cannot
+                    // truncate to `uint16`+. We also treat such a value as bounded
+                    // when the function is access-control gated: a basis-points
+                    // parameter of a privileged setter is a trusted config value, not
+                    // unbounded attacker input. (Lido VaultHub.updateConnection
+                    // `uint16(_reserveRatioBP)`.)
+                    if let ExprKind::Ident(name) = &arg.kind {
+                        if is_basis_points_name(name)
+                            && (bp.bounds_name(name) || bp.has_sane_guard || access_gated)
+                        {
+                            return;
+                        }
+                    }
+
+                    // SUPPRESSION (J) — ACCESS-GATED CONFIG PARAM: a plain parameter
+                    // cast inside an access-control-gated setter is a privileged
+                    // configuration value chosen by a trusted role. When that param
+                    // is additionally proven bounded by a `_requireSane*`-style guard
+                    // we fully suppress (e.g. VaultHub.updateConnection
+                    // `uint96(_shareLimit)`, bounded by `_requireSaneShareLimit`).
+                    // Otherwise we *downgrade* (lower confidence / Low) rather than
+                    // drop it — a privileged role is trusted, but an unguarded
+                    // misconfiguration that silently truncates is still worth a
+                    // review note. Plain params only: a value derived from
+                    // `msg.value`/`msg.data` is handled by the rules above and must
+                    // not be laundered through this trust assumption.
+                    let mut downgrade = false;
+                    if access_gated {
+                        if let ExprKind::Ident(name) = &arg.kind {
+                            if is_plain_param(f, name) {
+                                if bp.bounds_name(name) || bp.has_sane_guard {
+                                    return;
+                                }
+                                downgrade = true;
+                            }
+                        }
+                    }
+
                     // Suppress provably-bounded values (constant literals can't
                     // overflow the target unless written that way on purpose).
                     if is_constant_expr(arg) {
@@ -250,10 +326,20 @@ impl Detector for IntegerIssuesDetector {
 
                     // (E) LOCATION: report at the cast expression `span` (the
                     // `uintN(...)` site), never `f.span`/the signature line.
+                    // A `downgrade`d finding (access-gated config param with no
+                    // explicit bound) is reported at Low / reduced confidence — the
+                    // privileged-role trust assumption makes it a review note, not a
+                    // Medium attacker-truncation finding. Kept just above the default
+                    // confidence floor (0.35) so it stays *visible* as a de-emphasized
+                    // Low rather than being silently filtered out — a privileged
+                    // misconfiguration that wraps is still a real (if lower-priority)
+                    // hazard, so this is a downgrade, not a suppression.
+                    let (sev, conf) =
+                        if downgrade { (Severity::Low, 0.4) } else { (Severity::Medium, 0.5) };
                     let b = FindingBuilder::new(self.id(), Category::IntegerOverflow)
                         .title(format!("Narrowing downcast to `{ty}` silently truncates high bits"))
-                        .severity(Severity::Medium)
-                        .confidence(0.5)
+                        .severity(sev)
+                        .confidence(conf)
                         .dimension(Dimension::ValueFlow)
                         .message(format!(
                             "`{}` casts an attacker-controlled value to `{ty}` ({bits}-bit). Solidity casts \
@@ -999,6 +1085,219 @@ fn unchecked_subtraction_is_guarded(f: &sluice_ir::Function) -> bool {
     saw_sub && all_guarded_sub
 }
 
+/// True if `name` reads as a basis-points quantity: a suffix of `BP`/`Bps`/
+/// `BasisPoints` (case-insensitive), or the standalone token `bp`. Basis points
+/// range 0..=10000 (< 2^14), so such a value — once bounded — trivially fits any
+/// `uint16`+ target. Matched on the trailing token so `_reserveRatioBP`,
+/// `feeBps`, `maxBasisPoints` all hit, while an unrelated `bridge` does not.
+fn is_basis_points_name(name: &str) -> bool {
+    let lc = name.to_ascii_lowercase();
+    lc == "bp"
+        || lc.ends_with("bp")
+        || lc.ends_with("bps")
+        || lc.ends_with("basispoints")
+}
+
+/// Names a function's guards prove are basis-points-bounded, plus whether a
+/// `_requireSane*`-style helper guard is present at all.
+struct BpBounds {
+    /// Identifier names pinned `<= TOTAL_BASIS_POINTS` / `<= 10000` / `<= MAX_*BP`
+    /// by a `require(...)` or `if (...) revert` in the function body.
+    names: std::collections::HashSet<String>,
+    /// A `_requireSane*` (or `_requireValid*BP`) helper is invoked. Such helpers
+    /// validate a config value's range internally; we cannot see inside cheaply,
+    /// so its presence licenses suppressing a basis-points downcast in the same
+    /// function (precision is preserved by the `is_basis_points_name` gate).
+    has_sane_guard: bool,
+}
+
+impl BpBounds {
+    fn bounds_name(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+}
+
+/// True if `e` is a basis-points upper bound: the constant `10000` (with or
+/// without a `_` digit separator) or an identifier whose name signals a
+/// basis-points cap (`TOTAL_BASIS_POINTS`, `MAX_*BP`, `*BASIS_POINTS`, ...).
+fn is_bp_limit_expr(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Lit(sluice_ir::Lit::Number(n)) => n.replace('_', "").trim() == "10000",
+        ExprKind::Ident(n) => {
+            let lc = n.to_ascii_lowercase();
+            lc.contains("basis_points")
+                || lc.contains("basispoints")
+                || (lc.contains("bp") && (lc.starts_with("max") || lc.starts_with("total")))
+        }
+        ExprKind::Member { member, .. } => {
+            let lc = member.to_ascii_lowercase();
+            lc.contains("basis_points") || lc.contains("basispoints")
+        }
+        _ => false,
+    }
+}
+
+/// Collect the basis-points bounds a function establishes. We look for two
+/// shapes, both of which prove the surviving (post-guard) value is `<= ~10000`:
+///   * a `require(x <= BP_LIMIT)` / `require(x < BP_LIMIT)` (the comparison is the
+///     truthy surviving condition), and
+///   * an `if (x > BP_LIMIT) revert ...` / `if (x >= BP_LIMIT) revert ...` (the
+///     revert prunes the over-limit path, so `x <= BP_LIMIT` survives).
+/// where `BP_LIMIT` is `10000` or a basis-points cap identifier ([`is_bp_limit_expr`]).
+/// Also records whether any `_requireSane*` / `_requireValid*` helper is called.
+fn basis_points_bounds(cx: &AnalysisContext, f: &sluice_ir::Function) -> BpBounds {
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // (a) `require(...)` / `assert(...)` conditions: `x <= LIMIT` / `x < LIMIT`
+    //     proves `x <= LIMIT` on the surviving path.
+    fn collect_le(cond: &Expr, names: &mut std::collections::HashSet<String>) {
+        match &cond.kind {
+            ExprKind::Binary { op: BinOp::Le | BinOp::Lt, lhs, rhs } if is_bp_limit_expr(rhs) => {
+                if let Some(n) = lhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            // `LIMIT >= x` / `LIMIT > x` — same proof, operands swapped.
+            ExprKind::Binary { op: BinOp::Ge | BinOp::Gt, lhs, rhs } if is_bp_limit_expr(lhs) => {
+                if let Some(n) = rhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            ExprKind::Binary { op: BinOp::And, lhs, rhs } => {
+                collect_le(lhs, names);
+                collect_le(rhs, names);
+            }
+            _ => {}
+        }
+    }
+    // (b) `if (x > LIMIT) revert` / `if (x >= LIMIT) revert` — the revert prunes the
+    //     over-limit branch, so `x <= LIMIT` holds afterwards. Only credit this when
+    //     the then-branch is exclusively a revert/return (no fall-through).
+    fn collect_if_revert(cond: &Expr, names: &mut std::collections::HashSet<String>) {
+        match &cond.kind {
+            ExprKind::Binary { op: BinOp::Gt | BinOp::Ge, lhs, rhs } if is_bp_limit_expr(rhs) => {
+                if let Some(n) = lhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            ExprKind::Binary { op: BinOp::Lt | BinOp::Le, lhs, rhs } if is_bp_limit_expr(lhs) => {
+                if let Some(n) = rhs.simple_name() {
+                    names.insert(n.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut has_sane_guard = false;
+    for s in &f.body {
+        s.visit(&mut |st| {
+            if let sluice_ir::StmtKind::If { cond, then_branch, else_branch } = &st.kind {
+                if else_branch.is_empty() && branch_only_aborts(then_branch) {
+                    collect_if_revert(cond, &mut names);
+                }
+            }
+        });
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Call(c) = &e.kind {
+                match c.kind {
+                    CallKind::Builtin(sluice_ir::Builtin::Require)
+                    | CallKind::Builtin(sluice_ir::Builtin::Assert) => {
+                        if let Some(cond) = c.args.first() {
+                            collect_le(cond, &mut names);
+                        }
+                    }
+                    // `_requireSane*` / `_requireValid*` range-validation helpers.
+                    CallKind::Internal => {
+                        if let Some(fname) = c.func_name.as_deref() {
+                            let lc = fname.to_ascii_lowercase();
+                            if lc.starts_with("_requiresane")
+                                || lc.starts_with("requiresane")
+                                || (lc.contains("requirevalid") && lc.contains("bp"))
+                            {
+                                has_sane_guard = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    let _ = cx;
+    BpBounds { names, has_sane_guard }
+}
+
+/// True when a statement list's sole effect is to abort (a `revert`, a bare
+/// `return`, or a `return e`) — i.e. an `if (cond) { <abort> }` guard prunes the
+/// `cond` branch so its negation survives. Mirrors the parser's leading-guard
+/// recognition; kept local so this detector owns its own bounds reasoning.
+fn branch_only_aborts(branch: &[sluice_ir::Stmt]) -> bool {
+    if branch.is_empty() {
+        return false;
+    }
+    branch.iter().all(|s| {
+        matches!(
+            &s.kind,
+            sluice_ir::StmtKind::Revert { .. } | sluice_ir::StmtKind::Return(_)
+        )
+    })
+}
+
+/// True if the function is gated by an access-control sender check — the signal
+/// that its parameters are privileged configuration values rather than unbounded
+/// attacker input. Three independent signals, any of which suffices:
+///   * an `only*` / role-style modifier (`onlyOwner`, `onlyRole(...)`,
+///     `onlyGuarantorOf(...)`) — recognized by the parser as a `MsgSenderCheck`
+///     guard, surfaced via `cx.has_access_control`;
+///   * a body call to a `_requireSender(...)` / `_checkRole(...)`-style helper
+///     (the comparison lives inside the helper, so the parser does not classify
+///     the bare call as a `MsgSenderCheck` — we detect it textually here);
+///   * a leading `require(msg.sender == ...)` (also `MsgSenderCheck`).
+fn is_access_gated(cx: &AnalysisContext, f: &sluice_ir::Function) -> bool {
+    if cx.has_access_control(f) {
+        return true;
+    }
+    // `only*` modifier whose name signals access control (the parser classifies
+    // the *invocation* as a MsgSenderCheck only when it can see the comparison;
+    // a name-based fallback catches modifiers defined elsewhere).
+    if f.modifiers.iter().any(|m| {
+        let lc = m.name.to_ascii_lowercase();
+        lc.starts_with("only") || lc.contains("auth") || lc.contains("restricted")
+    }) {
+        return true;
+    }
+    // Body call to a sender-check helper: `_requireSender(...)`, `_checkRole(...)`,
+    // `_requireRole(...)`, `_authorizeSender(...)`, ...
+    let mut gated = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Call(c) = &e.kind {
+                if let Some(fname) = c.func_name.as_deref() {
+                    let lc = fname.to_ascii_lowercase();
+                    if lc.contains("requiresender")
+                        || lc.contains("checkrole")
+                        || lc.contains("requirerole")
+                        || lc.contains("authorizesender")
+                        || lc.contains("onlysender")
+                    {
+                        gated = true;
+                    }
+                }
+            }
+        });
+    }
+    gated
+}
+
+/// True if `name` is a *plain parameter* of `f` — a direct argument the caller
+/// supplies, not a local or state variable. The access-gated-config suppression
+/// only trusts plain params (a privileged setter's inputs); a derived local could
+/// have been computed from an unmodeled source and is left to fire.
+fn is_plain_param(f: &sluice_ir::Function, name: &str) -> bool {
+    f.params.iter().any(|p| p.name.as_deref() == Some(name))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -1549,5 +1848,218 @@ contract C {
 }
 "#;
         assert!(fires(src), "max() with a wide operand must still fire");
+    }
+
+    // ------------------------------------------------------------------
+    // R8 BOUNDED-CAST regressions: the residual Lido FP shapes.
+    //   (H) `msg.value` cast to a wide (>= 96-bit) target — capped by ETH supply.
+    //   (I) basis-points value pinned by a `<= 10000`/`*BP` guard, a `_requireSane*`
+    //       helper, or an access-control gate.
+    //   (J) plain config parameter of an access-control-gated setter.
+    // Each must now stay SILENT, while the matching unbounded shape still FIRES.
+    // ------------------------------------------------------------------
+
+    // (H) `uint128(msg.value)` — native ETH (< 2^96) cast to a 128-bit target
+    // cannot truncate. (Lido PredepositGuarantee._topUpNodeOperatorBalance:805.)
+    #[test]
+    fn silent_on_msg_value_to_wide_uint() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    mapping(address => uint128) public bal;
+    function topUp() external payable {
+        bal[msg.sender] += uint128(msg.value);
+    }
+}
+"#;
+        assert!(!fires(src), "uint128(msg.value) must be silent (ETH < 2^96)");
+    }
+
+    // (H) `int104(int256(msg.value))` — the wrapping `int256(...)` cast propagates
+    // `msg.value` provenance; the 104-bit target still holds ETH. (Lido
+    // VaultHub.fund:733.)
+    #[test]
+    fn silent_on_msg_value_via_int256_to_int104() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    function fund() external payable {
+        _delta(int104(int256(msg.value)));
+    }
+    function _delta(int104 d) internal { d; }
+}
+"#;
+        assert!(!fires(src), "int104(int256(msg.value)) must be silent (ETH < 2^96)");
+    }
+
+    // POSITIVE (H): the msg.value bound only holds for WIDE targets. A narrowing
+    // of `msg.value` to `uint64` (< 96 bits) can genuinely truncate (a 100-ETH
+    // value exceeds type(uint64).max wei), so it MUST still fire.
+    #[test]
+    fn fires_on_msg_value_to_narrow_uint() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint64 public packed;
+    function topUp() external payable {
+        packed = uint64(msg.value);
+    }
+}
+"#;
+        assert!(fires(src), "uint64(msg.value) must still fire (< 96-bit target truncates)");
+    }
+
+    // (I) ACCESS-GATED + BASIS-POINTS PARAM: a `*BP` parameter of an
+    // access-control-gated setter is a trusted config value. (Lido
+    // VaultHub.updateConnection `uint16(_reserveRatioBP)`:489, gated by
+    // `_requireSender`.)
+    #[test]
+    fn silent_on_access_gated_basis_points_param() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint16 public reserveRatioBP;
+    function updateConnection(uint256 _reserveRatioBP) external {
+        _requireSender(msg.sender);
+        reserveRatioBP = uint16(_reserveRatioBP);
+    }
+    function _requireSender(address s) internal view { if (msg.sender != s) revert(); }
+}
+"#;
+        assert!(!fires(src), "access-gated basis-points param downcast must be silent");
+    }
+
+    // (I) BASIS-POINTS PARAM BOUNDED BY `<= 10000` REQUIRE: pinned below 2^14, so a
+    // `uint16` downcast cannot truncate — even without access control.
+    #[test]
+    fn silent_on_require_bounded_basis_points() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint16 public feeBP;
+    function setFee(uint256 feeBp) external {
+        require(feeBp <= 10000, "too high");
+        feeBP = uint16(feeBp);
+    }
+}
+"#;
+        assert!(!fires(src), "require(bp <= 10000) bounded downcast must be silent");
+    }
+
+    // (I) BASIS-POINTS PARAM BOUNDED BY `if (x > TOTAL_BASIS_POINTS) revert`: the
+    // revert prunes the over-limit path, so `x <= TOTAL_BASIS_POINTS` survives.
+    // (Lido-style `TOTAL_BASIS_POINTS` cap.)
+    #[test]
+    fn silent_on_if_revert_bounded_basis_points() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint256 internal constant TOTAL_BASIS_POINTS = 100_00;
+    uint16 public rateBP;
+    function setRate(uint256 rateBp) external {
+        if (rateBp > TOTAL_BASIS_POINTS) revert();
+        rateBP = uint16(rateBp);
+    }
+}
+"#;
+        assert!(!fires(src), "if (bp > TOTAL_BASIS_POINTS) revert bounded downcast must be silent");
+    }
+
+    // POSITIVE (I): a basis-points-NAMED param with NO bound and NO access control
+    // is still attacker-supplied and unbounded — it MUST fire. (The name alone
+    // does not license suppression.)
+    #[test]
+    fn fires_on_unbounded_unguarded_basis_points() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint16 public feeBP;
+    function setFee(uint256 feeBp) external {
+        feeBP = uint16(feeBp);
+    }
+}
+"#;
+        assert!(fires(src), "unbounded, unguarded basis-points downcast must still fire");
+    }
+
+    // (J) ACCESS-GATED CONFIG PARAM + SANE GUARD: a plain param of an
+    // access-control-gated setter that is also range-validated by a
+    // `_requireSane*` helper is fully suppressed. (Lido VaultHub.updateConnection
+    // `uint96(_shareLimit)`:488, bounded by `_requireSaneShareLimit`.)
+    #[test]
+    fn silent_on_access_gated_sane_guarded_param() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint96 public shareLimit;
+    function updateConnection(uint256 _shareLimit) external {
+        _requireSender(msg.sender);
+        _requireSaneShareLimit(_shareLimit);
+        shareLimit = uint96(_shareLimit);
+    }
+    function _requireSender(address s) internal view { if (msg.sender != s) revert(); }
+    function _requireSaneShareLimit(uint256 v) internal pure { v; }
+}
+"#;
+        assert!(!fires(src), "access-gated, sane-guarded param downcast must be silent");
+    }
+
+    // (J) ACCESS-GATED CONFIG PARAM, NO EXPLICIT BOUND: downgraded (Low), NOT
+    // dropped — a privileged role is trusted, but an unguarded misconfiguration
+    // that silently truncates is still a review note. It must (a) not be Medium
+    // and (b) not vanish entirely (it sits just above the confidence floor).
+    //
+    // NB: the gate here is a body `_requireSender(...)` *helper* call, not an
+    // `onlyOwner` modifier / `require(msg.sender == ...)`. The latter is
+    // recognized by the dataflow, which then seeds the function's params as
+    // non-attacker (so they never reach this detector at all). A helper call is
+    // NOT dataflow-recognized, so its params arrive as attacker input and it is
+    // this detector's `is_access_gated` that must neutralize them — exactly the
+    // Lido VaultHub shape this rule targets.
+    #[test]
+    fn downgrades_access_gated_unbounded_param() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint64 public window;
+    function setWindow(uint256 _window) external {
+        _requireSender(msg.sender);
+        window = uint64(_window);
+    }
+    function _requireSender(address s) internal view { if (msg.sender != s) revert(); }
+}
+"#;
+        let fs: Vec<_> = run(src)
+            .into_iter()
+            .filter(|f| f.detector == "integer-issues")
+            .collect();
+        assert_eq!(fs.len(), 1, "access-gated unbounded param must still be reported (downgraded)");
+        assert_eq!(
+            fs[0].severity,
+            sluice_findings::Severity::Low,
+            "access-gated unbounded config-param downcast must be downgraded to Low"
+        );
+    }
+
+    // POSITIVE: a downcast inside an access-control-gated function whose operand is
+    // NOT a plain param (here a sum of a param + storage, an unmodeled local) is
+    // NOT laundered by the access gate — it still FIRES at Medium. The trust
+    // assumption is limited to direct parameters.
+    #[test]
+    fn fires_on_access_gated_nonparam_downcast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint128 public acc;
+    uint256 public base;
+    function bump(uint256 amount) external {
+        _requireSender(msg.sender);
+        uint256 total = base + amount;
+        acc = uint128(total);
+    }
+    function _requireSender(address s) internal view { if (msg.sender != s) revert(); }
+}
+"#;
+        assert!(fires(src), "access-gated downcast of a non-param local must still fire");
     }
 }

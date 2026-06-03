@@ -80,14 +80,39 @@ impl Detector for UncheckedReturnDetector {
             }
 
             let (cat, title, sev, msg, rec) = if is_token_call {
-                (
-                    Category::UnsafeErc20,
-                    "Unchecked ERC-20 transfer",
-                    Severity::Medium,
-                    "calls a raw ERC-20 transfer/approve and ignores the boolean return. Non-standard \
-                     tokens (USDT, etc.) return false or revert, silently losing funds.",
-                    "Use OpenZeppelin `SafeERC20` (`safeTransfer`/`safeTransferFrom`).",
-                )
+                // A raw ERC-20 transfer/transferFrom whose receiver resolves to a
+                // FIXED, trusted, in-protocol token — an `immutable`/`constant`
+                // state var, or a receiver whose name/type is a canonical
+                // revert-on-failure token (`WETH9`/`IWETH`, `stETH`/`wstETH`) —
+                // does not lose funds silently: such tokens return `true` or revert,
+                // so the dropped boolean is never `false`. The "non-standard token
+                // like USDT returns false" narrative does not apply to a hardcoded
+                // protocol-owned token. Downgrade to Low (a hygiene note: a
+                // `require`/`SafeERC20` is still best practice) and drop the
+                // USDT-style wording. The Medium case — an arbitrary /
+                // caller-supplied / parameter token address, where the
+                // returns-false risk is genuine — is preserved unchanged.
+                if is_fixed_in_protocol_token(cx, c.function, &c.target) {
+                    (
+                        Category::UnsafeErc20,
+                        "Unchecked transfer of trusted in-protocol token",
+                        Severity::Low,
+                        "ignores the boolean return of a transfer on a fixed, in-protocol token \
+                         (a hardcoded/immutable WETH/stETH-class token that returns true or reverts). \
+                         No funds are lost silently here, but checking the result is still best practice.",
+                        "For hygiene, route the transfer through `SafeERC20` (`safeTransfer`/`safeTransferFrom`) \
+                         or wrap it in a `require`.",
+                    )
+                } else {
+                    (
+                        Category::UnsafeErc20,
+                        "Unchecked ERC-20 transfer",
+                        Severity::Medium,
+                        "calls a raw ERC-20 transfer/approve and ignores the boolean return. Non-standard \
+                         tokens (USDT, etc.) return false or revert, silently losing funds.",
+                        "Use OpenZeppelin `SafeERC20` (`safeTransfer`/`safeTransferFrom`).",
+                    )
+                }
             } else {
                 (
                     Category::UncheckedReturn,
@@ -164,6 +189,80 @@ fn is_permit2_type(ty: &str) -> bool {
         || lower.contains("permit2")
 }
 
+/// True if the receiver of an ERC-20 `transfer`/`transferFrom` resolves to a
+/// FIXED, trusted, in-protocol token — one whose `transfer` is known to return
+/// `true` or revert (never the USDT-style silent `false`). Two independent
+/// signals, either of which is sufficient:
+///
+///   1. the receiver's ROOT identifier is an `immutable`/`constant` state var on
+///      the calling contract (a token wired once at construction: WETH9, the
+///      protocol's own stETH/wstETH module), OR
+///   2. the receiver's name or declared type is a canonical revert-on-failure
+///      token (`WETH9`/`IWETH`/`*WETH*`, `stETH`/`STETH`, `wstETH`/`WSTETH`).
+///
+/// The name/type signal is what catches a non-immutable but still-canonical
+/// handle — e.g. Lido's `WstETH.sol` holds `IStETH public stETH` (a plain state
+/// var) and calls `stETH.transfer(...)`.
+///
+/// An arbitrary / caller-supplied / parameter token (`IERC20(userToken)`, a
+/// `token` param, a mutable `token` var) matches NEITHER and stays Medium, so the
+/// genuine USDT-returns-false risk is preserved.
+fn is_fixed_in_protocol_token(cx: &AnalysisContext, fid: FunctionId, target: &str) -> bool {
+    let root = sluice_frontier::target_root(target.trim());
+    // Signal 2 (text): the receiver expression text itself names a canonical
+    // token — covers inline casts like `IWETH9(x).transfer(...)` and the bare
+    // identifier alike.
+    if is_canonical_token_name(root) || is_canonical_token_type(target.trim()) {
+        return true;
+    }
+
+    if let Some(f) = cx.scir.function(fid) {
+        // Signal 2 (param type): a receiver that is a function parameter whose
+        // declared type is a canonical token (a token handed in but still of the
+        // fixed WETH/stETH class — its transfer reverts, never returns false).
+        if let Some(p) = f.params.iter().find(|p| p.name.as_deref() == Some(root)) {
+            if is_canonical_token_type(&p.ty) {
+                return true;
+            }
+        }
+        if let Some(contract) = cx.scir.contract(f.contract) {
+            if let Some(v) = contract.state_vars.iter().find(|v| v.name == root) {
+                // Signal 1: a fixed (immutable/constant) state var — wired once at
+                // construction and never reassignable.
+                if v.immutable || v.constant {
+                    return true;
+                }
+                // Signal 2 (state-var type): a state var typed as a canonical token.
+                if is_canonical_token_type(&v.ty) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True if an identifier names a canonical revert-on-failure token (case-
+/// insensitive): the WETH family (`WETH`/`WETH9`/`weth9`) or the Lido staked-ETH
+/// family (`stETH`/`STETH`/`wstETH`/`WSTETH`). Substring match so handles like
+/// `_weth9` / `wstEth` are caught. Deliberately narrow — a generic `token` /
+/// `currency` / `asset` receiver is NOT canonical and stays Medium.
+fn is_canonical_token_name(name: &str) -> bool {
+    let n = name.trim_start_matches('_').to_ascii_lowercase();
+    n.contains("weth") || n.contains("steth")
+}
+
+/// True if a declared type string names a canonical revert-on-failure token
+/// interface (`IWETH`/`IWETH9`/`WETH9`, `IStETH`/`IWstETH`/`WstETH`, ...). The
+/// leading type token is taken (an inline cast `IWETH9(x)` renders the name
+/// first), then matched against the WETH / stETH families. The `steth` substring
+/// also subsumes `wsteth`.
+fn is_canonical_token_type(ty: &str) -> bool {
+    let first = ty.split_whitespace().next().unwrap_or(ty);
+    let name = first.split(['(', '<']).next().unwrap_or(first);
+    is_canonical_token_name(name)
+}
+
 /// Count the top-level (paren-depth-1) positional arguments of the call whose
 /// span is given, when its callee method is `transferFrom`. Returns `None` if
 /// the argument list cannot be located. Used to tell the 4-argument Permit2
@@ -235,6 +334,12 @@ mod tests {
 
     fn fired(fs: &[sluice_findings::Finding]) -> bool {
         fs.iter().any(|f| f.detector == "unchecked-return")
+    }
+
+    /// The severity of the (single) `unchecked-return` finding, or `None` if it
+    /// did not fire.
+    fn ur_severity(fs: &[sluice_findings::Finding]) -> Option<sluice_findings::Severity> {
+        fs.iter().find(|f| f.detector == "unchecked-return").map(|f| f.severity)
     }
 
     // TRUE POSITIVE: a raw 2-arg ERC-20 `token.transfer(to, amt)` returns a bool
@@ -335,6 +440,122 @@ mod tests {
         assert!(
             !fired(&run(SAFE_PERMIT2_INHERITED)),
             "4-arg Permit2 transferFrom with inherited handle must not fire (arity signal)"
+        );
+    }
+
+    // ---- trusted in-protocol token downgrade (Medium -> Low) ----
+    use sluice_findings::Severity;
+
+    // An `immutable` WETH9 handle whose `transfer` return is dropped is a hygiene
+    // note, not a fund-loss bug (WETH9 returns true / reverts). Mirrors
+    // universal-router `Payments.wrapETH` (`IWETH9 internal immutable WETH9`).
+    // Must still FIRE, but at LOW.
+    const FIXED_IMMUTABLE_WETH9: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IWETH9 { function transfer(address to, uint256 amt) external returns (bool); function deposit() external payable; }
+        contract Payments {
+            IWETH9 internal immutable WETH9;
+            constructor(address w) { WETH9 = IWETH9(w); }
+            function wrapETH(address recipient, uint256 amount) external {
+                WETH9.transfer(recipient, amount);
+            }
+        }
+    "#;
+
+    // A non-immutable but canonically-named stETH handle (Lido `WstETH.sol` holds
+    // `IStETH public stETH`). The name/type signal must downgrade it to LOW even
+    // though it is a plain (reassignable-typed) state var.
+    const FIXED_STETH_BY_NAME: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IStETH { function transfer(address to, uint256 amt) external returns (bool); function transferFrom(address f, address t, uint256 a) external returns (bool); }
+        contract WstETH {
+            IStETH public stETH;
+            constructor(IStETH _s) { stETH = _s; }
+            function unwrap(uint256 amt) external { stETH.transfer(msg.sender, amt); }
+        }
+    "#;
+
+    // An immutable STETH/WSTETH `transferFrom` (3-arg ERC-20 shape) — Lido
+    // `WithdrawalQueue`. Must fire at LOW (immutable signal), and the 4-arg
+    // Permit2 suppression must not swallow the 3-arg call.
+    const FIXED_IMMUTABLE_STETH_TRANSFER_FROM: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IStETH { function transferFrom(address f, address t, uint256 a) external returns (bool); }
+        contract WithdrawalQueue {
+            IStETH public immutable STETH;
+            constructor(IStETH _s) { STETH = _s; }
+            function requestWithdrawal(uint256 amt) external {
+                STETH.transferFrom(msg.sender, address(this), amt);
+            }
+        }
+    "#;
+
+    // ARBITRARY / caller-supplied token via inline cast `IERC20(userToken)` — the
+    // genuine USDT-returns-false risk. Must stay MEDIUM.
+    const ARBITRARY_TOKEN_TRANSFER: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IERC20 { function transfer(address to, uint256 amt) external returns (bool); }
+        contract Router {
+            function rescue(address userToken, address to, uint256 amt) external {
+                IERC20(userToken).transfer(to, amt);
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_low_on_immutable_weth9() {
+        assert_eq!(
+            ur_severity(&run(FIXED_IMMUTABLE_WETH9)),
+            Some(Severity::Low),
+            "immutable WETH9.transfer must fire at Low (trusted in-protocol token)"
+        );
+    }
+
+    #[test]
+    fn fires_low_on_steth_by_name() {
+        assert_eq!(
+            ur_severity(&run(FIXED_STETH_BY_NAME)),
+            Some(Severity::Low),
+            "canonically-named stETH.transfer must fire at Low even when not immutable"
+        );
+    }
+
+    #[test]
+    fn fires_low_on_immutable_steth_transfer_from() {
+        assert_eq!(
+            ur_severity(&run(FIXED_IMMUTABLE_STETH_TRANSFER_FROM)),
+            Some(Severity::Low),
+            "immutable STETH.transferFrom (3-arg) must fire at Low"
+        );
+    }
+
+    #[test]
+    fn fires_medium_on_arbitrary_token_cast() {
+        assert_eq!(
+            ur_severity(&run(ARBITRARY_TOKEN_TRANSFER)),
+            Some(Severity::Medium),
+            "IERC20(userToken).transfer must stay Medium (USDT-returns-false risk is real)"
+        );
+    }
+
+    // Recall guard: the arbitrary-token corpus shapes must stay MEDIUM, not get
+    // swept into Low. A generic `token`/`PT` receiver is not a canonical token.
+    #[test]
+    fn arbitrary_receivers_stay_medium() {
+        assert_eq!(
+            ur_severity(&run(VULN_ERC20_TRANSFER)),
+            Some(Severity::Medium),
+            "generic `token.transfer` must stay Medium"
+        );
+        assert_eq!(
+            ur_severity(&run(VULN_PT_TRANSFER)),
+            Some(Severity::Medium),
+            "generic `PT.transfer` must stay Medium"
+        );
+        assert_eq!(
+            ur_severity(&run(VULN_ERC20_TRANSFER_FROM)),
+            Some(Severity::Medium),
+            "generic 3-arg `token.transferFrom` must stay Medium"
         );
     }
 }

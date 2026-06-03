@@ -5,7 +5,7 @@ use crate::detector::Detector;
 use crate::detectors::is_privileged_name;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
 use sluice_invariant::InvariantKind;
-use sluice_ir::GuardKind;
+use sluice_ir::{Expr, ExprKind, GuardKind, Stmt, StmtKind};
 
 pub struct AccessControlDetector;
 
@@ -40,6 +40,7 @@ impl Detector for AccessControlDetector {
                         if cx.has_access_control(f)
                             || cx.is_initializer(f)
                             || is_oneshot_initializer(f)
+                            || is_signature_gated_auth(f)
                             || is_user_facing(&f.name)
                             || is_framework_hook(&f.name)
                         {
@@ -96,6 +97,7 @@ impl Detector for AccessControlDetector {
             if cx.has_access_control(f)
                 || cx.is_initializer(f)
                 || is_oneshot_initializer(f)
+                || is_signature_gated_auth(f)
                 || f.is_constructor()
                 || is_framework_hook(&f.name)
                 || is_noop_body(f)
@@ -234,6 +236,219 @@ fn guard_mentions_var(text: &str, var: &str) -> bool {
         i = start + 1;
     }
     false
+}
+
+/// True if the function authorizes the caller by recovering an ECDSA signer and
+/// gating on it — the signature-gated access-control pattern (Lido
+/// `DepositSecurityModule.pauseDeposits`: recover a guardian address from a
+/// signature, then `revert` unless the recovered signer is a registered
+/// guardian). This is genuine authorization (only a holder of a guardian key can
+/// produce a passing signature), just expressed via signature recovery rather
+/// than an `onlyOwner`/`onlyRole` modifier or a `msg.sender ==` check, so it is
+/// NOT "missing access control".
+///
+/// Precision: requires BOTH (a) a signer-recovery call (`ECDSA.recover` /
+/// `*.recover` / `ecrecover`) AND (b) a revert/require gate whose condition is
+/// derived (transitively, by intra-function dataflow) from that recovered
+/// signer. A `recover` whose result is only logged/emitted or returned — never
+/// fed into a reverting check — does NOT count, so an unguarded privileged
+/// setter that merely happens to recover a signature still fires. (This mirrors
+/// the real anti-pattern in `wormhole.sol`, where the recovered signer is
+/// discarded and the quorum check keys off a counter, not the signer — that
+/// must remain a true positive.)
+fn is_signature_gated_auth(f: &sluice_ir::Function) -> bool {
+    // (a) Locate the variables that receive a recovered signer, plus whether any
+    //     recover call happened at all.
+    let mut recovered_into: Vec<String> = Vec::new();
+    let mut recover_seen = false;
+    collect_recover_sinks(&f.body, &mut recovered_into, &mut recover_seen);
+    if !recover_seen {
+        return false;
+    }
+
+    // Propagate signer-taint through local assignments/decls: any local assigned
+    // from an expression that references an already-tainted name becomes tainted
+    // (e.g. `guardianIndex = _getGuardianIndex(guardianAddr)` taints
+    // `guardianIndex` once `guardianAddr` is the recovered signer). A fixpoint
+    // over a few passes covers ordinary straight-line dependency chains.
+    let mut tainted: Vec<String> = recovered_into;
+    for _ in 0..6 {
+        let before = tainted.len();
+        propagate_taint(&f.body, &mut tainted);
+        if tainted.len() == before {
+            break;
+        }
+    }
+
+    // (b) Require a revert/require gate whose condition references a tainted name
+    //     — the equality/membership check that rejects an unauthorized signer.
+    body_has_reverting_check_on(&f.body, &tainted)
+}
+
+/// True if a callee name denotes ECDSA signer recovery.
+fn is_recover_name(name: &str) -> bool {
+    name == "recover" || name == "ecrecover" || name == "tryRecover"
+}
+
+/// Walk the body collecting the names of locals assigned the result of a
+/// signer-recovery call (`addr = ECDSA.recover(..)`, `address a = ecrecover(..)`),
+/// and set `recover_seen` if any recovery call appears at all.
+fn collect_recover_sinks(stmts: &[Stmt], sinks: &mut Vec<String>, recover_seen: &mut bool) {
+    // `Stmt::visit` is pre-order over the whole tree, so iterating each top-level
+    // statement covers every nested statement exactly once. The Lido recover
+    // lives inside an `if (guardianIndex == -1) { ... }`, hence the deep walk.
+    for s in stmts {
+        s.visit(&mut |inner| match &inner.kind {
+            StmtKind::VarDecl { name: Some(n), init: Some(e), .. } => {
+                if expr_is_recover_call(e) {
+                    push_unique(sinks, n);
+                }
+            }
+            StmtKind::Expr(e) => {
+                if let ExprKind::Assign { target, value, .. } = &e.kind {
+                    if expr_is_recover_call(value) {
+                        if let Some(name) = lvalue_root_name(target) {
+                            push_unique(sinks, name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+    // Whether any recover call appears anywhere in the body (covers the
+    // `recover` even when its result is consumed inline, e.g. as a call arg).
+    for s in stmts {
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Call(c) = &e.kind {
+                let nm = c.func_name.as_deref().or_else(|| c.callee.simple_name());
+                if nm.map(is_recover_name).unwrap_or(false) {
+                    *recover_seen = true;
+                }
+            }
+        });
+    }
+}
+
+/// True if `e` is (or, peeling a surrounding call/cast/ternary, contains as its
+/// value-producing head) a signer-recovery call.
+fn expr_is_recover_call(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call(c) => {
+            let nm = c.func_name.as_deref().or_else(|| c.callee.simple_name());
+            nm.map(is_recover_name).unwrap_or(false)
+        }
+        // `address(ECDSA.recover(...))` / `payable(recover(...))`.
+        ExprKind::New(inner) => expr_is_recover_call(inner),
+        _ => false,
+    }
+}
+
+/// Root variable name of an assignment target (`a` for `a`, `a.b`, `a[i]`).
+fn lvalue_root_name(target: &Expr) -> Option<&str> {
+    match &target.kind {
+        ExprKind::Ident(n) => Some(n),
+        ExprKind::Member { base, .. } => lvalue_root_name(base),
+        ExprKind::Index { base, .. } => lvalue_root_name(base),
+        _ => None,
+    }
+}
+
+/// One dataflow pass: taint any local assigned from an expression that mentions
+/// an already-tainted name.
+fn propagate_taint(stmts: &[Stmt], tainted: &mut Vec<String>) {
+    // Collect newly-tainted names against the *current* set first, then merge —
+    // so we never borrow `tainted` mutably and immutably at the same time.
+    let mut additions: Vec<String> = Vec::new();
+    for s in stmts {
+        s.visit(&mut |inner| match &inner.kind {
+            StmtKind::VarDecl { name: Some(n), init: Some(e), .. } => {
+                if expr_mentions_any(e, tainted) {
+                    push_unique(&mut additions, n);
+                }
+            }
+            StmtKind::Expr(e) => {
+                if let ExprKind::Assign { target, value, .. } = &e.kind {
+                    if expr_mentions_any(value, tainted) {
+                        if let Some(name) = lvalue_root_name(target) {
+                            push_unique(&mut additions, name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+    for a in additions {
+        push_unique(tainted, &a);
+    }
+}
+
+/// True if expression `e` references any identifier in `names`.
+fn expr_mentions_any(e: &Expr, names: &[String]) -> bool {
+    let mut found = false;
+    e.visit(&mut |x| {
+        if let ExprKind::Ident(id) = &x.kind {
+            if names.iter().any(|n| n == id) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// True if the body contains a revert/require gate whose *condition* references a
+/// tainted (signer-derived) name — i.e. control flow reverts based on the
+/// recovered signer. Covers `if (cond) revert ...` / `if (cond) return` and
+/// `require(cond, ...)`.
+fn body_has_reverting_check_on(stmts: &[Stmt], tainted: &[String]) -> bool {
+    let mut hit = false;
+    for s in stmts {
+        s.visit(&mut |inner| {
+            if hit {
+                return;
+            }
+            // `if (cond) { revert/return }` with the condition referencing the signer.
+            if let StmtKind::If { cond, then_branch, else_branch } = &inner.kind {
+                if else_branch.is_empty()
+                    && branch_reverts(then_branch)
+                    && expr_mentions_any(cond, tainted)
+                {
+                    hit = true;
+                }
+            }
+            // `require(cond, ...)` referencing the signer.
+            if let StmtKind::Expr(e) = &inner.kind {
+                if let ExprKind::Call(c) = &e.kind {
+                    let is_require = matches!(c.func_name.as_deref(), Some("require") | Some("assert"));
+                    if is_require {
+                        if let Some(first) = c.args.first() {
+                            if expr_mentions_any(first, tainted) {
+                                hit = true;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        if hit {
+            break;
+        }
+    }
+    hit
+}
+
+/// True if a one-statement branch is a `revert`/`return` (the guard-on-failure
+/// shape), mirroring the parser's `is_guard_branch`.
+fn branch_reverts(branch: &[Stmt]) -> bool {
+    branch.iter().any(|s| matches!(s.kind, StmtKind::Revert { .. } | StmtKind::Return(_)))
+}
+
+/// Push `name` into `v` if not already present.
+fn push_unique(v: &mut Vec<String>, name: &str) {
+    if !v.iter().any(|x| x == name) {
+        v.push(name.to_string());
+    }
 }
 
 /// Intentionally-permissionless, user-facing function names that should not be
@@ -454,6 +669,120 @@ mod tests {
             }
         "#;
         assert!(fires_on(src, "initWallet"), "unguarded initWallet (Parity) must still fire (recall)");
+    }
+
+    // ---- FP: signature-gated authorization (Lido DepositSecurityModule.pauseDeposits).
+    // The function writes a privileged scalar (`isDepositsPaused`) with no
+    // onlyOwner/msg.sender guard, BUT recovers a guardian address from an ECDSA
+    // signature and reverts unless that recovered signer is a registered
+    // guardian (`_getGuardianIndex(guardianAddr) == -1` -> revert). This IS
+    // access control (signature-gated), so it must NOT be flagged. ----
+    #[test]
+    fn silent_on_signature_gated_pause() {
+        let src = r#"
+            library ECDSA {
+                function recover(bytes32 h, bytes32 r, bytes32 vs) internal pure returns (address) {}
+            }
+            contract DepositSecurityModule {
+                bool public isDepositsPaused;
+                address public owner;
+                bytes32 public constant PAUSE_MESSAGE_PREFIX = keccak256("x");
+                uint256 public pauseIntentValidityPeriodBlocks;
+                error InvalidSignature();
+                error PauseIntentExpired();
+                struct Signature { bytes32 r; bytes32 vs; }
+                function _getGuardianIndex(address a) internal view returns (int256) {}
+                function pauseDeposits(uint256 blockNumber, Signature memory sig) external {
+                    if (isDepositsPaused) return;
+                    address guardianAddr = msg.sender;
+                    int256 guardianIndex = _getGuardianIndex(msg.sender);
+                    if (guardianIndex == -1) {
+                        bytes32 msgHash = keccak256(abi.encodePacked(PAUSE_MESSAGE_PREFIX, blockNumber));
+                        guardianAddr = ECDSA.recover(msgHash, sig.r, sig.vs);
+                        guardianIndex = _getGuardianIndex(guardianAddr);
+                        if (guardianIndex == -1) revert InvalidSignature();
+                    }
+                    if (block.number - blockNumber > pauseIntentValidityPeriodBlocks) revert PauseIntentExpired();
+                    isDepositsPaused = true;
+                }
+                function setOwner(address o) external { require(msg.sender == owner); owner = o; }
+                function poke() external { require(msg.sender == owner); }
+            }
+        "#;
+        assert!(
+            !fires_on(src, "pauseDeposits"),
+            "signature-gated pauseDeposits (recover + guardian revert-gate) must not be flagged"
+        );
+    }
+
+    // ---- FP: direct `ecrecover(...) == signer` equality gate is also auth. ----
+    #[test]
+    fn silent_on_ecrecover_equality_gated_setter() {
+        let src = r#"
+            contract Config {
+                address public owner;
+                address public trustedSigner;
+                function setOwner(address newOwner, uint8 v, bytes32 r, bytes32 s) external {
+                    bytes32 digest = keccak256(abi.encodePacked(newOwner));
+                    address recovered = ecrecover(digest, v, r, s);
+                    require(recovered == trustedSigner, "bad sig");
+                    owner = newOwner;
+                }
+                function rotate(address t) external { require(msg.sender == owner); trustedSigner = t; }
+                function poke() external { require(msg.sender == owner); }
+            }
+        "#;
+        assert!(
+            !fires_on(src, "setOwner"),
+            "ecrecover==signer-gated setter must not be flagged (signature-gated auth)"
+        );
+    }
+
+    // ---- TP guard (precision): a privileged setter that recovers a signature but
+    // NEVER gates on the recovered signer (the wormhole anti-pattern: recovered
+    // address discarded, no revert/require keyed off it) MUST still fire. The
+    // recover-only-logged case is not authorization. ----
+    #[test]
+    fn fires_on_recover_without_signer_gate() {
+        let src = r#"
+            contract Config {
+                address public owner;
+                event Recovered(address who);
+                function setOwner(address newOwner, uint8 v, bytes32 r, bytes32 s) external {
+                    bytes32 digest = keccak256(abi.encodePacked(newOwner));
+                    address recovered = ecrecover(digest, v, r, s);
+                    emit Recovered(recovered); // discarded — never gates control flow
+                    owner = newOwner;
+                }
+            }
+        "#;
+        assert!(
+            fires_on(src, "setOwner"),
+            "recover whose result only feeds an event (no revert-gate) must still fire (recall)"
+        );
+    }
+
+    // ---- TP guard (precision): recover result gates an UNRELATED variable, not
+    // the signer. A `require` keyed off a counter/amount (not signer-derived)
+    // does not authorize the caller, so the unguarded privileged write fires. ----
+    #[test]
+    fn fires_on_recover_with_unrelated_gate() {
+        let src = r#"
+            contract Config {
+                address public owner;
+                function setOwner(address newOwner, uint256 amount, uint8 v, bytes32 r, bytes32 s) external {
+                    bytes32 digest = keccak256(abi.encodePacked(newOwner));
+                    address recovered = ecrecover(digest, v, r, s);
+                    recovered; // not used in any gate
+                    require(amount > 0, "amount");
+                    owner = newOwner;
+                }
+            }
+        "#;
+        assert!(
+            fires_on(src, "setOwner"),
+            "recover with a gate on an unrelated var (not the signer) must still fire (recall)"
+        );
     }
 }
 

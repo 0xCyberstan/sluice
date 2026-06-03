@@ -70,15 +70,23 @@ impl Detector for TwapManipulationDetector {
 
             let src = cx.source_text(f.span);
 
-            // --- (1) Does this function read a Uniswap-V3-style price at all? ---
-            let uses_slot0 = src.contains("slot0");
-            let uses_observe = src.contains("observe") || src.contains("consult") || src.contains("observesingle");
-            // A raw cumulative-price difference (the V2 `price0CumulativeLast`
-            // pattern, or a V3 `tickCumulative` delta) is a hand-rolled TWAP.
-            let uses_cumulative = src.contains("price0cumulative")
-                || src.contains("price1cumulative")
-                || src.contains("tickcumulative")
-                || src.contains("cumulativeprice");
+            // --- (1) Does this function actually *call* a Uniswap-style oracle read? ---
+            //
+            // Precision-critical: we classify the body by its CALL EXPRESSIONS, not by
+            // a substring of the source. A bare identifier / parameter / function name
+            // that merely *contains* "observe" (the event-`observer` pattern —
+            // `removeObserver`/`observers`/`_observerIndex`), or a local variable
+            // spelled `tickCumulatives`, is NOT an oracle read and must never trip this
+            // detector. We require a call expression whose resolved method is a genuine
+            // TWAP/oracle primitive (`observe`/`observeSingle`/`consult` /
+            // `getTimeWeightedAverage`, an ambiguous `current`/`quote` only *on a
+            // receiver handle*, or a `slot0` read), or a cumulative-price getter
+            // (`price0CumulativeLast`/`price1CumulativeLast`/`tickCumulative`) read off a
+            // pool/pair handle.
+            let reads = classify_oracle_reads(f);
+            let uses_slot0 = reads.slot0;
+            let uses_observe = reads.observe;
+            let uses_cumulative = reads.cumulative;
             if !uses_slot0 && !uses_observe && !uses_cumulative {
                 continue;
             }
@@ -232,6 +240,97 @@ impl Detector for TwapManipulationDetector {
 }
 
 // ------------------------------------------------------------------ heuristics
+
+/// Which Uniswap-style oracle reads a function body actually *calls*.
+#[derive(Default)]
+struct OracleReads {
+    /// A `slot0()` / `getSlot0(...)` read — the instantaneous current-block tick.
+    slot0: bool,
+    /// A true-TWAP primitive call: `observe`/`observeSingle`/`consult` /
+    /// `getTimeWeightedAverage`, or an ambiguous `current`/`quote` *on a receiver
+    /// handle*. (The averaging window may still be fake — that is decided later.)
+    observe: bool,
+    /// A hand-rolled cumulative-price read: a `price0CumulativeLast` /
+    /// `price1CumulativeLast` / `tickCumulative*` getter read off a pool/pair handle.
+    cumulative: bool,
+}
+
+/// Unambiguous TWAP/oracle primitives: seeing a *call* with one of these resolved
+/// method names is conclusive evidence of an oracle read, whether the call is bare
+/// (`consult(...)`, an in-repo wrapper) or a member call (`pool.observe(...)`).
+const OBSERVE_METHODS: &[&str] = &["observe", "observesingle", "consult", "gettimeweightedaverage"];
+
+/// Ambiguous read methods (`current()` on an OZ `Counter`, a generic `quote(...)`)
+/// that count as an oracle read ONLY when called on a *receiver handle*
+/// (`twapOracle.current(...)`, `pair.quote(...)`), never as a bare local call.
+const OBSERVE_METHODS_RECEIVER_ONLY: &[&str] = &["current", "quote"];
+
+/// Classify a function body by the Uniswap-style oracle reads it actually *calls*.
+///
+/// This replaces the previous `source.contains("observe")` substring test, which
+/// false-fired on the event-observer pattern (`removeObserver`/`observers`/
+/// `_observerIndex` on Lido's `TokenRateNotifier`): those are identifiers / a
+/// function name, not an `observe` oracle call. We match on the resolved CALL name
+/// (exact for the TWAP primitives) and on cumulative-price getters read off a
+/// receiver handle — a bare local identifier such as `tickCumulatives` (the result
+/// of an `observe`) is deliberately NOT a trigger on its own.
+fn classify_oracle_reads(f: &sluice_ir::Function) -> OracleReads {
+    use sluice_ir::ExprKind;
+    let mut r = OracleReads::default();
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            match &e.kind {
+                ExprKind::Call(c) => {
+                    let name = c.func_name.as_deref().unwrap_or("").to_ascii_lowercase();
+                    if name.is_empty() {
+                        return;
+                    }
+                    // `slot0()` / `getSlot0(...)` — instantaneous price.
+                    if name == "slot0" || name == "getslot0" {
+                        r.slot0 = true;
+                    }
+                    // Unambiguous TWAP primitives (bare or member call).
+                    if OBSERVE_METHODS.contains(&name.as_str()) {
+                        r.observe = true;
+                    }
+                    // Ambiguous read methods only count on a receiver handle.
+                    if c.receiver.is_some() && OBSERVE_METHODS_RECEIVER_ONLY.contains(&name.as_str()) {
+                        r.observe = true;
+                    }
+                    // A cumulative-price *getter* called on a receiver handle
+                    // (`pair.price0CumulativeLast()`).
+                    if c.receiver.is_some() && is_cumulative_price_name(&name) {
+                        r.cumulative = true;
+                    }
+                }
+                // A cumulative-price public-getter read written as a member access
+                // without call parens (`pair.price0CumulativeLast`). Requires the
+                // `member` form (a `.field` off a handle), so a bare local
+                // `tickCumulatives` identifier is excluded.
+                ExprKind::Member { member, .. } => {
+                    if is_cumulative_price_name(&member.to_ascii_lowercase()) {
+                        r.cumulative = true;
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+    r
+}
+
+/// True if a (lowercased) method/member name is a canonical Uniswap cumulative-
+/// price getter (`price0CumulativeLast`, `price1CumulativeLast`, `tickCumulatives`,
+/// `secondsPerLiquidityCumulativeX128`, …). Matched on the handle-qualified name so
+/// it never trips on an unrelated local variable of the same spelling.
+fn is_cumulative_price_name(name: &str) -> bool {
+    (name.contains("price0cumulative")
+        || name.contains("price1cumulative")
+        || name.contains("tickcumulative")
+        || name.contains("cumulativeprice"))
+        // `secondsPerLiquidityCumulative*` is the other V3 cumulative accumulator.
+        || name.contains("cumulativex")
+}
 
 /// True if a numeric literal adjacent to a TWAP-window keyword is at least
 /// [`MIN_TWAP_WINDOW`] (e.g. `secondsAgo = 1800`, `uint32 PERIOD = 3600`). A
@@ -621,6 +720,78 @@ mod tests {
         assert!(
             fs.iter().any(|f| f.detector == "twap-manipulation"),
             "a view getter that derives a value from slot0 must still fire: {:?}",
+            fs
+        );
+    }
+
+    // ---- Lexical-FP fix: oracle reads are matched by CALL, not by substring ----
+
+    // Real shape (Lido `TokenRateNotifier.removeObserver`): a pure `onlyOwner`
+    // array `pop()` that maintains an event-`observers` list. It contains the
+    // SUBSTRING "observe" in the identifiers `removeObserver`/`observers`/
+    // `_observerIndex`, but computes NO price and never calls `observe`/`consult`
+    // /`slot0`/a cumulative getter. The old `source.contains("observe")` gate
+    // false-fired High here; with call-based classification it must be SILENT.
+    const EVENT_OBSERVER_REMOVE: &str = r#"
+        interface ITokenRatePusher { function pushTokenRate() external; }
+        contract TokenRateNotifier {
+            address[] public observers;
+            uint256 public constant INDEX_NOT_FOUND = type(uint256).max;
+            function _observerIndex(address observer_) internal view returns (uint256) {
+                uint256 len = observers.length;
+                for (uint256 i = 0; i < len; i++) {
+                    if (observers[i] == observer_) return i;
+                }
+                return INDEX_NOT_FOUND;
+            }
+            function removeObserver(address observer_) external {
+                uint256 idx = _observerIndex(observer_);
+                require(idx != INDEX_NOT_FOUND, "no observer");
+                if (idx != observers.length - 1) {
+                    observers[idx] = observers[observers.length - 1];
+                }
+                observers.pop();
+            }
+        }
+    "#;
+
+    #[test]
+    fn event_observer_remove_is_silent() {
+        let fs = run(EVENT_OBSERVER_REMOVE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "an event-observer `removeObserver` array pop with no oracle call must \
+             not fire (substring \"observe\" is not an oracle read): {:?}",
+            fs.iter().filter(|f| f.detector == "twap-manipulation").collect::<Vec<_>>()
+        );
+    }
+
+    // Real shape (Uniswap-V2 cumulative TWAP, the Mango/cumulative class): a
+    // genuine `price0CumulativeLast` read off a pair handle, differenced over an
+    // unbounded interval and used as a price. This is a real, hand-rolled TWAP
+    // oracle read (a CALL on a handle, not an identifier substring) and MUST fire.
+    const V2_CUMULATIVE_TWAP: &str = r#"
+        interface IUniswapV2Pair {
+            function price0CumulativeLast() external view returns (uint256);
+        }
+        contract V2Oracle {
+            IUniswapV2Pair public pair;
+            uint256 public lastCumulative;
+            uint32 public lastTimestamp;
+            function consultPrice() external view returns (uint256 price) {
+                uint256 current = pair.price0CumulativeLast();
+                uint256 elapsed = block.timestamp - lastTimestamp;
+                price = (current - lastCumulative) / elapsed;
+            }
+        }
+    "#;
+
+    #[test]
+    fn v2_cumulative_price_read_fires() {
+        let fs = run(V2_CUMULATIVE_TWAP);
+        assert!(
+            fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "a genuine price0CumulativeLast TWAP read used for a price must still fire: {:?}",
             fs
         );
     }

@@ -16,7 +16,7 @@ use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder};
 use sluice_frontier::ReentrancyKind;
-use sluice_ir::{CallKind, CallSite, Function};
+use sluice_ir::{CallKind, CallSite, Contract, Function};
 
 pub struct ReentrancyDetector;
 
@@ -110,6 +110,197 @@ fn is_library_static_call(cs: &CallSite, contract_state_vars: &rustc_hash::FxHas
     pascal && !contract_state_vars.contains(root)
 }
 
+/// True iff `ty` (a textual Solidity type) is a VALUE type — a fixed-width
+/// numeric/bytes/bool/enum scalar. You cannot make a cross-contract call on a
+/// value, so a method invoked on a value-typed receiver is ALWAYS a `using`-bound
+/// library dispatch (an internal `JUMP`), never an external re-entry vector.
+/// (`address`/`address payable` and capitalized interface/contract types are NOT
+/// value types — calls on those can be real external calls and stay armed.)
+fn is_value_type_str(ty: &str) -> bool {
+    let t = ty.trim();
+    t.starts_with("uint")
+        || t.starts_with("int")
+        || t == "bool"
+        || t.starts_with("enum ")
+        || (t.starts_with("bytes")
+            // `bytes1..bytes32` are value types; dynamic `bytes`/`bytes calldata`
+            // are reference types (but still never a call receiver, so harmless).
+            && t[5..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true))
+}
+
+/// The element/value type of a `mapping(K => V)` or `T[]` declaration, if the
+/// outer type is a mapping or array. Used to decide whether `m[k].foo()` /
+/// `a[i].foo()` invokes a library on a VALUE element (a helper) or on a stored
+/// interface/address (a real external call). For nested `mapping(=>mapping(=>V))`
+/// we peel to the innermost `V`.
+fn mapping_or_array_value_type(ty: &str) -> Option<String> {
+    let t = ty.trim();
+    if t.starts_with("mapping") {
+        // Innermost value type is the segment after the LAST `=>`.
+        let after = t.rsplit("=>").next()?.trim();
+        // Strip a trailing `)` chain from the nested-mapping close-parens.
+        let v = after.trim_end_matches(')').trim();
+        return Some(v.to_string());
+    }
+    if let Some(stripped) = t.strip_suffix("]") {
+        // `T[]` / `T[N]` -> element type `T` (drop the `[...]`).
+        if let Some(open) = stripped.rfind('[') {
+            return Some(stripped[..open].trim().to_string());
+        }
+    }
+    None
+}
+
+/// Per-contract facts the detector needs to recognize `using`-bound library /
+/// value-helper pseudo-external calls and to reason about config/guard storage.
+struct ContractCallFacts {
+    /// State-var names whose receiver resolves to a VALUE type: a value-typed
+    /// scalar (`bytes32 TOTAL_SHARES_POSITION`, `uint256 x`) or a mapping/array
+    /// whose ELEMENT is a value type (`mapping(address=>uint256) shares` ->
+    /// `shares[k]`). A method call whose target root is one of these is a bound
+    /// library/value helper, never a cross-contract call.
+    value_recv_vars: rustc_hash::FxHashSet<String>,
+    /// `true` iff the contract has at least one `using L for <valueType>` directive
+    /// (the SafeMath/Math/SafeCast/UnstructuredStorage pattern) — the precondition
+    /// for treating a value-helper-NAMED call on a non-state receiver
+    /// (`localUint.sub(x)`, `userStake.mulDiv(...)`) as a library dispatch.
+    binds_value_library: bool,
+    /// State-var names that are `constant`/`immutable` — a read of one of these is
+    /// a fixed value an attacker cannot corrupt by re-entering, so it can never
+    /// seed a cross-function "stale value carried across the call" surface.
+    fixed_vars: rustc_hash::FxHashSet<String>,
+}
+
+impl ContractCallFacts {
+    fn build(contract: Option<&Contract>) -> Self {
+        let mut value_recv_vars = rustc_hash::FxHashSet::default();
+        let mut fixed_vars = rustc_hash::FxHashSet::default();
+        let mut binds_value_library = false;
+        if let Some(c) = contract {
+            for v in &c.state_vars {
+                if v.constant || v.immutable {
+                    fixed_vars.insert(v.name.clone());
+                }
+                let elem = mapping_or_array_value_type(&v.ty);
+                let recv_is_value = match &elem {
+                    // `m[k]`/`a[i]` receiver is the element type.
+                    Some(e) => is_value_type_str(e),
+                    // Bare scalar receiver.
+                    None => is_value_type_str(&v.ty),
+                };
+                if recv_is_value {
+                    value_recv_vars.insert(v.name.clone());
+                }
+            }
+            // A `using L for <valueType>` (or `using L for *`) binds library methods
+            // to value receivers — the marker that helper-named calls on value
+            // locals are internal dispatches.
+            for u in &c.using_for {
+                let binds = match &u.ty {
+                    None => true, // `using L for *` binds everything, incl. value types
+                    Some(t) => is_value_type_str(t),
+                };
+                if binds {
+                    binds_value_library = true;
+                    break;
+                }
+            }
+        }
+        ContractCallFacts { value_recv_vars, binds_value_library, fixed_vars }
+    }
+}
+
+/// A curated set of `using`-bound, side-effect-free VALUE / math / cast / unstructured
+/// storage helper method names (SafeMath, Math, SignedMath, FixedPointMath,
+/// SafeCast, UnstructuredStorage and the Lido `UnstructuredStorageExt`). These are
+/// pure in-process computations on a value/storage-slot receiver and never a
+/// cross-contract control transfer, so a call to one cannot arm reentrancy. Only
+/// consulted when the contract actually binds a value-type library, so a same-named
+/// genuine external method (rare) on a contract that does NOT use such a library is
+/// unaffected.
+fn is_value_helper_name(name: Option<&str>) -> bool {
+    let Some(n) = name else { return false };
+    // Prefix families: SafeCast `toUintNN`/`toIntNN`, UnstructuredStorage
+    // `setStorageX`/`getStorageX`, FixedPoint `mulDiv*`/`mulWad*`/`divWad*`,
+    // Lido `setLowUint*`/`getLowUint*`/`setHighUint*`/`getHighUint*`.
+    if n.starts_with("toUint")
+        || n.starts_with("toInt")
+        || n.starts_with("setStorage")
+        || n.starts_with("getStorage")
+        || n.starts_with("mulDiv")
+        || n.starts_with("mulWad")
+        || n.starts_with("divWad")
+        || n.starts_with("rayMul")
+        || n.starts_with("rayDiv")
+        || n.starts_with("wadMul")
+        || n.starts_with("wadDiv")
+        || n.starts_with("setLowUint")
+        || n.starts_with("getLowUint")
+        || n.starts_with("setHighUint")
+        || n.starts_with("getHighUint")
+    {
+        return true;
+    }
+    matches!(
+        n,
+        "add" | "sub" | "mul" | "div" | "mod" | "pow" | "exp"
+            | "min" | "max" | "average" | "ceilDiv" | "sqrt"
+            | "log2" | "log10" | "log256" | "abs" | "diff"
+            | "tryAdd" | "trySub" | "tryMul" | "tryDiv" | "tryMod"
+            | "addMod" | "mulMod"
+    )
+}
+
+/// True iff this `External`, non-value, non-token-transfer call is really a
+/// `using`-bound library / VALUE-helper dispatch rather than a cross-contract call.
+/// Two sound sources (mirroring `is_library_static_call`, which handles the bare
+/// PascalCase-namespace shape `Time.timestamp()`):
+///   * (i) the receiver provably resolves to a VALUE type — a value-typed state
+///     var (`TOTAL_SHARES_POSITION_LOW128.setLowUint128`) or a value-element
+///     mapping/array element (`shares[k].add`). You cannot call a contract on a
+///     `uint256`/`bytes32`, so this is always a `using` library call.
+///   * (ii) the contract binds a value-type library (`using SafeMath for uint256`,
+///     `using Math for uint256`) AND the method name is a known math/cast/storage
+///     helper — covering the receiver-is-a-value-LOCAL case (`currentSenderShares.sub`,
+///     `userStake.mulDiv`, `_getTotalShares().add`) where the receiver's value type
+///     isn't visible from a state-var declaration.
+/// Token-transfer-named and value-bearing calls are excluded for safety: even a
+/// `using SafeERC20 for IERC20` `token.safeTransfer(...)` moves tokens and stays
+/// armed (the ERC-777/721 hook re-entry surface).
+fn is_value_helper_call(cs: &CallSite, facts: &ContractCallFacts) -> bool {
+    if cs.kind != CallKind::External || cs.sends_value || is_token_transfer_name(cs.func_name.as_deref()) {
+        return false;
+    }
+    let root = sluice_frontier::target_root(&cs.target);
+    // (i) provable value-typed receiver (scalar var, or value-mapping/array element).
+    if facts.value_recv_vars.contains(root) {
+        return true;
+    }
+    // (ii) value-library `using` + recognized pure helper method name.
+    facts.binds_value_library && is_value_helper_name(cs.func_name.as_deref())
+}
+
+/// True iff `name` reads like a CONFIG / time-window / guard scalar — a date,
+/// activation/deadline window, limit/cap/threshold, pause/mode/status flag — that
+/// an entry guard compares against (`if (block.timestamp >= startClaimDate) ...`,
+/// `if (emergencyMode) ...`). A pre-call READ of such a scalar is a permission/state
+/// check, not a value an attacker corrupts by re-entering, so it must not seed a
+/// cross-function surface (LoopFi `withdraw` reads `startClaimDate`/`loopActivation`/
+/// `emergencyMode` before its `msg.sender.call{value:}` while settling balances
+/// first — CEI-correct). Kept narrow (config/time/flag words only) so a genuine
+/// value/accounting var carried across the call (Pendle `positionData`) is never
+/// excluded.
+fn is_config_guard_name(name: &str) -> bool {
+    let l = name.trim_start_matches('_').to_ascii_lowercase();
+    const CONFIG_KEYS: &[&str] = &[
+        "date", "time", "activation", "deadline", "start", "end", "delay",
+        "period", "window", "duration", "cooldown", "epoch", "cap", "limit",
+        "threshold", "maxim", "minim", "enabled", "disabled", "paused", "pause",
+        "mode", "status", "phase", "state", "flag", "active", "frozen", "locked",
+    ];
+    CONFIG_KEYS.iter().any(|k| l.contains(k))
+}
+
 /// True iff `f` contains at least one GENUINE (untrusted) reentrancy-capable
 /// external/low-level call that actually ARMS reentrancy (untrusted, and not an
 /// internal guard/assert helper). A function with none of these cannot be
@@ -118,8 +309,9 @@ fn has_genuine_reentry_vector(
     f: &Function,
     trusted: &rustc_hash::FxHashSet<String>,
     state_vars: &rustc_hash::FxHashSet<String>,
+    facts: &ContractCallFacts,
 ) -> bool {
-    f.effects.call_sites.iter().any(|cs| is_arming_call(cs, trusted, state_vars))
+    f.effects.call_sites.iter().any(|cs| is_arming_call(cs, trusted, state_vars, facts))
 }
 
 /// True iff the arming external call is a low-level/value call to a
@@ -132,9 +324,10 @@ fn has_caller_supplied_value_vector(
     f: &Function,
     trusted: &rustc_hash::FxHashSet<String>,
     state_vars: &rustc_hash::FxHashSet<String>,
+    facts: &ContractCallFacts,
 ) -> bool {
     f.effects.call_sites.iter().any(|cs| {
-        is_arming_call(cs, trusted, state_vars)
+        is_arming_call(cs, trusted, state_vars, facts)
             && cs.sends_value
             && {
                 let root = sluice_frontier::target_root(&cs.target).to_ascii_lowercase();
@@ -189,47 +382,79 @@ fn is_guard_helper_name(name: Option<&str>) -> bool {
 }
 
 /// A reentry-capable call site that genuinely ARMS reentrancy: an untrusted
-/// re-entry vector that is NOT an internal guard/assert helper and NOT a
-/// stateless-library / static-namespace dispatch. The guard-helper exclusion is
-/// the `setFeature`-shape protection (an `_assertOnly*()` check must never be read
-/// as the arming external call); the library-static exclusion is the
+/// re-entry vector that is NOT an internal guard/assert helper, NOT a
+/// stateless-library / static-namespace dispatch, and NOT a `using`-bound
+/// value/math/storage-helper call. The guard-helper exclusion is the
+/// `setFeature`-shape protection (an `_assertOnly*()` check must never be read as
+/// the arming external call); the library-static exclusion is the
 /// `Time.timestamp()` / `UQ112x112.encode()` shape (a pure in-process library call
 /// mis-classified `External` because the library lives in an excluded dependency
-/// tree — it hands control to no one and cannot be re-entered).
+/// tree); the value-helper exclusion is the SafeMath/UnstructuredStorage shape
+/// (`x.sub(y)`, `shares[k].add(a)`, `SLOT.setLowUint128(v)`, `userStake.mulDiv(...)`)
+/// — a method on a value/storage receiver that is `using`-bound to an excluded
+/// library and so mis-classified `External`. None of these hands control to an
+/// external party, so none can be re-entered. (Lido StETH `_mintShares`/
+/// `_burnShares`/`_transferShares` and LoopFi `_claim` are armed by exactly such
+/// mis-classified value-helper calls.)
 fn is_arming_call(
     cs: &CallSite,
     trusted: &rustc_hash::FxHashSet<String>,
     state_vars: &rustc_hash::FxHashSet<String>,
+    facts: &ContractCallFacts,
 ) -> bool {
     is_reentry_vector(cs)
         && !is_trusted_call(cs, trusted)
         && !is_guard_helper_name(cs.func_name.as_deref())
         && !is_library_static_call(cs, state_vars)
+        && !is_value_helper_call(cs, facts)
 }
 
 /// True iff `f` performs a storage WRITE to one of `vars` STRICTLY AFTER a
 /// genuine (untrusted) reentrancy-capable external call, AND that written var is
-/// VALUE/balance state (the thing re-entry actually corrupts). This is the
+/// VALUE/balance state (the thing re-entry actually corrupts), AND that var was
+/// NOT already SETTLED (written) before the first arming call. This is the
 /// concrete classic checks-effects-interactions violation: a value write whose
-/// position index is greater than the arming call's index. A write that precedes
-/// the call is the safe shape; a write to a non-value flag/registry var is
-/// bookkeeping; neither counts.
+/// position index is greater than the arming call's index.
+///
+/// The settle-before-the-call exclusion is the CEI-downgrade rule. In a genuine
+/// classic drain the vulnerable slot is read before and written ONLY after the
+/// call (`balances[msg.sender] -= amt` with no pre-call balances write). When the
+/// SAME var is also written before the call, the function settles it before
+/// interacting (LoopFi `_claim` zeroes `balances` before `lpETH.safeTransfer`, and
+/// the other-branch `balances` write only trails a sibling branch's call;
+/// `_processLock` credits balances/totalSupply before the WETH branch and only the
+/// non-ETH branch trails `safeTransferFrom`). A var settled before the arming call
+/// is CEI-correct on every path it is interacted on, so its later (cross-branch)
+/// write is not the vulnerable post-call update — suppress it.
 fn has_qualifying_post_call_write(
     f: &Function,
     vars: &[String],
     trusted: &rustc_hash::FxHashSet<String>,
     state_vars: &rustc_hash::FxHashSet<String>,
+    facts: &ContractCallFacts,
 ) -> bool {
     let first_vector = f
         .effects
         .call_sites
         .iter()
-        .filter(|cs| is_arming_call(cs, trusted, state_vars))
+        .filter(|cs| is_arming_call(cs, trusted, state_vars, facts))
         .map(|cs| cs.order)
         .min();
     let Some(first) = first_vector else { return false };
+    // Vars SETTLED (written) before the first arming call — CEI-correct; their
+    // later writes are not the vulnerable post-call update.
+    let settled_before: rustc_hash::FxHashSet<&str> = f
+        .effects
+        .storage_writes
+        .iter()
+        .filter(|w| w.order < first)
+        .map(|w| w.var.as_str())
+        .collect();
     f.effects.storage_writes.iter().any(|w| {
-        w.order > first && is_value_state_var(&w.var) && vars.iter().any(|v| v == &w.var)
+        w.order > first
+            && is_value_state_var(&w.var)
+            && !settled_before.contains(w.var.as_str())
+            && vars.iter().any(|v| v == &w.var)
     })
 }
 
@@ -247,8 +472,9 @@ fn readonly_getter_has_own_call(
     f: &Function,
     trusted: &rustc_hash::FxHashSet<String>,
     state_vars: &rustc_hash::FxHashSet<String>,
+    facts: &ContractCallFacts,
 ) -> bool {
-    if has_genuine_reentry_vector(f, trusted, state_vars) {
+    if has_genuine_reentry_vector(f, trusted, state_vars, facts) {
         return true;
     }
     f.callees.iter().any(|cid| {
@@ -256,7 +482,7 @@ fn readonly_getter_has_own_call(
             // A callee in another contract resolves its own trusted set; reuse the
             // getter's (a superset of immutable/infra names) as a safe approximation
             // — the only goal is to detect a REAL external/low-level call there.
-            has_genuine_reentry_vector(callee, trusted, state_vars)
+            has_genuine_reentry_vector(callee, trusted, state_vars, facts)
         })
     })
 }
@@ -272,20 +498,24 @@ fn readonly_getter_has_own_call(
 ///
 /// A function that SETTLES every var it reads before the call (writes the new
 /// value before interacting — CEI) and whose only other pre-call reads are
-/// trusted config/guard addresses, with NO post-call write, has nothing for a
-/// re-entrant sibling to corrupt. That is the v4 `collectProtocolFees` shape:
-/// `protocolFeesAccrued` is decremented before `currency.transfer` and the guard
-/// read is `protocolFeeController` (a trusted controller address) — CEI-correct.
+/// trusted config/guard addresses, constants, or config/time/flag scalars, with
+/// NO post-call write, has nothing for a re-entrant sibling to corrupt. That is
+/// the v4 `collectProtocolFees` shape (`protocolFeesAccrued` decremented before
+/// `currency.transfer`, guard read `protocolFeeController`) and the LoopFi
+/// `withdraw` shape (`balances`/`totalSupply` settled before `msg.sender.call`, the
+/// only other pre-call reads being the `startClaimDate`/`loopActivation` window
+/// dates and `emergencyMode` flag) — both CEI-correct.
 fn has_cross_function_surface(
     f: &Function,
     trusted: &rustc_hash::FxHashSet<String>,
     state_vars: &rustc_hash::FxHashSet<String>,
+    facts: &ContractCallFacts,
 ) -> bool {
     let Some(first) = f
         .effects
         .call_sites
         .iter()
-        .filter(|cs| is_arming_call(cs, trusted, state_vars))
+        .filter(|cs| is_arming_call(cs, trusted, state_vars, facts))
         .map(|cs| cs.order)
         .min()
     else {
@@ -296,8 +526,12 @@ fn has_cross_function_surface(
     if f.effects.storage_writes.iter().any(|w| w.order > first) {
         return true;
     }
-    // (b) a pre-call read of a var that is NOT settled before the call and is not a
-    // trusted config/guard address — a stale value relied on across the call.
+    // (b) a pre-call read of a var that is a genuine value carried across the
+    // re-entry window: NOT settled before the call, NOT a trusted governance/config
+    // ADDRESS, NOT a `constant`/`immutable` (a fixed value re-entry cannot corrupt),
+    // and NOT a config/time/flag/limit scalar read in an entry guard. A genuine
+    // accounting var carried across the call (Pendle `positionData`) matches none
+    // of these exclusions and is still surfaced.
     let written_before: rustc_hash::FxHashSet<&str> = f
         .effects
         .storage_writes
@@ -309,6 +543,8 @@ fn has_cross_function_surface(
         r.order < first
             && !written_before.contains(r.var.as_str())
             && !is_trusted_state_name(&r.var)
+            && !facts.fixed_vars.contains(r.var.as_str())
+            && !is_config_guard_name(&r.var)
     })
 }
 
@@ -356,6 +592,14 @@ impl Detector for ReentrancyDetector {
                 .contract(f.contract)
                 .map(|c| c.state_vars.iter().map(|v| v.name.clone()).collect())
                 .unwrap_or_default();
+            // Per-contract call facts: which receivers resolve to a VALUE type (so a
+            // method on them is a `using`-bound library/value helper, not a
+            // cross-contract call), whether the contract binds a value-type library,
+            // and the constant/immutable var set. Lets the gates below see through
+            // SafeMath/UnstructuredStorage `x.sub(y)` / `SLOT.setLowUint128(v)`
+            // pseudo-external calls that the parser fell back to `External` because
+            // the library lives in an excluded dependency tree.
+            let call_facts = ContractCallFacts::build(cx.scir.contract(f.contract));
 
             for r in cx.frontier.reentrancy_of(f.id) {
                 if r.guarded || cx.has_reentrancy_guard(f) {
@@ -376,7 +620,7 @@ impl Detector for ReentrancyDetector {
                     // the external call, so that function must itself contain a
                     // genuine (untrusted) re-entry vector.
                     ReentrancyKind::Classic | ReentrancyKind::CrossFunction => {
-                        if !has_genuine_reentry_vector(f, &trusted, &state_vars) {
+                        if !has_genuine_reentry_vector(f, &trusted, &state_vars, &call_facts) {
                             // No external/low-level call at all, every such call
                             // targets trusted infrastructure (the
                             // harvest-calls-`distributor`/`treasury` class), or the
@@ -395,7 +639,7 @@ impl Detector for ReentrancyDetector {
                     // through its own execution and must stay silent, regardless of
                     // what a sibling mutating writer does.
                     ReentrancyKind::ReadOnly => {
-                        if !readonly_getter_has_own_call(cx, f, &trusted, &state_vars) {
+                        if !readonly_getter_has_own_call(cx, f, &trusted, &state_vars, &call_facts) {
                             continue;
                         }
                     }
@@ -408,7 +652,7 @@ impl Detector for ReentrancyDetector {
                 // there is no post-call write at all (a one-line transfer), there
                 // is nothing for re-entry to corrupt.
                 if r.kind == ReentrancyKind::Classic
-                    && !has_qualifying_post_call_write(f, &r.vars_written_after, &trusted, &state_vars)
+                    && !has_qualifying_post_call_write(f, &r.vars_written_after, &trusted, &state_vars, &call_facts)
                 {
                     continue;
                 }
@@ -421,7 +665,7 @@ impl Detector for ReentrancyDetector {
                 // no post-call write, is not re-enterable into harm (v4
                 // `collectProtocolFees`: decrement before `currency.transfer`).
                 if r.kind == ReentrancyKind::CrossFunction
-                    && !has_cross_function_surface(f, &trusted, &state_vars)
+                    && !has_cross_function_surface(f, &trusted, &state_vars, &call_facts)
                 {
                     continue;
                 }
@@ -489,7 +733,7 @@ impl Detector for ReentrancyDetector {
                 // High — so an unrecognized in-protocol call can no longer over-rank
                 // to Critical (the `claimCredit` shape). Read-only / cross-function
                 // keep their existing value-flow corroboration.
-                let caller_supplied_value = has_caller_supplied_value_vector(f, &trusted, &state_vars);
+                let caller_supplied_value = has_caller_supplied_value_vector(f, &trusted, &state_vars, &call_facts);
                 let add_value_flow = match r.kind {
                     ReentrancyKind::Classic => caller_supplied_value,
                     _ => f.effects.call_sites.iter().any(|c| c.sends_value),
@@ -924,6 +1168,155 @@ mod tests {
         assert!(
             fires(src),
             "a genuine transfer-then-(deferred)-state-write must still fire as cross-function reentrancy"
+        );
+    }
+
+    // ---- R-next FP (Lido StETH shares): a function whose ONLY "external" calls are
+    // `using`-bound SafeMath / UnstructuredStorage value helpers (`x.sub(y)`,
+    // `shares[k].add(a)`, `SLOT.setLowUint128(v)`) — mis-classified `External`
+    // because those libraries live in an excluded dependency tree — must stay
+    // silent. There is NO genuine external call, so there is no re-entry vector.
+    // Real sites: StETH `_mintShares` / `_burnShares` / `_transferShares`. ----
+    #[test]
+    fn silent_on_safemath_unstructured_value_helper_calls_only() {
+        let src = r#"
+            // Bound libraries deliberately omitted from the source set (as in the real
+            // tree), so `.sub`/`.add`/`.setLowUint128` fall back to `External`.
+            contract StETH {
+                using SafeMath for uint256;
+                using UnstructuredStorage for bytes32;
+                mapping(address => uint256) private shares;
+                bytes32 internal constant TOTAL_SHARES_POSITION_LOW128 = keccak256("lido.StETH.totalShares");
+                function _transferShares(address _sender, address _recipient, uint256 _sharesAmount) internal {
+                    uint256 currentSenderShares = shares[_sender];
+                    require(_sharesAmount <= currentSenderShares, "BALANCE_EXCEEDED");
+                    shares[_sender] = currentSenderShares.sub(_sharesAmount);   // value-helper, not a call
+                    shares[_recipient] = shares[_recipient].add(_sharesAmount); // value-helper, not a call
+                }
+                function _mintShares(address _recipient, uint256 _sharesAmount) internal returns (uint256 newTotalShares) {
+                    newTotalShares = _getTotalShares().add(_sharesAmount);      // value-helper on a value local
+                    TOTAL_SHARES_POSITION_LOW128.setLowUint128(newTotalShares); // value-helper on a bytes32 constant
+                    shares[_recipient] = shares[_recipient].add(_sharesAmount);
+                }
+                function _getTotalShares() internal view returns (uint256) {
+                    return TOTAL_SHARES_POSITION_LOW128.getLowUint128();
+                }
+            }
+        "#;
+        assert!(
+            !fires(src),
+            "a function whose only external-looking calls are using-bound value/storage helpers must stay silent"
+        );
+    }
+
+    // ---- R-next FP (LoopFi `_claim`): a value-helper math call (`userStake.mulDiv`,
+    // `using Math for uint256`) must not be read as the arming call, and a `balances`
+    // slot SETTLED before the real `safeTransfer`/value call is CEI-correct even when
+    // a sibling branch writes the same var after a different branch's call (the
+    // cross-branch ordering artifact). Must stay silent. Real site: LoopFi
+    // `PrelaunchPoints._claim`. ----
+    #[test]
+    fn silent_on_cei_claim_with_math_helper_and_cross_branch_write() {
+        let src = r#"
+            interface ILpETH {
+                function safeTransfer(address to, uint256 a) external;
+                function deposit(address r) external payable;
+            }
+            contract PrelaunchPoints {
+                using Math for uint256;
+                mapping(address => mapping(address => uint256)) public balances;
+                uint256 public totalSupply;
+                uint256 public totalLpETH;
+                address public constant ETH = address(0xee);
+                ILpETH public lpETH;
+                function _fillQuote(address t, uint256 a) internal { (bool ok,) = t.call(""); require(ok); }
+                function _claim(address _token, address _receiver) internal returns (uint256 claimedAmount) {
+                    uint256 userStake = balances[msg.sender][_token];
+                    require(userStake != 0);
+                    if (_token == ETH) {
+                        claimedAmount = userStake.mulDiv(totalLpETH, totalSupply); // math helper, NOT a call
+                        balances[msg.sender][_token] = 0;                          // settle BEFORE the transfer
+                        lpETH.safeTransfer(_receiver, claimedAmount);              // real external call, last
+                    } else {
+                        balances[msg.sender][_token] = userStake - 1;              // settle BEFORE the calls
+                        _fillQuote(_token, 1);
+                        claimedAmount = address(this).balance;
+                        lpETH.deposit{value: claimedAmount}(_receiver);
+                    }
+                }
+            }
+        "#;
+        assert!(
+            !fires(src),
+            "CEI-correct claim (balances settled before the real call; math helper is not the arming call) must stay silent"
+        );
+    }
+
+    // ---- R-next FP (LoopFi `withdraw` cross-function): `balances`/`totalSupply` are
+    // settled BEFORE `msg.sender.call{value:}`, and the only other pre-call reads are
+    // the `startClaimDate`/`loopActivation` window dates and the `emergencyMode`
+    // flag — config/guard scalars, not value carried across the call. Cross-function
+    // must stay silent. Real site: LoopFi `PrelaunchPoints.withdraw`. ----
+    #[test]
+    fn silent_on_cei_withdraw_with_only_config_guard_reads() {
+        let src = r#"
+            interface IERC20 { function safeTransfer(address to, uint256 a) external; }
+            contract PrelaunchPoints {
+                mapping(address => mapping(address => uint256)) public balances;
+                uint256 public totalSupply;
+                uint32 public loopActivation;
+                uint32 public startClaimDate;
+                bool public emergencyMode;
+                address public constant ETH = address(0xee);
+                function setStartClaimDate(uint32 d) external { startClaimDate = d; } // sibling writes the date
+                function withdraw(address _token) external {
+                    if (!emergencyMode) {
+                        if (block.timestamp <= loopActivation) revert();
+                        if (block.timestamp >= startClaimDate) revert();
+                    }
+                    uint256 lockedAmount = balances[msg.sender][_token];
+                    balances[msg.sender][_token] = 0;             // settle BEFORE the call
+                    require(lockedAmount != 0);
+                    if (_token == ETH) {
+                        if (block.timestamp >= startClaimDate) revert();
+                        totalSupply = totalSupply - lockedAmount; // settle BEFORE the call
+                        (bool sent,) = msg.sender.call{value: lockedAmount}(""); // real call, nothing written after
+                        require(sent);
+                    } else {
+                        IERC20(_token).safeTransfer(msg.sender, lockedAmount);
+                    }
+                }
+            }
+        "#;
+        assert!(
+            !fires(src),
+            "CEI-correct withdraw (value settled before the call; only config/date/flag pre-call reads) must stay silent"
+        );
+    }
+
+    // ---- Recall guard: a genuine `using SafeMath` contract that STILL has a real
+    // external value call followed by a balance write must FIRE. This proves the
+    // value-helper exclusion only removes the SafeMath pseudo-calls, never the real
+    // re-entry vector. ----
+    #[test]
+    fn fires_on_real_call_then_write_even_with_safemath() {
+        let src = r#"
+            contract Bank {
+                using SafeMath for uint256;            // binds a value library, but...
+                mapping(address => uint256) public balances;
+                function withdraw(uint256 amt) external {
+                    uint256 bal = balances[msg.sender];
+                    require(bal >= amt);
+                    (bool ok,) = msg.sender.call{value: amt}("");  // GENUINE low-level value call
+                    require(ok);
+                    balances[msg.sender] = bal.sub(amt);           // value write strictly after (via helper)
+                }
+            }
+        "#;
+        let fs = reentrancy_findings(src);
+        assert!(
+            fs.iter().any(|f| f.category == Category::Reentrancy),
+            "a real call-then-write must still fire even when the write uses a SafeMath helper"
         );
     }
 }
