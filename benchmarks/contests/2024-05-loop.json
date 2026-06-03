@@ -1,0 +1,65 @@
+{
+  "name": "2024-05-loop",
+  "repo": "code-423n4/2024-05-loop",
+  "commit": "20d9013a93a1ba98154198d6cf3c63f73ab95658",
+  "local_path": "~/Data/bench/2024-05-loop",
+  "scope_dirs": ["src"],
+  "audit_url": "https://code4rena.com/reports/2024-05-loop",
+  "known_findings": [
+    {
+      "id": "H-01",
+      "severity": "High",
+      "contract": "PrelaunchPoints",
+      "function": "_claim",
+      "file": "src/PrelaunchPoints.sol",
+      "line": 262,
+      "bug_class": "accounting-invariant",
+      "in_class": false,
+      "summary": "_claim sets claimedAmount = address(this).balance after the swap, so any pre-existing ETH balance (or a second claimer's funds) is credited to one user, over-minting lpETH 1:1 against an inflated balance. Should track the swap's actual output, not the contract balance."
+    },
+    {
+      "id": "QA-setOwner",
+      "severity": "Low",
+      "contract": "PrelaunchPoints",
+      "function": "setOwner",
+      "file": "src/PrelaunchPoints.sol",
+      "line": 337,
+      "bug_class": "missing-zero-check",
+      "in_class": true,
+      "summary": "setOwner assigns owner = _owner with no address(0) check; a zero owner permanently bricks the privileged role."
+    },
+    {
+      "id": "QA-setEmergencyMode",
+      "severity": "Low",
+      "contract": "PrelaunchPoints",
+      "function": "setEmergencyMode",
+      "file": "src/PrelaunchPoints.sol",
+      "line": 372,
+      "bug_class": "missing-event-emit",
+      "in_class": true,
+      "summary": "setEmergencyMode flips the emergencyMode flag without emitting an event, so the privileged state change is unobservable off-chain."
+    },
+    {
+      "id": "M-lockToken-allowlist",
+      "severity": "Medium",
+      "contract": "PrelaunchPoints",
+      "function": "_processLock",
+      "file": "src/PrelaunchPoints.sol",
+      "line": 172,
+      "bug_class": "logic-allowlist",
+      "in_class": false,
+      "summary": "Token allowlist / lock-token validation logic gap (protocol-specific): locked tokens are not constrained the way the design intends, allowing unsupported tokens to enter the accounting."
+    },
+    {
+      "id": "M-swap-router-data",
+      "severity": "Medium",
+      "contract": "PrelaunchPoints",
+      "function": "_claim",
+      "file": "src/PrelaunchPoints.sol",
+      "line": 256,
+      "bug_class": "logic-calldata-validation",
+      "in_class": false,
+      "summary": "User-supplied 0x swap calldata is only loosely validated; a crafted _data lets the swap deviate from the intended token/route (protocol-specific exchange-data validation bug, not a modeled sink)."
+    }
+  ]
+}

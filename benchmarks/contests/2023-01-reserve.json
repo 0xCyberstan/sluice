@@ -1,0 +1,88 @@
+{
+  "name": "2023-01-reserve",
+  "repo": "code-423n4/2023-01-reserve",
+  "commit": "5e89ca44a917c9bd0277d58849c3edbc6181ff9d",
+  "local_path": "~/Data/bench/2023-01-reserve",
+  "scope_dirs": ["protocol/contracts"],
+  "audit_url": "https://code4rena.com/reports/2023-01-reserve",
+  "note": "Repo ships both p0 (reference) and p1 (production) implementations; the same logical contract appears as RTokenP0/RTokenP1, StRSRP0/StRSRP1. Contract names below are the logical names; the harness normalizes the P0/P1 suffix when matching.",
+  "known_findings": [
+    {
+      "id": "M-10",
+      "severity": "Medium",
+      "contract": "RToken",
+      "function": "issue",
+      "file": "protocol/contracts/p1/RToken.sol",
+      "line": 233,
+      "bug_class": "signed-cast",
+      "in_class": true,
+      "summary": "issue() performs an unsafe downcast of an issuance amount to uint192 without bounds-checking, which can silently truncate and corrupt the issuance accounting."
+    },
+    {
+      "id": "M-07",
+      "severity": "Medium",
+      "contract": "RToken",
+      "function": "redeem",
+      "file": "protocol/contracts/p1/RToken.sol",
+      "line": 439,
+      "bug_class": "erc777-reentrancy",
+      "in_class": true,
+      "summary": "redeem() transfers basket collateral that may be an ERC777 token; the receive hook re-enters before state settles, letting a redeemer extract more than their pro-rata share (read-only / cross-function reentrancy)."
+    },
+    {
+      "id": "M-02",
+      "severity": "Medium",
+      "contract": "StRSR",
+      "function": "stake",
+      "file": "protocol/contracts/p1/StRSR.sol",
+      "line": 212,
+      "bug_class": "share-inflation",
+      "in_class": true,
+      "summary": "The RSR:stRSR exchange rate can be inflated by a first/early staker (donation / rounding) so later stakers receive fewer shares than fair value — an ERC4626-style share-price inflation on the staking pool."
+    },
+    {
+      "id": "M-14",
+      "severity": "Medium",
+      "contract": "CTokenFiatCollateral",
+      "function": "constructor",
+      "file": "protocol/contracts/plugins/assets/CTokenFiatCollateral.sol",
+      "line": 46,
+      "bug_class": "signed-cast",
+      "in_class": true,
+      "summary": "int8(referenceERC20Decimals) (and the analogous -int8(erc20Decimals) in Asset.bal) casts a uint8 decimals value to int8; a token with >127 decimals wraps negative, mispricing collateral. A signed/narrowing-cast class bug on the decimals assumption."
+    },
+    {
+      "id": "M-18",
+      "severity": "Medium",
+      "contract": "StRSR",
+      "function": "setName",
+      "file": "protocol/contracts/p1/StRSR.sol",
+      "line": 803,
+      "bug_class": "cached-domain-separator",
+      "in_class": true,
+      "summary": "StRSR caches the EIP-2612 domain separator at init but setName/setSymbol change the token name without recomputing it, so the cached DOMAIN_SEPARATOR no longer matches the current name and permit signatures break (or remain bound to the stale name)."
+    },
+    {
+      "id": "M-economic-rewards",
+      "severity": "Medium",
+      "contract": "StRSR",
+      "function": "seizeRSR",
+      "file": "protocol/contracts/p1/StRSR.sol",
+      "line": 374,
+      "bug_class": "economic-reward-accounting",
+      "in_class": false,
+      "summary": "Protocol-specific RSR-seizure / reward-distribution accounting edge (rounding of the seized amount across the era can leave dust or mis-split rewards) — an economic invariant, not a modeled detector class."
+    },
+    {
+      "id": "M-economic-melt",
+      "severity": "Medium",
+      "contract": "Furnace",
+      "function": "melt",
+      "file": "protocol/contracts/p1/Furnace.sol",
+      "line": 70,
+      "bug_class": "economic-invariant",
+      "in_class": false,
+      "summary": "Furnace melt-rate / period accounting (protocol-specific): the RToken melt schedule can be gamed across period boundaries to alter the realized melt, an economic invariant outside the modeled detector classes."
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+//! Contest manifest model + the bug-class → Sluice-category compatibility map.
+//!
+//! A manifest (`benchmarks/contests/<name>.json`) names one audit contest, the
+//! local clone, the in-scope directories, and the published High/Medium findings
+//! mapped to ground truth `(contract, function, file, line, bug_class, in_class)`.
+
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+/// One published audit finding, mapped to ground truth.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KnownFinding {
+    pub id: String,
+    pub severity: String,
+    pub contract: String,
+    pub function: String,
+    /// Path of the bug, relative to the contest root (e.g. `src/Foo.sol`).
+    pub file: String,
+    pub line: usize,
+    /// Free-form ground-truth class label (see [`compatible_categories`]).
+    pub bug_class: String,
+    /// `true` if `bug_class` is one Sluice's detector set models; `false` for
+    /// protocol-specific invariant/accounting/logic bugs.
+    pub in_class: bool,
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// A parsed contest manifest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Manifest {
+    pub name: String,
+    pub repo: String,
+    #[serde(default)]
+    pub commit: Option<String>,
+    pub local_path: String,
+    pub scope_dirs: Vec<String>,
+    // Documentation-only fields: parsed and validated as part of the committed
+    // manifest schema (so a typo'd key is rejected and they round-trip), but the
+    // scoreboard does not render them. Kept here so the schema is the struct.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub audit_url: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub note: Option<String>,
+    pub known_findings: Vec<KnownFinding>,
+}
+
+impl Manifest {
+    /// Load and parse a manifest file.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("reading manifest {}: {e}", path.display()))?;
+        let m: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("parsing manifest {}: {e}", path.display()))?;
+        Ok(m)
+    }
+
+    /// Expand `~` in `local_path` and return the absolute contest root.
+    pub fn root(&self) -> PathBuf {
+        expand_tilde(&self.local_path)
+    }
+
+    /// The absolute scope directories to hand to `sluice scan`.
+    pub fn scope_paths(&self) -> Vec<PathBuf> {
+        let root = self.root();
+        self.scope_dirs.iter().map(|d| root.join(d)).collect()
+    }
+}
+
+/// Expand a leading `~` / `~/` to the user's home directory.
+pub fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if p == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(p)
+}
+
+/// Map a manifest `bug_class` to the set of Sluice `Category` *variant names*
+/// (as they appear in `sluice scan --format json`, e.g. `"SignedCast"`) that
+/// count as a compatible catch for that class.
+///
+/// A known finding is "caught with a compatible class" when Sluice emits a
+/// finding at the right location whose `category` is in this set. The mapping is
+/// deliberately generous within a class family (a `signed-cast` ground-truth bug
+/// is satisfied by `SignedCast`, `IntegerOverflow`, `UncheckedMath`, or
+/// `DecimalsAssumption`) so that a correct catch under a sibling detector still
+/// scores as recall, while staying narrow enough that an unrelated class (e.g.
+/// `Reentrancy` for a `signed-cast` bug) does not falsely count.
+///
+/// Returning an empty slice means "no Sluice class models this" — used for the
+/// out-of-class protocol-specific bugs, which therefore can only ever be matched
+/// by the location-only fallback (see the `--lenient-class` flag), never by class.
+pub fn compatible_categories(bug_class: &str) -> &'static [&'static str] {
+    match bug_class {
+        // ---- in-class families (classes Sluice models) ----
+        "signed-cast" | "unsafe-downcast" | "integer" | "integer-overflow" => {
+            &["SignedCast", "IntegerOverflow", "UncheckedMath", "DecimalsAssumption"]
+        }
+        "decimals" | "decimals-assumption" => &["DecimalsAssumption", "SignedCast"],
+        "reentrancy" => &["Reentrancy", "ReadOnlyReentrancy", "Erc777Reentrancy", "MintCallbackReentrancy"],
+        "erc777-reentrancy" => &["Erc777Reentrancy", "Reentrancy", "ReadOnlyReentrancy"],
+        "read-only-reentrancy" => &["ReadOnlyReentrancy", "Reentrancy", "Erc777Reentrancy"],
+        "oracle" | "oracle-manipulation" | "price-manipulation" => {
+            &["OracleManipulation", "PriceManipulation", "TwapManipulation", "OracleStaleness", "PriceBounds"]
+        }
+        "oracle-staleness" => &["OracleStaleness", "OracleManipulation", "SequencerUptime"],
+        "share-inflation" | "erc4626-inflation" | "first-depositor" => {
+            &["Erc4626Inflation", "FirstDepositor", "RoundingDirection", "PrecisionLoss", "InternalSharePricingRounding"]
+        }
+        "rounding" | "rounding-direction" | "precision-loss" => {
+            &["RoundingDirection", "PrecisionLoss", "Erc4626Inflation", "InternalSharePricingRounding"]
+        }
+        "cached-domain-separator" => &["CachedDomainSeparator"],
+        "access-control" | "missing-access-control" => {
+            &["AccessControl", "UnprotectedInitializer", "TxOriginAuth", "Centralization", "ArbitraryTransfer"]
+        }
+        "unprotected-initializer" => &["UnprotectedInitializer", "AccessControl", "UninitializedProxy"],
+        "unchecked-return" => &["UncheckedReturn", "UnsafeErc20"],
+        "unsafe-erc20" => &["UnsafeErc20", "UncheckedReturn", "FeeOnTransfer"],
+        "fee-on-transfer" => &["FeeOnTransfer", "UnsafeErc20"],
+        "signature-replay" => &["SignatureReplay", "SignatureMalleability", "Eip712TypehashMismatch", "CachedDomainSeparator"],
+        "signature-malleability" => &["SignatureMalleability", "SignatureReplay", "EcrecoverZeroAddress"],
+        "missing-deadline" => &["MissingDeadline"],
+        "slippage" => &["Slippage", "LpSlippage"],
+        "missing-zero-check" => &["MissingZeroCheck"],
+        "missing-event-emit" => &["MissingEventEmit"],
+        "denial-of-service" | "dos" => &["DenialOfService", "UnboundedLoop", "GasGriefing"],
+        "unbounded-loop" => &["UnboundedLoop", "DenialOfService"],
+        "weak-randomness" => &["WeakRandomness"],
+        "timestamp" | "timestamp-dependence" => &["TimestampDependence", "BlockNumberTime"],
+        "flashloan-governance" => &["FlashLoanGovernance", "GovernanceTimelock"],
+        "delegatecall" => &["DelegatecallStorage", "UninitializedProxy", "SelectorCollision"],
+        "bridge-verification" => &["BridgeVerification", "UntrustedCallTarget"],
+        "missing-solvency-check" => &["MissingSolvencyCheck"],
+        // ---- out-of-class (protocol-specific): no modeled category ----
+        // accounting / economic / logic invariants the pattern set does not model.
+        "accounting-invariant"
+        | "economic-invariant"
+        | "economic-reward-accounting"
+        | "logic"
+        | "logic-allowlist"
+        | "logic-calldata-validation"
+        | "invariant" => &[],
+        // Unknown class: treat as out-of-class (empty), so it cannot silently
+        // match on class — only the location-only fallback can catch it.
+        _ => &[],
+    }
+}

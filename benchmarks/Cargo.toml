@@ -1,0 +1,23 @@
+[package]
+name = "sluice-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Contest-benchmark scoreboard: recall + precision of Sluice vs known audit findings."
+
+[[bin]]
+name = "sluice-bench"
+path = "src/main.rs"
+
+# Intentionally NO dependency on sluice-engine / sluice-findings / detectors.
+# The harness drives the compiled `sluice` binary as a black box and parses its
+# JSON, so changes to detector internals can never break the harness build and
+# the harness can never affect detector tests.
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+walkdir    = { workspace = true }

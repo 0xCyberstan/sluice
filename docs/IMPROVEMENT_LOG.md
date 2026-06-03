@@ -783,3 +783,20 @@ verified the combined state):
   only M-02 share-rate left — a PHASE-B invariant/monotonicity target). 6 benchmarks: **no new Crit/High FPs**
   (Aave/Lido/Morpho/UR/LoopFi 0, Comet 9 defensible). Recall preserved (corpus 20/20+8/8 + all real-hacks); each
   recall fix verified 0-new-FP across all 6 benchmarks + the broad dogfood corpora. _done._
+
+### NORTH STAR — PHASE A: the contest-benchmark SCOREBOARD is live
+Built `sluice-bench` (new workspace crate `benchmarks/`): a black-box harness that drives the release binary, scans a
+corpus of real audit contests (`benchmarks/contests/*.json` manifests: known High/Med findings mapped to
+`(contract,function,file,line,bug_class,in_class)`), and scores **in-class recall / out-of-class recall / Crit-High
+precision** per contest + aggregate → `benchmarks/SCOREBOARD.md`. Independent of `sluice-engine`/`sluice-findings` so it
+can never affect detector tests. Run: `cargo run -p sluice-bench --release`.
+- **Baseline (2 seeded contests, on the wave-6 binary):** Reserve in-class **80% (4/5)** [was 20% pre-wave-6 — the
+  scoreboard objectively captured the wave-6 recall gains], LoopFi 100% (2/2); aggregate **in-class 86% (6/7),
+  out-of-class 0% (0/5)**, 11 unmatched Crit/High (candidate FP on Reserve, all `oracle`/`twap` on issue/redeem — triage).
+- **The key diagnostic — "location ceiling":** if any-class match counted, in-class would be **100% (7/7)** — i.e.
+  Sluice already fires *something* at nearly every in-class bug location, so the recall gap is **class-mismatch, not
+  detector-blindness.** That is precisely where PHASE B (+ trigger-tightening) aims.
+- 880 workspace tests (incl. 7 new sluice-bench), 0 warnings. Corpus expands next to 5 (Stader 0/4, Frankencoin 0/8,
+  Tigris 5/8 already labeled — these pull the aggregate to the honest number). **The scoreboard is now the objective the
+  loop optimizes; every round states which metric it moves.** Next build: **PHASE B1 — `value-source-discipline`** (the
+  LoopFi-H-01 invariant detector, `docs/INVARIANT_ENGINE_DESIGN.md`) — the first detector that moves out-of-class recall above 0.
