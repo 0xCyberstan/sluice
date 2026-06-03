@@ -261,6 +261,26 @@ R7–R9 were all novel-detector rounds; the roadmap says interleave the optimiza
   baseline (olympus 92 / etherfi 126 / pendle 81), md5-stable across runs, 285 tests, 0 warnings. (Integration caught a
   cross-round conflict: WF1's new private `source_cache` field broke a struct-literal `AnalysisContext{..}` in the arch
   round's prelude test — fixed by routing it through `AnalysisContext::new`.)
+
+### Round 11 — 7 Karak-mined novel detectors (worktree agents) — validated against REAL audit findings
+- **Result:** +7 detectors → **71 active**. Authored by 7 parallel worktree agents (each built + scanned real Karak +
+  the 6 prior codebases, and USED the new R10 `prelude` — dogfooding the architecture work): shares-escrowed-repriced,
+  percent-slash-live-base, hash-gated-replay, clamp-residual-burn, proof-admission-only, external-root-caller-timestamp,
+  zero-margin-timing-window. Independent dogfood (authoritative): **all 7 fire on the real Karak source** (10 hits, at
+  the exact sites of real Karak/C4 findings — finalizeSlashing/computeSlashAmount, NativeVault.validateSnapshotProofs,
+  the Vault withdrawal queue); **0 FP on olympus/pendle/etherfi/symbiotic**; **1 defensible TP on eigenlayer**
+  (hash-gated-replay correctly generalizes to EigenLayer `_completeQueuedWithdrawal` — same shape, agent-verified).
+  333 tests, 0 warnings, corpus 20/20 + 8/8. **Strongest validation yet: the detectors fire where real published audit
+  findings live (ground truth), not just on clean shapes.** 20 → 27 novel classes; 71 detectors total.
+
+#### R12 candidate backlog (R11 WF3 research on ETHENA — non-restaking, maps to the user's own Ethena audit findings)
+1. **escrow-exit-restriction-gap** — blacklist/restriction enforced at escrow ENTRY (burn leg) but NOT at the matured-asset EXIT (often a separate silo contract) → a frozen user still exits staged value. *This was the single High the whole Ethena audit produced.* StakedUSDeV2.sol:80-92 → USDeSilo.sol:27-29.
+2. **vesting-buffered-tvl-donation** — `getRate` reads `totalAssets = balanceOf − unvested`, but a raw `transfer` donation lands in `balanceOf` un-buffered → atomic price jump that defeats the vesting anti-spike (only one inflow path is buffered). StakedUSDe.sol:161-180 + EthenaBalancerRateProvider.getRate.
+3. **one-sided-peg-band-check** — mint/redeem price-band check constrains only the protocol-favorable direction.
+4. **eip712-typehash-struct-mismatch** — typehash string field order/width diverges from the encoded struct.
+5. **delegated-signer-single-step** — a signer/authorization delegate installed in one step (no two-step accept handshake).
+6. **pre-auth-callout-to-caller-supplied-target** — EIP-1271/external auth call dispatched to an attacker-named address BEFORE authorization.
+These broaden Sluice beyond restaking (synthetic-dollar / RFQ-mint / ERC4626-staking) and have ground truth (the user's confirmed Ethena High + Mediums). Full SCIR signatures in the R11 WF3 transcript.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector

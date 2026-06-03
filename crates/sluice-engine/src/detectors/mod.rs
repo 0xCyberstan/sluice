@@ -78,10 +78,18 @@ pub mod netted_aggregate_desync;
 pub mod crosschain_rate_staleness;
 // Round 9 (perpetual loop) — remaining Renzo-mined novel classes.
 pub mod cooldown_bypass_flag;
+pub mod hash_gated_replay;
 pub mod oracle_first_mint_seeding;
 pub mod proportional_payout_tx_value;
 pub mod snapshot_redeem_asymmetry;
 pub mod unguarded_accounting_mutator;
+pub mod zero_margin_timing_window;
+// Round 11 (perpetual loop) — novel classes mined from Karak V2.
+pub mod percent_slash_live_base;
+pub mod clamp_residual_burn;
+pub mod external_root_caller_timestamp;
+pub mod proof_admission_only;
+pub mod shares_escrowed_repriced;
 
 use crate::detector::Detector;
 
@@ -171,8 +179,18 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(unguarded_accounting_mutator::UnguardedAccountingMutatorDetector),
         Box::new(snapshot_redeem_asymmetry::SnapshotRedeemAsymmetryDetector),
         Box::new(cooldown_bypass_flag::CooldownBypassFlagDetector),
+        Box::new(hash_gated_replay::HashGatedStructReplayDetector),
         Box::new(oracle_first_mint_seeding::OracleFirstMintSeedingDetector),
         Box::new(proportional_payout_tx_value::ProportionalPayoutTxValueDetector),
+        // Zero-margin finalize/veto/unbonding window boundary (Karak Slasher/Vault class).
+        Box::new(zero_margin_timing_window::ZeroMarginTimingWindowDetector),
+        // Percent-of-live-base slashing finalize (Karak SlasherLib computeSlashAmount class).
+        Box::new(percent_slash_live_base::PercentSlashOnLiveBaseDetector),
+        // Remaining R11 Karak-mined classes.
+        Box::new(shares_escrowed_repriced::SharesEscrowedRepricedDetector),
+        Box::new(clamp_residual_burn::ClampResidualBurnDetector),
+        Box::new(proof_admission_only::ProofAdmissionOnlyDetector),
+        Box::new(external_root_caller_timestamp::ExternalRootCallerTimestampDetector),
     ]
 }
 
