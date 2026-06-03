@@ -31,6 +31,30 @@ cross-contract linking → path-sensitivity → performance/caching → PoC comp
 
 ---
 
+## Long-horizon roadmap (user direction, 2026-06-03)
+
+Beyond the near-term precision rounds, drive Sluice toward a **complete, revolutionary tool** along three
+standing thrusts. Rotate the round THEME so each recurs (keep the green gate + dogfood-measured FP movement every round):
+
+1. **Optimize structure (extensibility).** Make adding/modifying a detector near-trivial: shared SCIR query
+   primitives (call-target trust map, ordered effect stream, taint queries), a detector-authoring macro/DSL to
+   kill per-detector boilerplate, consistent FP-suppression helpers. Dedicated **architecture rounds** refactor
+   toward this; measure by "lines + concepts to add a detector."
+2. **Optimize speed (scale).** Profile hot paths; parallelize file parse + detector execution; intern/cache
+   strings & spans; explore incremental / whole-program caching. Dedicated **performance rounds** benchmark on
+   very large repos (10k+ files) and gate wall-clock + peak-RSS as tracked metrics (today: ~150ms / <36MB on
+   ~200-file repos — must stay sub-linear-feeling at 50×).
+3. **Creative novel-bug R&D (recurring workflow).** Don't stop at published hacks — spin up research agents to
+   *hypothesize* under-publicised / emerging bug classes, then build detector + reconstructed fixture for each.
+   Seed backlog: transient-storage (EIP-1153 tstore/tload) reentrancy-guard bypass; EIP-7702 delegated-EOA trust;
+   ERC-4337 paymaster/validation-phase griefing; 3+-hop cross-protocol read-only reentrancy; rounding/dust
+   accumulation over many txns; liquidation-ordering MEV; partial-upgrade invariant drift; cross-chain & EIP-712
+   domain/message replay; checkpoint/snapshot vote manipulation; withdrawal-queue & slashing accounting desync.
+
+The goal is to beat Slither/Aderyn/Mythril precisely on the complex / economic / novel logic bugs they miss.
+
+---
+
 ## Rounds
 
 ### Round 1 — core: cross-contract resolver
@@ -114,6 +138,36 @@ zero crashes; the bug surface is **precision/labeling**, plus one parser gap). T
   arbitrary-transfer, reentrancy, and the new untrusted-call-target detector; + a parse-layer pre-pass that strips the
   Solidity 0.8.29 `contract X layout at <slot> is ...` directive solang 0.3.5 rejects (eigenlayer AllocationManagerView.sol
   silently dropped). _status: launching._
+- **Result:** 51 detectors; corpus 20/20 + 8/8; real-hacks 8/8; 195 tests, 0 warnings. New core detector
+  **erc721-mint-reentrancy** (a confirmed gap: `_safeMint`'s onERC721Received hook is an internal-call control
+  transfer the reentrancy detector misses; precise CEI-around-callback shape; 0 FPs on the 4 non-NFT codebases).
+  Measured FP wins (all four totals down, no regressions): **pendle signed-cast 9→0** (return-tuple location bug),
+  **pendle DoS 8→2** (fault-tolerant/`try*` multicalls), pendle upgradeable self-delegatecall FPs reclassified
+  Critical→Info (3 dropped to Info, 7 genuine `target.delegatecall` stay Medium), **etherfi integer 31→23**
+  (48→23 across R5+R6), **eigenlayer signed-cast 5→2**, **olympus centralization 30→27 + properly tiered**
+  (Medium/Low/Info; fixed the scorer bug where conf-0.4 made the Medium tier unreachable — Medium tier now
+  carries 0.5 so 45×0.75=33.75 lands as Medium). Totals: olympus 97→92, eigenlayer 26→23, pendle 96→81,
+  etherfi 134→126. _done._
+
+### Round 7 — FIRST novel-bug R&D round (per the long-horizon roadmap, thrust #3)
+Build detectors for the under-publicised classes WF3's R6 research surfaced on Symbiotic Core (restaking), each
+with a reconstructed fixture + harness entry. Three workflows:
+- **WF1 — checkpoint/epoch trust:** `checkpoint-hint-trust` (caller-supplied checkpoint index/`hint` drives a
+  value-deciding view read — Symbiotic Checkpoints.upperLookupRecent) + `epoch-boundary-staleness` (a value read
+  at "latest" while a sibling decision uses an epoch/capture-timestamp window). NEW categories.
+- **WF2 — slashing/share accounting:** `proportional-split-residual` (multi-bucket pro-rata split force-assigns the
+  rounding remainder to one bucket — Vault.onSlash) + `pooled-shares-reprice-desync` (an external path mutates a
+  pooled-asset balance but per-key share supply is left stale, so `previewRedeem` reprices wrong) +
+  `internal-share-pricing-rounding` (mulDiv share pricing in helpers the rounding detector skips because they aren't
+  named deposit/withdraw/redeem). NEW categories.
+- **WF3 — silenced callback + validation harness:** `silenced-privileged-callback` (fire-and-forget low-level call
+  to a MUTABLE hook address whose revert/return is discarded — `pop(call(...))` in BaseDelegator/BaseSlasher onSlash —
+  while a dependent accounting write is NOT contingent on success) + reconstruct each new class as a fixture in a new
+  real-world/near-miss harness (`tests/real_hacks_r7.rs` or a `novel_classes.rs`), and dogfood-measure on
+  symbiotic + the four prior targets (the new detectors must not add FPs there).
+- Core: shared SCIR primitives the novel detectors need (ordered effect stream already exists; add a caller-supplied-
+  index/`hint` taint query + a "pooled balance vs per-key share supply" co-update query) — a down payment on the
+  roadmap's architecture/extensibility thrust. _status: pending._
 - **Result:** 50 detectors; corpus 20/20 recall + 8/8 clean; **R4 hacks now 8/8** (TempleDAO caught by the
   new `untrusted-call-target` detector — the R4 MISS, closed). 153 tests, 0 warnings. Delivered:
   - **WF1 cast precision:** integer-issues width-bit suppression (`uintN(address)`/`uintN(bytesM)`/narrower-int

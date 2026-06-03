@@ -63,7 +63,19 @@ impl Detector for IntegerIssuesDetector {
             // `unchecked` blocks is an increment-by-one, this is that pattern and
             // we stay silent. Any other unchecked arithmetic (`+ amount`, `- x`,
             // `* y`) still fires.
-            if f.effects.has_unchecked_math && takes_attacker_input && !unchecked_is_only_increment(f) {
+            //
+            // SUPPRESSION (G) — GUARDED SUBTRACTION: the canonical ERC20 idiom
+            // `require(a >= b); unchecked { ... a - b ... }` (e.g. OpenZeppelin
+            // `decreaseAllowance`/`transferFrom`) is provably underflow-free — the
+            // dominating `>=`/`>` check pins `a >= b` before the wrap-disabled
+            // subtraction. We stay silent only when *every* unchecked subtraction
+            // has such a matching guard and there is no other unchecked arithmetic.
+            // Any unguarded `- x`, or any `+`/`*`, still fires.
+            if f.effects.has_unchecked_math
+                && takes_attacker_input
+                && !unchecked_is_only_increment(f)
+                && !unchecked_subtraction_is_guarded(f)
+            {
                 let b = FindingBuilder::new(self.id(), Category::UncheckedMath)
                     .title("Unchecked arithmetic on attacker-controlled input")
                     .severity(Severity::Medium)
@@ -93,6 +105,14 @@ impl Detector for IntegerIssuesDetector {
                 let fn_src = cx.source_text(f.span);
                 let has_dominating_guard = fn_src.contains("type(uint")
                     && (fn_src.contains("revert") || fn_src.contains("require"));
+
+                // Classify each local once: was it defined (last write) by a
+                // `min(..., type(uintN).max)` clamp or by a monotonic
+                // shrink (`a / b` / `a >> k`)? The cast operand is frequently a
+                // bare local that holds such a value (`x = a / b; y = uintN(x);`),
+                // which suppressions (B)/(C) miss when they look only at the cast's
+                // own span. See `classify_locals`.
+                let locals = classify_locals(cx, f);
 
                 visit_calls(f, |c, span| {
                     if c.kind != CallKind::TypeCast {
@@ -132,14 +152,37 @@ impl Detector for IntegerIssuesDetector {
                     if cast_src.contains("min(") && cast_src.contains("type(uint") {
                         return;
                     }
+                    // SUPPRESSION (B') — CLAMPED-VIA-LOCAL: the same saturation, but
+                    // the `min(..., type(uintN).max)` result was stored in a local
+                    // first (`uint256 total = _min(x, type(uint40).max); ... uint40(total)`).
+                    // The cast operand is then a bare identifier whose defining
+                    // expression carries the clamp. Suppress only when the local was
+                    // *last* written by such a clamp (computed in `classify_locals`).
+                    if let ExprKind::Ident(name) = &arg.kind {
+                        if matches!(locals.get(name.as_str()), Some(LocalDef::ClampedToTypeMax)) {
+                            return;
+                        }
+                    }
 
-                    // SUPPRESSION (C) — DIVISION-DOWN: `uintN(a / b)` shrinks the
-                    // value monotonically (integer division rounds toward zero),
-                    // so casting a quotient does not introduce a fresh truncation
-                    // hazard the author did not already reason about. Kills
-                    // `uint32((t - g) / s)`.
-                    if matches!(&arg.kind, ExprKind::Binary { op: BinOp::Div, .. }) {
+                    // SUPPRESSION (C) — DIVISION-DOWN: `uintN(a / b)` (and the
+                    // equally monotone `uintN(a >> k)`) shrinks the value toward
+                    // zero, so casting the result does not introduce a fresh
+                    // truncation hazard the author did not already reason about.
+                    // Kills `uint32((t - g) / s)`.
+                    if matches!(
+                        &arg.kind,
+                        ExprKind::Binary { op: BinOp::Div | BinOp::Shr, .. }
+                    ) {
                         return;
+                    }
+                    // SUPPRESSION (C') — DIVISION-DOWN-VIA-LOCAL: identical monotone
+                    // shrink, but the quotient was bound to a local first
+                    // (`uint256 q = a / b; ... uintN(q)`). Same reasoning as (C);
+                    // only the named-local indirection differs.
+                    if let ExprKind::Ident(name) = &arg.kind {
+                        if matches!(locals.get(name.as_str()), Some(LocalDef::ShrunkMonotone)) {
+                            return;
+                        }
                     }
 
                     // SUPPRESSION (D) — see `has_dominating_guard` above. Only
@@ -453,6 +496,171 @@ fn unchecked_is_only_increment(f: &sluice_ir::Function) -> bool {
     saw_arith && all_increment
 }
 
+/// How a local variable was *last* defined, when that definition makes a
+/// subsequent narrowing cast of the local provably non-truncating. Used by the
+/// CLAMPED-VIA-LOCAL (B') and DIVISION-DOWN-VIA-LOCAL (C') suppressions, which
+/// generalize the existing single-expression (B)/(C) shapes to the common
+/// `tmp = <safe expr>; ... uintN(tmp)` form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalDef {
+    /// Bound to a `min(..., type(uintN).max)` saturation — cannot exceed the
+    /// clamped maximum, so a downcast to that max's width cannot truncate.
+    ClampedToTypeMax,
+    /// Bound to a monotone shrink (`a / b` or `a >> k`) — rounds toward zero, so
+    /// casting the result is not a fresh truncation hazard (same as (C)).
+    ShrunkMonotone,
+}
+
+/// Classify a function's locals by their *last* top-level definition (VarDecl
+/// init or plain `=` assignment) into the `LocalDef` shapes above. Later writes
+/// overwrite earlier ones (last-write-wins), matching the value the cast will
+/// actually see. Definitions we cannot prove safe are simply absent from the map
+/// (we then decline to suppress — precision over recall). Compound assignments
+/// (`+=`, `-=`, ...) are intentionally ignored: they are not a pure clamp/shrink.
+fn classify_locals(
+    cx: &AnalysisContext,
+    f: &sluice_ir::Function,
+) -> std::collections::HashMap<String, LocalDef> {
+    // First gather `(name, defining-expr)` pairs in source order, then fold them
+    // last-write-wins. Collecting into a Vec first keeps the statement walk a
+    // simple shared-borrow closure (no nested mutable capture of `map`).
+    let mut defs: Vec<(&str, &Expr)> = Vec::new();
+    for s in &f.body {
+        s.visit(&mut |st| match &st.kind {
+            // `T name = init;`
+            sluice_ir::StmtKind::VarDecl { name: Some(n), init: Some(init), .. } => {
+                defs.push((n.as_str(), init));
+            }
+            // `name = value;` (plain assignment only; compound ops are not a clamp/shrink).
+            sluice_ir::StmtKind::Expr(Expr {
+                kind: ExprKind::Assign { op: sluice_ir::AssignOp::Assign, target, value },
+                ..
+            }) => {
+                if let ExprKind::Ident(n) = &target.kind {
+                    defs.push((n.as_str(), value.as_ref()));
+                }
+            }
+            _ => {}
+        });
+    }
+
+    let mut map = std::collections::HashMap::new();
+    for (name, def) in defs {
+        // Monotone shrink: top-level `/` or `>>` (right-shift, like integer
+        // division, only ever sheds magnitude — never grows the value).
+        if matches!(&def.kind, ExprKind::Binary { op: BinOp::Div | BinOp::Shr, .. }) {
+            map.insert(name.to_string(), LocalDef::ShrunkMonotone);
+            continue;
+        }
+        // Clamp: `min(..., type(uintN).max)` saturation. Reuse the exact textual
+        // signal suppression (B) keys on, but read it from the *definition's* span.
+        let def_src = cx.source_text(def.span);
+        if def_src.contains("min(") && def_src.contains("type(uint") {
+            map.insert(name.to_string(), LocalDef::ClampedToTypeMax);
+            continue;
+        }
+        // Anything else: this local is no longer provably safe — drop any prior
+        // classification so a later unsafe rebind cannot be mistaken for safe.
+        map.remove(name);
+    }
+
+    map
+}
+
+/// SUPPRESSION (G) helper. True when the function's `unchecked { }` arithmetic is
+/// exclusively subtraction *and* every such subtraction `a - b` is dominated by a
+/// matching `require(a >= b)` / `require(a > b)` (or `assert`) lower-bound guard,
+/// i.e. the canonical OpenZeppelin allowance/balance idiom that is provably
+/// underflow-free.
+///
+/// Conservative by construction: any `+`/`*`/`/` inside `unchecked`, any
+/// decrement (`--`), or any subtraction whose operands are not pinned by such a
+/// require'd lower bound makes this return `false`, so genuine attacker-influenced
+/// wrap-around still fires.
+fn unchecked_subtraction_is_guarded(f: &sluice_ir::Function) -> bool {
+    // (1) Collect ordered `(larger, smaller)` name pairs proven by a
+    //     `require(a >= b)` / `require(a > b)` (or `assert`). We deliberately only
+    //     trust `>=`/`>` *inside a require/assert*: there the comparison is the
+    //     surviving (truthy) condition, so `a >= b` genuinely holds afterwards. A
+    //     bare `a <= b` or an `if (a >= b) revert` would prove the *opposite* on
+    //     the surviving path, so we do NOT infer bounds from those (soundness over
+    //     reach — a wrong inference here would silence a real underflow).
+    let mut guarded_pairs: Vec<(String, String)> = Vec::new();
+    // Pull `(a, b)` out of a `>=`/`>` comparison; recurse through `&&` so
+    // `require(a >= b && p >= q)` records both pairs.
+    fn collect_ge(cond: &Expr, out: &mut Vec<(String, String)>) {
+        match &cond.kind {
+            ExprKind::Binary { op: BinOp::Ge | BinOp::Gt, lhs, rhs } => {
+                if let (Some(h), Some(l)) = (lhs.simple_name(), rhs.simple_name()) {
+                    out.push((h.to_string(), l.to_string()));
+                }
+            }
+            ExprKind::Binary { op: BinOp::And, lhs, rhs } => {
+                collect_ge(lhs.as_ref(), out);
+                collect_ge(rhs.as_ref(), out);
+            }
+            _ => {}
+        }
+    }
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Call(c) = &e.kind {
+                if matches!(
+                    c.kind,
+                    CallKind::Builtin(sluice_ir::Builtin::Require)
+                        | CallKind::Builtin(sluice_ir::Builtin::Assert)
+                ) {
+                    if let Some(cond) = c.args.first() {
+                        collect_ge(cond, &mut guarded_pairs);
+                    }
+                }
+            }
+        });
+    }
+
+    // (2) Inspect every arithmetic op inside `unchecked { }`. Require all to be
+    //     subtractions with a matching guard; reject anything else.
+    let mut saw_sub = false;
+    let mut all_guarded_sub = true;
+    for s in &f.body {
+        s.visit(&mut |st| {
+            let sluice_ir::StmtKind::Block { unchecked: true, stmts } = &st.kind else {
+                return;
+            };
+            for inner in stmts {
+                inner.visit_exprs(&mut |e| match &e.kind {
+                    ExprKind::Binary { op, lhs, rhs } if op.is_arithmetic() => {
+                        if matches!(op, BinOp::Sub) {
+                            saw_sub = true;
+                            // `lhs - rhs` is safe iff a guard proved `lhs >= rhs`
+                            // on the same two names.
+                            let matched = match (lhs.simple_name(), rhs.simple_name()) {
+                                (Some(a), Some(b)) => {
+                                    guarded_pairs.iter().any(|(h, l)| h == a && l == b)
+                                }
+                                _ => false,
+                            };
+                            if !matched {
+                                all_guarded_sub = false;
+                            }
+                        } else {
+                            // `+` / `*` / `/` / `%` inside unchecked — not this pattern.
+                            all_guarded_sub = false;
+                        }
+                    }
+                    // `--x` / `x--` inside unchecked can underflow — reject.
+                    ExprKind::Unary { op: UnOp::PreDec | UnOp::PostDec, .. } => {
+                        all_guarded_sub = false;
+                    }
+                    _ => {}
+                });
+            }
+        });
+    }
+
+    saw_sub && all_guarded_sub
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -646,5 +854,165 @@ contract C {
 }
 "#;
         assert!(fires(src), "unbounded uint256->uint64 downcast must still fire");
+    }
+
+    // ------------------------------------------------------------------
+    // R6 tightening regressions: the residual etherfi FP shapes.
+    // ------------------------------------------------------------------
+
+    // (B') CLAMPED-VIA-LOCAL: `min(..., type(uintN).max)` is stored in a local
+    // and the cast operates on that local (etherfi MembershipNFT.tierPointsOf /
+    // loyaltyPointsOf). Suppression (B) only saw the cast's own span; (B') reads
+    // the local's defining clamp.
+    #[test]
+    fn silent_on_min_clamped_via_local() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    function pointsOf(uint256 base, uint256 earned) external pure returns (uint40) {
+        uint256 total = _min(base + earned, type(uint40).max);
+        return uint40(total);
+    }
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}
+"#;
+        assert!(!fires(src), "min()-clamped-via-local downcast must be silent");
+    }
+
+    // (B') CLAMPED-VIA-LOCAL with a later reassignment (etherfi
+    // MembershipNFT.membershipPointsEarning): the local is first a quotient, then
+    // re-bound to a `min(..., type(uint40).max)` clamp; the *last* write (clamp)
+    // governs the subsequent cast.
+    #[test]
+    fn silent_on_min_clamped_via_reassigned_local() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    function earningOf(uint256 shares, uint256 elapsed, uint256 rate) external pure returns (uint40) {
+        uint256 earning = shares * elapsed * rate / 10000;
+        earning = _min((earning / 1 days) / 0.001 ether, type(uint40).max);
+        return uint40(earning);
+    }
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}
+"#;
+        assert!(!fires(src), "reassigned min()-clamped local downcast must be silent");
+    }
+
+    // (C') DIVISION-DOWN-VIA-LOCAL: a quotient bound to a local, then narrowed
+    // (etherfi depositDataRootGenerator `uint64(deposit_amount)` where
+    // `deposit_amount = _amountIn / GWEI`, and MembershipManager._topUpDeposit
+    // `uint40(dilutedPoints)`). Divisors here are constant / zero-checked so the
+    // separate div-by-zero detector stays silent and only the DOWNCAST is under
+    // test.
+    #[test]
+    fn silent_on_division_down_via_local() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint64 public packed;
+    function f(uint256 amountIn) external {
+        uint256 q = amountIn / 1e9;
+        packed = uint64(q);
+    }
+    function g(uint256 total, uint256 pts, uint256 divisor) external returns (uint40) {
+        require(divisor != 0);
+        uint256 diluted = (total * pts) / divisor;
+        return uint40(diluted);
+    }
+}
+"#;
+        assert!(!fires(src), "downcast of a division quotient held in a local must be silent");
+    }
+
+    // (C) extended to right-shift: `uintN(a >> k)` is also a monotone shrink.
+    #[test]
+    fn silent_on_shift_right_cast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint128 public half;
+    function f(uint256 x) external {
+        half = uint128(x >> 1);
+    }
+}
+"#;
+        assert!(!fires(src), "downcast of a right-shift result must be silent");
+    }
+
+    // (G) GUARDED SUBTRACTION: the canonical ERC20 `require(a >= b); unchecked {
+    // a - b }` idiom (etherfi EETH.decreaseAllowance / transferFrom) is
+    // provably underflow-free.
+    #[test]
+    fn silent_on_guarded_unchecked_subtraction() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    mapping(address => uint256) public allowanceOf;
+    function decreaseAllowance(address spender, uint256 amount) external returns (bool) {
+        uint256 currentAllowance = allowanceOf[spender];
+        require(currentAllowance >= amount, "below zero");
+        unchecked { allowanceOf[spender] = currentAllowance - amount; }
+        return true;
+    }
+}
+"#;
+        assert!(!fires(src), "guarded unchecked subtraction (ERC20 idiom) must be silent");
+    }
+
+    // POSITIVE (G): an UNGUARDED unchecked subtraction on attacker input still
+    // FIRES — the guard-matching must be precise, not a blanket pass for any
+    // unchecked `-`.
+    #[test]
+    fn fires_on_unguarded_unchecked_subtraction() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint256 public bal;
+    function withdraw(uint256 amount) external {
+        unchecked { bal = bal - amount; }
+    }
+}
+"#;
+        assert!(fires(src), "unguarded unchecked subtraction must still fire");
+    }
+
+    // POSITIVE (G): a guard on the WRONG operands does not license the
+    // subtraction — `require(x >= y)` must not suppress `a - b`.
+    #[test]
+    fn fires_on_unchecked_subtraction_with_mismatched_guard() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint256 public bal;
+    function f(uint256 a, uint256 b, uint256 x, uint256 y) external {
+        require(x >= y);
+        unchecked { bal = a - b; }
+    }
+}
+"#;
+        assert!(fires(src), "unchecked subtraction with a mismatched guard must still fire");
+    }
+
+    // POSITIVE (B'/C'): a downcast of a local that is NEITHER a clamp NOR a
+    // monotone shrink (it is an unbounded sum of attacker input) still FIRES —
+    // the local-resolution must not blanket-suppress every local.
+    #[test]
+    fn fires_on_downcast_of_unbounded_local() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint64 public y;
+    function f(uint256 a, uint256 b) external {
+        uint256 s = a + b;
+        y = uint64(s);
+    }
+}
+"#;
+        assert!(fires(src), "downcast of an unbounded (sum) local must still fire");
     }
 }

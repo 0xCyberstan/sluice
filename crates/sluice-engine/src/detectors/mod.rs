@@ -59,6 +59,8 @@ pub mod lp_slippage;
 pub mod signed_cast;
 // Round 5 (perpetual loop) detectors.
 pub mod untrusted_call_target;
+// Round 6 (perpetual loop) detectors.
+pub mod erc721_mint_reentrancy;
 
 use crate::detector::Detector;
 
@@ -122,6 +124,8 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(signed_cast::SignedCastDetector),
         // Round 5 (perpetual loop).
         Box::new(untrusted_call_target::UntrustedCallTargetDetector),
+        // Round 6 (perpetual loop).
+        Box::new(erc721_mint_reentrancy::Erc721MintReentrancyDetector),
     ]
 }
 

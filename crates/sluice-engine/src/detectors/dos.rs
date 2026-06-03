@@ -17,7 +17,24 @@
 //!
 //! Precision over recall: failures isolated by `try/catch`, pull-payment
 //! patterns, owner-set/constant-bounded loops, and `view`/`pure` functions are
-//! suppressed.
+//! suppressed. Two further shapes are suppressed because the "one reverting
+//! recipient bricks the batch" premise does not hold for them:
+//!
+//!   * **Fault-tolerant / `try`-style aggregators** — the loop captures each
+//!     entry's `(bool success, …)` and stores the per-entry outcome (into a
+//!     tuple or a `Result[]`) instead of unconditionally reverting; a failed
+//!     entry is deliberately tolerated (any abort is gated behind a caller
+//!     `requireSuccess`-style flag). `Multicall2.tryAggregate`,
+//!     `PendleMulticallV{1,2}.tryAggregate` are of this kind.
+//!   * **Read-only aggregator helpers** — a function in a contract/file named
+//!     `*Multicall*`/`*aggregator*` whose in-loop call returns data and sends no
+//!     native value (`Multicall2.aggregate`, `PendleMulticallV{1,2}.aggregate`).
+//!     There are no stored recipients for an attacker to grief; the caller
+//!     supplies its own call list.
+//!
+//! A genuine push-payment loop that sends native value and reverts the whole
+//! batch on a single failure (`require(success)` / bubbled `if (!success) revert`)
+//! is still reported.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -68,7 +85,25 @@ impl Detector for DosDetector {
                     // calldata array, or an admin-bounded storage list, is not a DoS.
                     let sends_value = loop_sends_value(body);
                     let over_growable = loop_iterates_growable(loop_stmt, &growable);
-                    if !pull_payment && (sends_value || over_growable) {
+                    // The "one reverting recipient bricks the batch" premise is FALSE
+                    // for two shapes, so suppress them:
+                    //  (A) a FAULT-TOLERANT / `try`-style aggregator — the per-entry
+                    //      `(bool success, …)` is captured and stored (into a tuple or
+                    //      a `Result[]`) and a failed entry does NOT unconditionally
+                    //      revert the batch (no `require(success)`; any abort is gated
+                    //      behind a caller `requireSuccess`-style bool knob), and
+                    //  (B) a READ-ONLY aggregator helper — a function in a contract or
+                    //      file named *Multicall*/*aggregator* whose in-loop call
+                    //      returns data without sending native value (no `{value:}` /
+                    //      `transfer` / `send`). Both intentionally tolerate, or never
+                    //      expose, a failing recipient, so neither can be griefed.
+                    let fault_tolerant = loop_is_fault_tolerant(cx, f, loop_stmt);
+                    let readonly_aggregator = is_readonly_aggregator(cx, f, body);
+                    if !pull_payment
+                        && !fault_tolerant
+                        && !readonly_aggregator
+                        && (sends_value || over_growable)
+                    {
                         let mut b = FindingBuilder::new(self.id(), Category::DenialOfService)
                             .title("External call inside a loop (one reverting recipient bricks the batch)")
                             .severity(Severity::Medium)
@@ -297,6 +332,97 @@ fn loop_sends_value(body: &[Stmt]) -> bool {
     sends
 }
 
+/// True if any in-loop call sends **native ETH** — precisely (`{value:}` present,
+/// `.transfer`, or `.send`). Unlike [`loop_sends_value`], a bare low-level
+/// `.call(data)` with no `{value:}` does *not* count here: a read aggregator that
+/// forwards calldata is not a value push, and we must not treat it as one.
+fn loop_sends_native_value(body: &[Stmt]) -> bool {
+    let mut sends = false;
+    for s in body {
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Call(c) = &e.kind {
+                if c.value.is_some() || matches!(c.kind, CallKind::Transfer | CallKind::Send) {
+                    sends = true;
+                }
+            }
+        });
+        if sends {
+            break;
+        }
+    }
+    sends
+}
+
+/// (A) A FAULT-TOLERANT / `try`-style aggregator loop: each entry's
+/// `(bool success, …)` is captured and the per-entry outcome is *stored* (an
+/// indexed write `results[i] = …`, or a `Result(success, …)` construction), and a
+/// failed entry does **not** unconditionally revert the batch.
+///
+/// The defining contrast with a real push-payment DoS is the failure path. A
+/// loop that does `require(success)` / `if (!success) revert` aborts the whole
+/// batch on any failure and is *not* tolerant. A loop that only reverts when a
+/// caller-supplied `requireSuccess`-style `bool` knob is set — or that never
+/// reverts and just records the result — tolerates a failing entry, so no single
+/// recipient can brick it. We recognize the latter as: the outcome is stored, and
+/// either the loop performs no `require`/`revert`/`assert` at all, or the function
+/// exposes a `bool` success-knob parameter that gates the abort.
+fn loop_is_fault_tolerant(cx: &AnalysisContext, f: &Function, loop_stmt: &Stmt) -> bool {
+    // Comment-stripped, lowercased text of the whole loop (covers its body).
+    let src = cx.source_text(loop_stmt.span);
+    let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Must capture the call's success bit into a `(bool …)` tuple — the hallmark
+    // of an aggregator that inspects per-entry success rather than relying on the
+    // call to revert. (`"(boolok,)".contains("(bool")` holds after de-spacing.)
+    let captures_success = compact.contains("(bool");
+    if !captures_success {
+        return false;
+    }
+
+    // Stores the per-entry outcome: an indexed assignment (`returnData[i] = …`,
+    // `results[i] = ok`) or a `Result(...)` constructor. A loop that only reverts
+    // on failure (and stores nothing) is a hard aggregator, not a tolerant one.
+    // Neutralize `arr[i] == x` first so an element *comparison* is not mistaken
+    // for an element *assignment*.
+    let no_eq_cmp = compact.replace("]==", "]\u{1}");
+    let stores_result = no_eq_cmp.contains("]=") || no_eq_cmp.contains("result(");
+    if !stores_result {
+        return false;
+    }
+
+    // Tolerant iff the failure path cannot, by itself, abort the batch: either no
+    // abort statement exists, or the abort is gated behind a `bool` success-knob
+    // parameter (`requireSuccess`-style), so a failed entry alone does not revert.
+    let has_abort =
+        compact.contains("require(") || compact.contains("revert") || compact.contains("assert(");
+    let has_bool_knob = f.params.iter().any(|p| p.ty.trim().eq_ignore_ascii_case("bool"));
+    !has_abort || has_bool_knob
+}
+
+/// (B) A READ-ONLY aggregator helper: a function whose contract OR source file is
+/// named `*Multicall*`/`*aggregator*` and whose in-loop external call returns data
+/// without sending native value. Such a helper forwards a caller-supplied call
+/// list and has no stored recipients for an attacker to grief, so the push-payment
+/// DoS premise does not apply — even when it bubbles up a failure via
+/// `if (!success) revert`.
+fn is_readonly_aggregator(cx: &AnalysisContext, f: &Function, body: &[Stmt]) -> bool {
+    fn is_aggregator_name(s: &str) -> bool {
+        let s = s.to_ascii_lowercase();
+        s.contains("multicall") || s.contains("aggregator")
+    }
+    let contract_named =
+        cx.contract_of(f.id).map(|c| is_aggregator_name(&c.name)).unwrap_or(false);
+    let (path, _) = cx.scir.location(f.span);
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or(&path);
+    if !contract_named && !is_aggregator_name(basename) {
+        return false;
+    }
+    // A value-pushing batch (even in a *Multicall* contract, e.g. an owner-only
+    // executor that forwards ETH and reverts on failure) is a real push-payment
+    // loop and stays reported; only the no-value, data-returning helpers are FPs.
+    !loop_sends_native_value(body)
+}
+
 /// Detect a `push(...)` (array growth) on a storage array inside a loop body.
 /// Recognized either by the pre-classified `ArrayPushPop` builtin or by a member
 /// call named `push`.
@@ -475,5 +601,153 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "denial-of-service"));
+    }
+
+    // ------------------------------------------------------------------
+    // Regressions for the fault-tolerant / read-only-aggregator suppression
+    // (the R5 pendle dogfood fired on these). Each asserts SILENT; the two
+    // positives below assert the detector still FIRES on a real batch-bricking
+    // push loop and on an unconditional `require(success)` loop.
+    // ------------------------------------------------------------------
+
+    // (A) FAULT-TOLERANT: the per-entry success is captured and stored; a failed
+    // entry is tolerated (the loop never reverts on failure). Must stay silent.
+    #[test]
+    fn silent_on_fault_tolerant_store() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract TryBatch {
+                function exec(address[] calldata targets, bytes[] calldata data)
+                    external
+                    returns (bool[] memory results)
+                {
+                    results = new bool[](targets.length);
+                    for (uint256 i = 0; i < targets.length; i++) {
+                        (bool ok, ) = targets[i].call(data[i]);
+                        results[i] = ok;
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| f.detector == "denial-of-service"),
+            "fault-tolerant store-the-result loop must not flag: {:?}",
+            fs
+        );
+    }
+
+    // (A) FAULT-TOLERANT with a `requireSuccess` knob: the abort is gated behind a
+    // caller flag and the outcome is stored into a `Result[]` — the Multicall2 /
+    // PendleMulticall `tryAggregate` shape. Must stay silent.
+    #[test]
+    fn silent_on_try_aggregate() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract Aggregator {
+                struct Result { bool success; bytes returnData; }
+                function tryAggregate(bool requireSuccess, address[] calldata targets, bytes[] calldata data)
+                    external
+                    returns (Result[] memory returnData)
+                {
+                    returnData = new Result[](targets.length);
+                    for (uint256 i = 0; i < targets.length; i++) {
+                        (bool success, bytes memory ret) = targets[i].call(data[i]);
+                        if (requireSuccess) {
+                            require(success, "call failed");
+                        }
+                        returnData[i] = Result(success, ret);
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| f.detector == "denial-of-service"),
+            "flag-gated try-aggregate must not flag: {:?}",
+            fs
+        );
+    }
+
+    // (B) READ-ONLY aggregator helper: a `*Multicall*` contract whose loop forwards
+    // calldata and returns data with no native value — even though it bubbles the
+    // failure via `require(success)`. The caller supplies its own list; there are
+    // no stored recipients to grief. Must stay silent.
+    #[test]
+    fn silent_on_readonly_multicall() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract ReadMulticall {
+                function aggregate(address[] calldata targets, bytes[] calldata data)
+                    external
+                    returns (bytes[] memory returnData)
+                {
+                    returnData = new bytes[](targets.length);
+                    for (uint256 i = 0; i < targets.length; i++) {
+                        (bool success, bytes memory ret) = targets[i].call(data[i]);
+                        require(success, "Multicall: call failed");
+                        returnData[i] = ret;
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| f.detector == "denial-of-service"),
+            "read-only multicall aggregator must not flag: {:?}",
+            fs
+        );
+    }
+
+    // POSITIVE: a value-PUSHING batch in a *Multicall*-named contract is NOT a
+    // read-only helper — it forwards ETH and reverts the whole batch on one
+    // failure. The aggregator-name suppression must NOT silence it.
+    #[test]
+    fn fires_on_value_pushing_multicall() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract OwnerMulticall {
+                struct Call { address target; uint256 value; bytes callData; }
+                function aggregate(Call[] calldata calls)
+                    external
+                    payable
+                    returns (bytes[] memory rtnData)
+                {
+                    rtnData = new bytes[](calls.length);
+                    for (uint256 i = 0; i < calls.length; i++) {
+                        (bool success, bytes memory resp) =
+                            calls[i].target.call{value: calls[i].value}(calls[i].callData);
+                        require(success, "call failed");
+                        rtnData[i] = resp;
+                    }
+                }
+            }
+        "#);
+        assert!(
+            fs.iter().any(|f| f.detector == "denial-of-service"),
+            "value-pushing batch that reverts on failure must still flag: {:?}",
+            fs
+        );
+    }
+
+    // POSITIVE: an unconditional `require(success)` over an in-loop low-level call
+    // (no `requireSuccess` flag, nothing stored) reverts the whole batch on one
+    // failure — the kept DoS shape. Must still FIRE.
+    #[test]
+    fn fires_on_unconditional_require_loop() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract Caller {
+                address[] public a;
+                function pump() external {
+                    for (uint256 i = 0; i < a.length; i++) {
+                        (bool ok, ) = a[i].call("");
+                        require(ok);
+                    }
+                }
+            }
+        "#);
+        assert!(
+            fs.iter().any(|f| f.detector == "denial-of-service"),
+            "unconditional require(success) loop must still flag: {:?}",
+            fs
+        );
     }
 }

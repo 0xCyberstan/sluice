@@ -92,6 +92,7 @@ pub enum Category {
     Erc1155Safety,
     SignedCast,
     UntrustedCallTarget,
+    MintCallbackReentrancy,
     Other,
 }
 
@@ -159,6 +160,7 @@ impl Category {
             Erc1155Safety => "unchecked-erc1155-receiver",
             SignedCast => "signed-cast",
             UntrustedCallTarget => "untrusted-call-target",
+            MintCallbackReentrancy => "erc721-mint-reentrancy",
             Other => "other",
         }
     }
@@ -208,6 +210,7 @@ impl Category {
             Erc1155Safety => &["CWE-20"],
             SignedCast => &["CWE-196", "CWE-681"],
             UntrustedCallTarget => &["CWE-345", "CWE-20", "CWE-863"],
+            MintCallbackReentrancy => &["SWC-107", "CWE-841"],
             _ => &[],
         }
     }

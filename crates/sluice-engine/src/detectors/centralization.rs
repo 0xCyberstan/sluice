@@ -12,21 +12,41 @@
 //! "can move/re-route user funds" title, even for bounded scalar setters
 //! (`setFeeToDaoPercent` capped by `require(x <= MAX)`) and token-rescue helpers
 //! that send only to a fixed/preset recipient. Those are not rugs. So the title
-//! and severity are now **tiered by what the function body actually does**:
+//! and severity are now **tiered by what the function body actually does**. The
+//! cardinal rule (precision over volume): a Low (or higher) finding is reserved
+//! for a body with a genuine **fund-sink whose destination is not a fixed/preset
+//! recipient** — i.e. an attacker-steerable fund movement. Everything weaker is
+//! Info or silent.
 //!
 //!   * **Strong** — "Privileged admin can move/re-route user funds with no
-//!     timelock" — only when the body contains a real **fund-flow**: a token
-//!     `transfer`/`safeTransfer`/`transferFrom`, a `.call{value:}` / `.send` /
-//!     `.transfer` ETH move, a `mint`/`burn`, an `approve`, or a reassignment of
-//!     a withdrawal/treasury/recipient **address** state variable. A bulk
-//!     sweep / rescue to a *caller-chosen* destination (`rescue(token,to,amt)`)
-//!     is a rug and stays strong.
-//!   * **Soft** — "Privileged parameter setter (no timelock)" at Low — for a
+//!     timelock" — when the body contains a real fund-flow (token
+//!     `transfer`/`safeTransfer`/`transferFrom`, `.call{value:}` / `.send` ETH
+//!     move, `mint`/`burn`, `approve`, or a reassignment of a
+//!     withdrawal/treasury/recipient **address** state variable) AND that flow is
+//!     attacker-steerable: the destination is **caller-chosen** (`withdrawTo(to,
+//!     …)` / `rescue(token,to,amt)`), or it is a supply move (`mint`/`burn`), or
+//!     it re-points a recipient **address** state var. A fund-routing-shaped
+//!     setter (`set*Fee` / `setRouter` / `migrate`) that also moves funds is the
+//!     more serious configuration-reroute case → **Medium**; a plain steerable
+//!     fund mover → **Low**.
+//!   * **Info — preset-destination fund mover** — a body that *does* move funds
+//!     but only to a **fixed / preset / internal** destination (a state var, a
+//!     constant, a per-`id` mapping entry, or a bare `approve` to a fixed
+//!     spender) and is not a routing setter. It moves protocol funds along a
+//!     hard-wired path rather than re-routing *user* funds to an attacker-chosen
+//!     address, so it is informational, not a rug.
+//!   * **Info — token-rescue** — `recover*` / `sweep*` / `rescue*` that sends to a
+//!     **fixed / immutable / preset** recipient: a token-rescue, not a rug.
+//!   * **Soft — "Privileged parameter setter (no timelock)"** at Info — a
 //!     fund-routing-shaped setter (`set*Fee` / `setRouter` / `setImplementation`,
-//!     …) whose body moves no funds. Suppressed entirely when it is only a
-//!     bounded `uintN` set guarded by a cap (`require(x <= MAX)`).
-//!   * **Info** — token-rescue (`recover*` / `sweep*` / `rescue*`) that sends to
-//!     a **fixed / immutable / preset** recipient: a token-rescue, not a rug.
+//!     …) whose body moves **no** funds (no fund-sink ⇒ never Low+). Suppressed
+//!     entirely when it is only a bounded `uintN`/`bool` set guarded by a cap
+//!     (`require(x <= MAX)`), which cannot be pushed to an abusive value.
+//!
+//! Non-centralization shapes are dropped up front: constructors, initializers
+//! (the `initializer` modifier-guard *or* an `initialize`/`reinitialize`-style
+//! name — sets up the contract once, it is not the standing admin surface), and
+//! `view`/`pure` functions (they cannot move anything).
 //!
 //! Precision is otherwise prioritized via aggressive suppression:
 //!
@@ -58,6 +78,7 @@ pub struct CentralizationDetector;
 const STRONG_TITLE: &str = "Privileged admin can move/re-route user funds with no timelock";
 const SOFT_TITLE: &str = "Privileged parameter setter (no timelock)";
 const RESCUE_TITLE: &str = "Privileged token-rescue to a fixed recipient";
+const FIXED_DEST_TITLE: &str = "Privileged admin moves protocol funds to a preset destination";
 
 impl Detector for CentralizationDetector {
     fn id(&self) -> &'static str {
@@ -81,9 +102,21 @@ impl Detector for CentralizationDetector {
             if !cx.has_access_control(f) {
                 continue;
             }
-            // Constructors / initializers set up the contract once and are not the
-            // standing admin surface.
-            if f.is_constructor() || cx.is_initializer(f) {
+            // Non-centralization shapes are not the standing admin fund surface:
+            //   * constructors / initializers set up the contract exactly once.
+            //     `cx.is_initializer` only catches the `initializer` *modifier*
+            //     guard, so also drop functions whose *name* is an initializer
+            //     (`initialize` / `reinitialize` / `__init`, e.g. Olympus
+            //     `sOlympus.initialize`, which guards with a manual
+            //     `require(msg.sender == initializer)` and seeds `treasury` —
+            //     setup, not a standing fund-move lever).
+            //   * `view`/`pure` functions cannot move or re-route anything.
+            if f.is_constructor()
+                || cx.is_initializer(f)
+                || f.has_modifier_like("initializer")
+                || is_initializer_name(&f.name)
+                || f.is_view_or_pure()
+            {
                 continue;
             }
             // Ordinary user operations are not a centralization risk even when an
@@ -146,19 +179,20 @@ impl Detector for CentralizationDetector {
                 } else {
                     // A rescue-shaped name with no detectable fund move. Don't claim
                     // a fund reroute, but keep a soft signal rather than going fully
-                    // silent (never silence a possible real bug).
+                    // silent (never silence a possible real bug). No fund-sink ⇒
+                    // Info, not Low (Low is reserved for steerable fund movers).
                     out.push(self.finding(
                         cx,
                         f,
                         SOFT_TITLE,
-                        Severity::Low,
+                        Severity::Info,
                         soft_msg(&contract.name, &f.name),
                     ));
                 }
                 continue;
             }
 
-            // ---- Real fund-flow → strong title --------------------------------
+            // ---- Real fund-flow → tier by steerability ------------------------
             // A token transfer / ETH send / mint / burn / approve, or a
             // reassignment of a withdrawal/treasury/recipient address state var.
             if has_fund_flow(f, contract) {
@@ -169,14 +203,52 @@ impl Detector for CentralizationDetector {
                     continue;
                 }
                 // A fund-routing-shaped name (sets a fee/recipient/treasury/router,
-                // or a sweep/migrate) that *also* moves funds is the more serious
-                // configuration-reroute case → Medium; a plain fund mover → Low.
-                let sev = if is_fund_routing_setter(&f.name) {
-                    Severity::Medium
-                } else {
-                    Severity::Low
-                };
-                out.push(self.finding(cx, f, STRONG_TITLE, sev, strong_msg(&contract.name, &f.name)));
+                // or a sweep/migrate) that *also* moves funds is the most serious
+                // configuration-reroute case → Medium, strong title.
+                if is_fund_routing_setter(&f.name) {
+                    out.push(self.finding(
+                        cx,
+                        f,
+                        STRONG_TITLE,
+                        Severity::Medium,
+                        strong_msg(&contract.name, &f.name),
+                    ));
+                    continue;
+                }
+                // Steerable fund-flow → Low, strong title. "Steerable" means the
+                // admin can direct value somewhere an attacker would care about:
+                //   * the destination is **caller-chosen** (a parameter), the
+                //     classic `withdrawTo(to, …)` / arbitrary-recipient rug; or
+                //   * the body **mints / burns** supply (creates or destroys
+                //     balances out of thin air); or
+                //   * it re-points a withdrawal/treasury/recipient **address**
+                //     state var (re-routes where future funds go).
+                if has_caller_chosen_value_move(f)
+                    || has_mint_or_burn(f)
+                    || reassigns_recipient_address(f, contract)
+                {
+                    out.push(self.finding(
+                        cx,
+                        f,
+                        STRONG_TITLE,
+                        Severity::Low,
+                        strong_msg(&contract.name, &f.name),
+                    ));
+                    continue;
+                }
+                // Otherwise the body moves funds only to a **fixed / preset /
+                // internal** destination (a state var, a constant, a per-`id`
+                // mapping entry, or a bare `approve` to a fixed spender). This
+                // routes protocol funds along a hard-wired path rather than
+                // re-routing user funds to an attacker-chosen address — a trust
+                // note, not a rug → Info.
+                out.push(self.finding(
+                    cx,
+                    f,
+                    FIXED_DEST_TITLE,
+                    Severity::Info,
+                    fixed_dest_msg(&contract.name, &f.name),
+                ));
                 continue;
             }
 
@@ -185,13 +257,16 @@ impl Detector for CentralizationDetector {
             // *shape* matched (e.g. `setFee`, `setRouter`, `setImplementation`).
             // This is a softer trust concern, not a fund reroute.
             if is_fund_routing_setter(&f.name) {
-                // A bounded `uintN` setter guarded by an explicit cap
+                // A bounded `uintN`/`bool` setter guarded by an explicit cap
                 // (`require(x <= MAX)`) cannot push the parameter to an abusive
                 // value, so it is not a meaningful centralization lever → suppress.
                 if is_bounded_scalar_setter(f, contract) {
                     continue;
                 }
-                out.push(self.finding(cx, f, SOFT_TITLE, Severity::Low, soft_msg(&contract.name, &f.name)));
+                // In-between: a routing-shaped setter that moves no funds. Keep the
+                // soft "parameter setter" signal, but at Info — with no fund-sink
+                // in the body this is never a Low+ (fund-mover) finding.
+                out.push(self.finding(cx, f, SOFT_TITLE, Severity::Info, soft_msg(&contract.name, &f.name)));
                 continue;
             }
 
@@ -212,13 +287,20 @@ impl CentralizationDetector {
         sev: Severity,
         msg: String,
     ) -> Finding {
+        // Honest: the absence of an off-chain timelock owner cannot be proven from
+        // source, and "trusted admin" is often an accepted assumption, so this is a
+        // low-confidence signal. BUT the engine's corroboration scorer recomputes
+        // the final severity from `base(sev) × (0.5 + 0.5·confidence)`, and at
+        // confidence 0.4 a `Medium` label scores 45×0.7 = 31.5, which falls back
+        // under the Medium threshold (33) — making the Medium tier unreachable. Give
+        // the Medium tier (routing-shaped name that actually moves funds — the most
+        // serious config-reroute case) just enough confidence to land as Medium
+        // (45×0.75 = 33.75); Low/Info tiers keep 0.4 so their scores are unchanged.
+        let conf = if matches!(sev, Severity::Medium) { 0.5 } else { 0.4 };
         let b = FindingBuilder::new(self.id(), Category::Centralization)
             .title(title)
             .severity(sev)
-            // Honest: the absence of an off-chain timelock owner cannot be proven
-            // from source, and "trusted admin" is often an accepted assumption, so
-            // this is a low-confidence informational signal.
-            .confidence(0.4)
+            .confidence(conf)
             .dimension(Dimension::Invariant)
             .message(msg)
             .recommendation(
@@ -252,6 +334,20 @@ fn soft_msg(contract: &str, func: &str) -> String {
          immediately, with no timelock or delay. Its body does not itself move user funds, so \
          this is a softer trust concern than a direct fund reroute — but a compromised or \
          malicious admin can still change the parameter in one transaction with no exit window.",
+        contract, func
+    )
+}
+
+fn fixed_dest_msg(contract: &str, func: &str) -> String {
+    format!(
+        "`{}.{}` is an access-controlled function that moves funds (a token transfer / ETH \
+         send / approve) only to a fixed, preset, or internal destination — a state variable, a \
+         constant, a per-id mapping entry, or an `approve` to a fixed spender — not to a \
+         caller-chosen address, and it neither mints/burns supply nor re-points a \
+         recipient/treasury address. It routes protocol funds along a hard-wired path rather \
+         than re-routing user funds to an attacker-chosen destination, so it is informational \
+         rather than an admin-can-rug risk — but note the contract has no timelock, so verify \
+         the preset destination is the intended one.",
         contract, func
     )
 }
@@ -292,6 +388,20 @@ fn is_fund_routing_setter(name: &str) -> bool {
 fn is_recover_name(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     l.contains("recover") || l.contains("rescue") || l.contains("sweep")
+}
+
+/// An initializer-by-name: a one-shot setup function (`initialize`,
+/// `reinitialize`, `__init`, `init`). These seed contract state once and are not
+/// the standing admin fund surface. A bare `init` prefix is used because the
+/// convention (`initialize`, `initializeV2`, `__ERC20_init`, …) is unambiguous;
+/// it complements `cx.is_initializer`, which only sees the `initializer`
+/// *modifier* guard and misses manual `require(msg.sender == initializer)` forms.
+fn is_initializer_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.starts_with("initialize")
+        || l.starts_with("reinitialize")
+        || l.starts_with("__init")
+        || l == "init"
 }
 
 /// Intentionally-permissionless user operations that are not a centralization
@@ -351,6 +461,33 @@ fn has_fund_flow(f: &Function, contract: &Contract) -> bool {
                 // Approvals grant spending authority over held funds.
                 Some("approve") | Some("safeApprove") | Some("forceApprove") => found = true,
                 _ => {}
+            }
+        });
+        if found {
+            break;
+        }
+    }
+    found
+}
+
+/// True if the body contains a `mint`/`burn` call — a supply move that creates or
+/// destroys balances out of thin air (not a transfer of existing held funds).
+/// This is one of the "steerable" effects that keeps a fund-flow at Low rather
+/// than down-ranking it to the preset-destination Info tier.
+fn has_mint_or_burn(f: &Function) -> bool {
+    let mut found = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            if let ExprKind::Call(call) = &e.kind {
+                if matches!(
+                    call.func_name.as_deref(),
+                    Some("mint") | Some("_mint") | Some("burn") | Some("_burn") | Some("burnFrom")
+                ) {
+                    found = true;
+                }
             }
         });
         if found {
@@ -433,41 +570,40 @@ fn all_value_moves_are_caller_own(f: &Function) -> bool {
                 return;
             }
 
-            // ERC-20 moves: inspect the recipient / source argument.
-            //   transfer(to, amt)            -> arg0 is `to`
-            //   transferFrom(from, to, amt)  -> arg0 is `from`, arg1 is `to`
-            //   safeTransfer(token, to, amt) -> arg1 is `to`
-            //   safeTransferFrom(token, from, to, amt) -> arg1 `from`, arg2 `to`
-            match call.func_name.as_deref() {
-                Some("transfer") if matches!(call.kind, CallKind::External | CallKind::Internal) => {
-                    saw_move = true;
-                    if !arg_is_msg_sender(&call.args, 0) {
-                        all_caller = false;
-                    }
-                }
-                Some("transferFrom")
-                    if matches!(call.kind, CallKind::External | CallKind::Internal) =>
-                {
-                    saw_move = true;
-                    // Caller's own funds iff both endpoints are the caller (rare);
-                    // any other endpoint means it can touch non-caller funds.
-                    if !(arg_is_msg_sender(&call.args, 0) && arg_is_msg_sender(&call.args, 1)) {
-                        all_caller = false;
-                    }
-                }
-                Some("safeTransfer") => {
-                    saw_move = true;
-                    if !arg_is_msg_sender(&call.args, 1) {
-                        all_caller = false;
-                    }
-                }
-                Some("safeTransferFrom") => {
-                    saw_move = true;
-                    if !(arg_is_msg_sender(&call.args, 1) && arg_is_msg_sender(&call.args, 2)) {
-                        all_caller = false;
-                    }
-                }
-                _ => {}
+            // ERC-20 moves. The amount is always the **last** argument, the
+            // recipient `to` is the **second-to-last**, and for the `*From`
+            // family the source `from` is the argument before `to`. Indexing
+            // from the end is robust to *both* call shapes:
+            //   member form        `token.transfer(to, amt)`         to=arg[-2]
+            //   library form  `SafeERC20.safeTransfer(token, to, amt)` to=arg[-2]
+            // which the old fixed-index logic got wrong for the member form
+            // (it read arg1 as `to`, so `wsOHM.safeTransfer(msg.sender, bal)`
+            // looked non-caller-own and leaked a self-pull as a "rug").
+            let (is_plain, is_from) = match call.func_name.as_deref() {
+                Some("transfer") => (true, false),
+                Some("transferFrom") => (true, true),
+                Some("safeTransfer") => (false, false),
+                Some("safeTransferFrom") => (false, true),
+                _ => return,
+            };
+            // `transfer`/`transferFrom` only count as token moves when
+            // external/internal (a `payable(x).transfer(v)` ETH send is a
+            // `Transfer` kind, handled above).
+            if is_plain && !matches!(call.kind, CallKind::External | CallKind::Internal) {
+                return;
+            }
+            let n = call.args.len();
+            if n < 2 {
+                return;
+            }
+            saw_move = true;
+            // Destination `to` = second-to-last arg.
+            let to_caller = arg_is_msg_sender(&call.args, n - 2);
+            // For the `*From` family the funds originate at `from` = arg before
+            // `to`; "caller's own" requires that source to be the caller too.
+            let from_caller = !is_from || (n >= 3 && arg_is_msg_sender(&call.args, n - 3));
+            if !(to_caller && from_caller) {
+                all_caller = false;
             }
         });
     }
@@ -922,6 +1058,283 @@ mod tests {
         assert!(
             c.iter().any(|f| f.title.contains("move/re-route user funds")),
             "setTreasury(address) must fire with the strong title: {:?}",
+            c
+        );
+    }
+
+    // ===== R6 volume/severity tuning regressions =========================
+
+    use sluice_findings::Severity;
+
+    /// Convenience: highest severity among the centralization findings, or None
+    /// when the detector stayed silent.
+    fn max_central_sev(fs: &[sluice_findings::Finding]) -> Option<Severity> {
+        central(fs).iter().map(|f| f.severity).max()
+    }
+
+    // (A) Non-centralization shapes are dropped up front.
+
+    // Bounded `setFeePercent(uint256 p) onlyOwner { require(p<=MAX); fee=p; }` —
+    // the exact shape called out in the task. A capped scalar fee setter that
+    // moves no funds must be silent (or, at the very most, Info) — never Low+.
+    const SET_FEE_PERCENT: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Fees {
+            address public owner;
+            uint256 public fee;
+            uint256 public constant MAX = 1000;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            function setFeePercent(uint256 p) external onlyOwner {
+                require(p <= MAX, "too high");
+                fee = p;
+            }
+        }
+    "#;
+
+    #[test]
+    fn set_fee_percent_silent_or_info() {
+        let fs = run(SET_FEE_PERCENT);
+        let c = central(&fs);
+        // Bounded fee/percent setter: suppressed here, and in no case above Info.
+        assert!(c.is_empty(), "bounded setFeePercent must be silent: {:?}", c);
+        assert!(
+            max_central_sev(&fs).map_or(true, |s| s <= Severity::Info),
+            "bounded setFeePercent must never exceed Info: {:?}",
+            c
+        );
+    }
+
+    // An `initialize()` that even seeds a treasury address (the Olympus
+    // `sOlympus.initialize` shape, which uses a manual
+    // `require(msg.sender == initializer)` rather than the `initializer`
+    // modifier) is one-shot setup, not a standing fund lever → must be silent,
+    // and in particular must NOT be mislabeled a fund mover.
+    const INITIALIZE_SEEDS_TREASURY: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Staked {
+            address public initializer;
+            address public stakingContract;
+            address public treasury;
+            constructor() { initializer = msg.sender; }
+            function initialize(address _stakingContract, address _treasury) external {
+                require(msg.sender == initializer, "not initializer");
+                require(_stakingContract != address(0), "Staking");
+                stakingContract = _stakingContract;
+                require(_treasury != address(0), "Zero address: Treasury");
+                treasury = _treasury;
+                initializer = address(0);
+            }
+        }
+    "#;
+
+    #[test]
+    fn initialize_is_silent() {
+        let fs = run(INITIALIZE_SEEDS_TREASURY);
+        let c = central(&fs);
+        assert!(
+            c.is_empty(),
+            "initialize() (even seeding treasury) must be silent, not a fund mover: {:?}",
+            c
+        );
+    }
+
+    // A `view`/`pure` privileged-looking getter cannot move anything → silent.
+    const VIEW_GETTER: &str = r#"
+        pragma solidity ^0.8.0;
+        contract V {
+            address public owner;
+            address public treasury;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            function previewTreasury() external view onlyOwner returns (address) {
+                return treasury;
+            }
+        }
+    "#;
+
+    #[test]
+    fn view_function_is_silent() {
+        let fs = run(VIEW_GETTER);
+        assert!(central(&fs).is_empty(), "view/pure must be silent: {:?}", central(&fs));
+    }
+
+    // (B) Severity by impact.
+
+    // Positive (exact task shape): `withdrawTo(address to, uint256 a) onlyOwner
+    // { token.transfer(to, a); }` is a steerable transfer to a caller-chosen
+    // address → Low or higher, strong title.
+    const WITHDRAW_TO_EXACT: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IERC20 { function transfer(address to, uint256 a) external returns (bool); }
+        contract T {
+            address public owner;
+            IERC20 public token;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            function withdrawTo(address to, uint256 a) external onlyOwner {
+                token.transfer(to, a);
+            }
+        }
+    "#;
+
+    #[test]
+    fn withdraw_to_is_low_or_higher() {
+        let fs = run(WITHDRAW_TO_EXACT);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.title.contains("move/re-route user funds")
+                && f.severity >= Severity::Low),
+            "withdrawTo(to, a) must be Low+ with the strong title: {:?}",
+            c
+        );
+    }
+
+    // A genuine supply move (`mint`) stays Low+: minting balances out of thin
+    // air is a steerable fund-affecting power, kept meaningful.
+    const MINTER: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Token {
+            address public owner;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            function _mint(address to, uint256 a) internal {}
+            function mint(address to, uint256 a) external onlyOwner { _mint(to, a); }
+        }
+    "#;
+
+    #[test]
+    fn mint_stays_low_or_higher() {
+        let fs = run(MINTER);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.severity >= Severity::Low
+                && f.title.contains("move/re-route user funds")),
+            "mint() must remain Low+ (supply move): {:?}",
+            c
+        );
+    }
+
+    // A fund-routing-shaped name that also moves funds is the more serious
+    // configuration-reroute case → Medium.
+    const MIGRATE_MOVER: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IERC20 { function safeTransfer(address to, uint256 a) external; }
+        contract Allocator {
+            address public owner;
+            address public newAllocator;
+            IERC20 public token;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            function migrate() external onlyOwner {
+                token.safeTransfer(newAllocator, 100);
+            }
+        }
+    "#;
+
+    #[test]
+    fn migrate_fund_mover_is_medium() {
+        let fs = run(MIGRATE_MOVER);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.severity == Severity::Medium
+                && f.title.contains("move/re-route user funds")),
+            "migrate() that moves funds must be Medium: {:?}",
+            c
+        );
+    }
+
+    // Preset-destination fund mover: an `onlyOwner` transfer whose destination is
+    // a fixed *state variable* (not a caller-chosen param), with no mint/burn and
+    // no recipient-address re-point. It moves protocol funds along a hard-wired
+    // path → Info (the FIXED_DEST tier), never Low+.
+    const PRESET_DEST_MOVER: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IERC20 { function safeTransfer(address to, uint256 a) external; }
+        contract Escrow {
+            address public owner;
+            address public counterparty;
+            IERC20 public externalToken;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            // returns the held token to a FIXED, preset counterparty (state var)
+            function settle(uint256 a) external onlyOwner {
+                externalToken.safeTransfer(counterparty, a);
+            }
+        }
+    "#;
+
+    #[test]
+    fn preset_destination_mover_is_info() {
+        let fs = run(PRESET_DEST_MOVER);
+        let c = central(&fs);
+        assert!(!c.is_empty(), "a preset-destination fund mover should still be reported");
+        assert!(
+            c.iter().all(|f| f.severity == Severity::Info),
+            "a fund move only to a fixed/preset destination must be Info, not Low+: {:?}",
+            c
+        );
+        assert!(
+            c.iter().all(|f| !f.title.contains("move/re-route user funds")),
+            "preset-destination mover must not carry the strong rug title: {:?}",
+            c
+        );
+    }
+
+    // An admin sweep to `msg.sender` (the caller's own funds) via the *member*
+    // form `token.safeTransfer(msg.sender, bal)` must be suppressed. This is the
+    // Olympus `CrossChainMigrator.replenish/clear` shape — the old fixed-arg
+    // logic read arg1 as the recipient and leaked it as a "rug"; recipient =
+    // second-to-last arg fixes it.
+    const SWEEP_TO_SELF_MEMBER_FORM: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IERC20 {
+            function safeTransfer(address to, uint256 a) external;
+            function balanceOf(address who) external view returns (uint256);
+        }
+        contract Migrator {
+            address public owner;
+            IERC20 public wsOHM;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            function replenish() external onlyOwner {
+                wsOHM.safeTransfer(msg.sender, wsOHM.balanceOf(address(this)));
+            }
+        }
+    "#;
+
+    #[test]
+    fn sweep_to_self_member_form_is_silent() {
+        let fs = run(SWEEP_TO_SELF_MEMBER_FORM);
+        let c = central(&fs);
+        assert!(
+            c.is_empty(),
+            "admin sweep to msg.sender (member-form safeTransfer) is caller-own, must be silent: {:?}",
+            c
+        );
+    }
+
+    // An *unbounded* routing-shaped setter that moves no funds is reported, but
+    // (no fund-sink) only at Info, with the soft title — never Low+.
+    const UNBOUNDED_ROUTING_SETTER: &str = r#"
+        pragma solidity ^0.8.0;
+        contract R {
+            address public owner;
+            address public router;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            // setRouter is routing-shaped but writes no recipient-role address var
+            // here (the var is named `router`, not a treasury/recipient role) and
+            // moves no funds, so it is the soft, fund-less, Info tier.
+            function setRouterFee(uint256 f) external onlyOwner { /* no-op */ }
+        }
+    "#;
+
+    #[test]
+    fn unbounded_routing_setter_is_info_soft() {
+        let fs = run(UNBOUNDED_ROUTING_SETTER);
+        let c = central(&fs);
+        assert!(!c.is_empty(), "unbounded routing setter should still be reported");
+        assert!(
+            c.iter().all(|f| f.severity <= Severity::Info),
+            "a no-fund-move setter must never exceed Info: {:?}",
+            c
+        );
+        assert!(
+            c.iter().any(|f| f.title == "Privileged parameter setter (no timelock)"),
+            "expected the soft setter title for the in-between: {:?}",
             c
         );
     }
