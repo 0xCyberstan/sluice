@@ -116,6 +116,13 @@ pub enum Category {
     ProofAdmissionOnly,
     ExternalRootCallerTimestamp,
     ZeroMarginTimingWindow,
+    // ---- Round 12: synthetic-dollar / RFQ-mint / ERC4626-staking classes (Ethena; map to real findings) ----
+    EscrowExitRestrictionGap,
+    VestingBufferedDonation,
+    OneSidedPegBand,
+    Eip712TypehashMismatch,
+    DelegatedSignerSingleStep,
+    PreAuthCalloutTarget,
     Other,
 }
 
@@ -204,6 +211,12 @@ impl Category {
             ProofAdmissionOnly => "proof-admission-only",
             ExternalRootCallerTimestamp => "external-root-caller-timestamp",
             ZeroMarginTimingWindow => "zero-margin-timing-window",
+            EscrowExitRestrictionGap => "escrow-exit-restriction-gap",
+            VestingBufferedDonation => "vesting-buffered-donation",
+            OneSidedPegBand => "one-sided-peg-band",
+            Eip712TypehashMismatch => "eip712-typehash-mismatch",
+            DelegatedSignerSingleStep => "delegated-signer-single-step",
+            PreAuthCalloutTarget => "preauth-callout-target",
             Other => "other",
         }
     }
@@ -274,6 +287,12 @@ impl Category {
             ProofAdmissionOnly => &["CWE-345", "CWE-863"],
             ExternalRootCallerTimestamp => &["CWE-345", "CWE-672"],
             ZeroMarginTimingWindow => &["CWE-362", "CWE-367"],
+            EscrowExitRestrictionGap => &["CWE-284", "CWE-863"],
+            VestingBufferedDonation => &["CWE-682", "CWE-1339"],
+            OneSidedPegBand => &["CWE-682", "CWE-840"],
+            Eip712TypehashMismatch => &["CWE-347"],
+            DelegatedSignerSingleStep => &["CWE-284"],
+            PreAuthCalloutTarget => &["CWE-863", "CWE-345"],
             _ => &[],
         }
     }
