@@ -54,7 +54,28 @@
 //!     (`timelock` / `delay` / `eta` / `minDelay`, a `Timelock`/`Governor` base,
 //!     or a `queue`→`execute` two-step) is silenced — the exit window exists.
 //!   * A fund move that is **provably the caller's own** (every value-moving call
-//!     pins its destination/source to `msg.sender`) is not a rug and is silenced.
+//!     pins its destination/source to `msg.sender` — including a self-supply op
+//!     `_burn(msg.sender, x)` / `_mint(_msgSender(), x)`) is not a rug, silenced.
+//!   * **Protocol-internal plumbing** — when the access guard proves the *only*
+//!     caller is a **fixed protocol contract** (an inline / modifier
+//!     `require(msg.sender == X)` where `X` is `immutable` / `constant` / a
+//!     contract-interface-typed state var, or an `address` whose name denotes a
+//!     wired callee — `*Manager` / `*Bridge` / `staking` / `minter` / a
+//!     `Predeploys.<MESSENGER>`-style constant), and there is **no** discretionary
+//!     `onlyOwner` / `onlyRole` / `owner`/`admin`/governance path — a mint / burn
+//!     / transfer in the body is the protocol's own machinery, not a discretionary
+//!     admin who can rug (e.g. `StakingDistributor.distribute` minting to the
+//!     immutable `staking`, an `OptimismMintableERC20.mint` callable only by
+//!     `BRIDGE`). It is suppressed. The guard is resolved through inherited
+//!     modifiers and one level of internal-helper indirection
+//!     (`modifier onlyVault { _onlyVault(); _; }`). **Exception:** a body that
+//!     *re-points* a withdrawal/treasury/recipient **address** state var is a
+//!     genuine fund-routing change regardless of caller (an ownership-accept
+//!     two-step such as `pullVault` reassigning `vault`), so it still fires.
+//!   * A mint / burn whose recipient is a **fixed protocol destination**
+//!     (`msg.sender`, `address(this)`, or a `constant`/`immutable` var) is not an
+//!     attacker-steerable supply move (mint-to-protocol/self is not a user-fund
+//!     flow), so it does not by itself earn the Low tier.
 //!   * Ordinary user operations (`deposit`/`stake`/`claim`/…) are not flagged —
 //!     unless they are a *targeted* admin transfer to a caller-chosen address
 //!     (`withdrawTo(address to, ...)`), which is the rug shape.
@@ -146,6 +167,13 @@ impl Detector for CentralizationDetector {
                         // Admin can only pull funds to itself — not a rug of users.
                         continue;
                     }
+                    // Protocol-internal rescue: callable only by a fixed protocol
+                    // contract (not a discretionary admin), so even a caller-chosen
+                    // destination is chosen by that wired contract, not an admin
+                    // who can rug — suppress (mirrors the fund-flow arm below).
+                    if guard_pins_to_fixed_protocol_contract(cx, f, contract) {
+                        continue;
+                    }
                     if has_caller_chosen_value_move(f) {
                         // Destination is a caller/admin-supplied parameter: this is
                         // the classic `rescue(token, to, amt)` rug vector.
@@ -198,7 +226,10 @@ impl Detector for CentralizationDetector {
             if has_fund_flow(f, contract) {
                 // Suppress when every value-moving call is provably the caller's
                 // own funds (destination / source pinned to `msg.sender`): an admin
-                // that can only move funds *to itself* is not rugging users.
+                // that can only move funds *to itself* is not rugging users. This
+                // also covers a supply op on the caller's own balance
+                // (`_burn(msg.sender, x)` in a `cooldown`/`unstake`), which is a
+                // user operation, not an admin fund-move.
                 if all_value_moves_are_caller_own(f) {
                     continue;
                 }
@@ -215,16 +246,38 @@ impl Detector for CentralizationDetector {
                     ));
                     continue;
                 }
+                // Protocol-internal plumbing: the access guard pins `msg.sender` to
+                // a **fixed protocol contract** (an inline / modifier
+                // `require(msg.sender == <immutable | constant | contract-typed |
+                // *Manager/*Bridge/staking-style> var)`), and there is no
+                // discretionary-admin (`onlyOwner` / `onlyRole` / `owner` / `admin`
+                // / governance) path. The *only* caller is that one wired contract,
+                // so a mint/burn or transfer here is the protocol's own machinery
+                // (e.g. `StakingDistributor.distribute` minting to `staking`, an
+                // `OptimismMintableERC20.mint` callable only by `BRIDGE`), not a
+                // discretionary admin who can rug users — suppress.
+                //
+                // Exception: a body that **re-points** a withdrawal/treasury/
+                // recipient *address* state var is a genuine fund-routing change
+                // regardless of who triggers it (an ownership-accept two-step such
+                // as `OlympusAuthority.pullVault` reassigns `vault`), so it still
+                // falls through to the steerable tier below.
+                if guard_pins_to_fixed_protocol_contract(cx, f, contract)
+                    && !reassigns_recipient_address(f, contract)
+                {
+                    continue;
+                }
                 // Steerable fund-flow → Low, strong title. "Steerable" means the
                 // admin can direct value somewhere an attacker would care about:
                 //   * the destination is **caller-chosen** (a parameter), the
                 //     classic `withdrawTo(to, …)` / arbitrary-recipient rug; or
-                //   * the body **mints / burns** supply (creates or destroys
-                //     balances out of thin air); or
+                //   * the body **mints / burns** supply to a destination that is
+                //     not the caller's own / a fixed protocol contract (creates or
+                //     destroys balances at an attacker-relevant address); or
                 //   * it re-points a withdrawal/treasury/recipient **address**
                 //     state var (re-routes where future funds go).
                 if has_caller_chosen_value_move(f)
-                    || has_mint_or_burn(f)
+                    || mint_or_burn_is_steerable(f, contract)
                     || reassigns_recipient_address(f, contract)
                 {
                     out.push(self.finding(
@@ -470,31 +523,68 @@ fn has_fund_flow(f: &Function, contract: &Contract) -> bool {
     found
 }
 
-/// True if the body contains a `mint`/`burn` call — a supply move that creates or
-/// destroys balances out of thin air (not a transfer of existing held funds).
-/// This is one of the "steerable" effects that keeps a fund-flow at Low rather
-/// than down-ranking it to the preset-destination Info tier.
-fn has_mint_or_burn(f: &Function) -> bool {
-    let mut found = false;
+/// True if the body contains a `mint`/`burn` call whose account is **steerable** —
+/// i.e. a supply move that creates or destroys balances at a destination an
+/// attacker would care about, rather than along a hard-wired protocol path. A
+/// supply op is *not* steerable when its account (the first argument) is a fixed
+/// protocol destination: `msg.sender` (the caller's own balance), `address(this)`
+/// / `this` (self), or a `constant`/`immutable` state variable (a hard-wired
+/// protocol address that can never be repointed). This implements the
+/// "mint-to-protocol/self is not a user-fund-flow" reclassification — e.g.
+/// `treasury.mint(staking, …)` where `staking` is immutable is protocol issuance
+/// along a fixed path, not an admin minting to an arbitrary recipient.
+fn mint_or_burn_is_steerable(f: &Function, contract: &Contract) -> bool {
+    let mut steerable = false;
     for s in &f.body {
         s.visit_exprs(&mut |e| {
-            if found {
+            if steerable {
                 return;
             }
-            if let ExprKind::Call(call) = &e.kind {
-                if matches!(
-                    call.func_name.as_deref(),
-                    Some("mint") | Some("_mint") | Some("burn") | Some("_burn") | Some("burnFrom")
-                ) {
-                    found = true;
-                }
+            let ExprKind::Call(call) = &e.kind else { return };
+            if !matches!(
+                call.func_name.as_deref(),
+                Some("mint") | Some("_mint") | Some("burn") | Some("_burn") | Some("burnFrom")
+            ) {
+                return;
+            }
+            // Account = first argument (`(account, amount)`). Absent ⇒ can't prove
+            // a fixed destination, so treat as steerable (conservative: keep firing).
+            let Some(account) = call.args.first() else {
+                steerable = true;
+                return;
+            };
+            if !dest_is_fixed_protocol(account, contract) {
+                steerable = true;
             }
         });
-        if found {
+        if steerable {
             break;
         }
     }
-    found
+    steerable
+}
+
+/// Is `dest` a **fixed protocol destination** for a fund move — one that an admin
+/// cannot steer to an attacker-relevant address? True for `msg.sender` (caller's
+/// own), `address(this)` / `this` (self), or a `constant`/`immutable` state
+/// variable of `contract` (a hard-wired address). Casts are peeled first.
+fn dest_is_fixed_protocol(dest: &Expr, contract: &Contract) -> bool {
+    let d = unwrap_casts(dest);
+    if mentions_msg_sender(d) || is_this(d) {
+        return true;
+    }
+    if let Some(name) = ident_name(d) {
+        return contract
+            .state_vars
+            .iter()
+            .any(|v| v.name == name && (v.constant || v.immutable));
+    }
+    false
+}
+
+/// `this` / `address(this)` (after cast-stripping).
+fn is_this(e: &Expr) -> bool {
+    matches!(&unwrap_casts(e).kind, ExprKind::Ident(n) if n == "this")
 }
 
 /// True if the function writes a state variable that is an **address** typed
@@ -540,6 +630,454 @@ fn is_recipient_role_address(contract: &Contract, var_name: &str) -> bool {
     ROLES.iter().any(|r| n.contains(r))
 }
 
+// -------------------------------------------- fixed-protocol-contract guard
+
+/// What a `msg.sender == X` access guard pins the caller to.
+#[derive(Clone, Copy, PartialEq)]
+enum GuardTarget {
+    /// A **fixed protocol contract**: a `constant`/`immutable` address, a
+    /// contract/interface-typed state var, or an `address`-typed state var whose
+    /// name denotes a wired callee (`*Manager`, `*Bridge`, `staking`, `minter`,
+    /// …). The *only* caller is that one wired contract.
+    FixedContract,
+    /// A **discretionary admin / role holder**: `owner` / `admin` / `governor` /
+    /// `governance` / `guardian` / `authority`, or a role-based check
+    /// (`onlyRole` / `hasRole`). A human key can call.
+    DiscretionaryAdmin,
+    /// Could not classify (an unrecognized var, a `mapping`/whitelist check, a
+    /// complex condition). Neither suppresses nor blocks suppression.
+    Other,
+}
+
+/// True if `f`'s access control proves the **only** caller is a fixed protocol
+/// contract: there is at least one `msg.sender == <fixed-contract var>` guard
+/// (inline or via a modifier) AND no discretionary-admin / role guard. Such a
+/// function is protocol-internal plumbing (only that one wired contract can call
+/// it), not a discretionary admin who can rug users.
+///
+/// Resolves both guard shapes:
+///   * **inline** — a leading `require(msg.sender == X)` / `if (msg.sender != X)
+///     revert` in the body; and
+///   * **modifier** — a `MsgSenderCheck`-classified modifier (`onlyStakingManager`,
+///     `onlyVault`, …) whose body, resolved within the same contract, contains the
+///     `require(msg.sender == X)`.
+fn guard_pins_to_fixed_protocol_contract(
+    cx: &AnalysisContext,
+    f: &Function,
+    contract: &Contract,
+) -> bool {
+    let mut saw_fixed = false;
+    let mut classify = |t: GuardTarget| -> bool {
+        // Returns true to short-circuit (a blocker was seen).
+        match t {
+            GuardTarget::DiscretionaryAdmin => true,
+            GuardTarget::FixedContract => {
+                saw_fixed = true;
+                false
+            }
+            GuardTarget::Other => false,
+        }
+    };
+
+    // Inline guards in the function body: `require(msg.sender == X)` /
+    // `if (msg.sender != X) revert`.
+    for cond in inline_sender_guard_conds(f) {
+        if classify(classify_sender_guard(&cond, contract)) {
+            return false;
+        }
+    }
+
+    // Modifier guards: resolve each access-control modifier's body (same contract)
+    // and read its `require(msg.sender == X)`. A modifier we cannot resolve to a
+    // body but whose *name* is unmistakably a discretionary admin/role guard
+    // (`onlyOwner`, `onlyRole`, …) is a blocker; otherwise it is `Other`.
+    for m in &f.modifiers {
+        if !modifier_is_access_control(&m.name) {
+            continue;
+        }
+        match resolve_modifier_guard_target(cx, f, contract, &m.name) {
+            Some(t) => {
+                if classify(t) {
+                    return false;
+                }
+            }
+            None => {
+                if modifier_name_is_discretionary(&m.name) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    saw_fixed
+}
+
+/// The conditions of inline `msg.sender`-comparing guards in a function body:
+/// `require(msg.sender == X)` / `require(msg.sender != X)` and
+/// `if (msg.sender (==|!=) X) revert/return`. Only leading guards matter for
+/// access control, but scanning the whole body is harmless (a non-leading
+/// `msg.sender ==` check is rare and still informative).
+fn inline_sender_guard_conds(f: &Function) -> Vec<Expr> {
+    let mut conds = Vec::new();
+    for s in &f.body {
+        s.visit(&mut |st| match &st.kind {
+            sluice_ir::StmtKind::Expr(e) => {
+                if let ExprKind::Call(c) = &e.kind {
+                    if matches!(
+                        c.kind,
+                        CallKind::Builtin(sluice_ir::Builtin::Require)
+                            | CallKind::Builtin(sluice_ir::Builtin::Assert)
+                    ) {
+                        if let Some(arg) = c.args.first() {
+                            if expr_mentions_msg_sender(arg) {
+                                conds.push(arg.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            sluice_ir::StmtKind::If { cond, .. } if expr_mentions_msg_sender(cond) => {
+                conds.push(cond.clone());
+            }
+            _ => {}
+        });
+    }
+    conds
+}
+
+/// Classify a `msg.sender`-comparing guard condition by the variable it pins the
+/// caller to. Finds an equality/inequality `msg.sender (==|!=) X` inside `cond`
+/// and classifies `X`. A role check (`hasRole(...)` / `onlyRole`) anywhere in the
+/// condition is a discretionary-admin guard.
+fn classify_sender_guard(cond: &Expr, contract: &Contract) -> GuardTarget {
+    // A role lookup anywhere in the condition ⇒ discretionary (role-gated).
+    let mut role_based = false;
+    cond.visit(&mut |e| {
+        if let ExprKind::Call(c) = &e.kind {
+            if let Some(n) = call_callee_name(c) {
+                let l = n.to_ascii_lowercase();
+                if l.contains("hasrole") || l == "checkrole" || l == "_checkrole" {
+                    role_based = true;
+                }
+            }
+        }
+    });
+    if role_based {
+        return GuardTarget::DiscretionaryAdmin;
+    }
+    match sender_eq_target_name(cond) {
+        Some(name) => classify_guard_target_name(&name, contract),
+        None => GuardTarget::Other,
+    }
+}
+
+/// Find the identifier compared for (in)equality against `msg.sender` in `cond`.
+/// Handles either operand order and peels `address(...)` / `payable(...)` casts:
+/// `msg.sender == staking` / `staking != msg.sender` / `msg.sender == owner()`.
+fn sender_eq_target_name(cond: &Expr) -> Option<String> {
+    let mut found: Option<String> = None;
+    cond.visit(&mut |e| {
+        if found.is_some() {
+            return;
+        }
+        if let ExprKind::Binary { op, lhs, rhs } = &e.kind {
+            if !matches!(op, sluice_ir::BinOp::Eq | sluice_ir::BinOp::Ne) {
+                return;
+            }
+            let l = unwrap_casts(lhs);
+            let r = unwrap_casts(rhs);
+            let (other, sender_side) = if mentions_msg_sender(l) {
+                (r, true)
+            } else if mentions_msg_sender(r) {
+                (l, true)
+            } else {
+                (r, false)
+            };
+            if !sender_side {
+                return;
+            }
+            // The other side is the pinned target. Resolve it to a name across the
+            // shapes a guard target takes:
+            //   * a bare identifier (`staking`);
+            //   * a getter call (`owner()` / `authority.governor()`);
+            //   * a member access (a predeploy / library constant
+            //     `Predeploys.L2_TO_L2_CROSS_DOMAIN_MESSENGER`), classified by the
+            //     trailing member name.
+            if let Some(n) = ident_name(other) {
+                found = Some(n.to_string());
+            } else if let ExprKind::Call(c) = &other.kind {
+                if let Some(n) = call_callee_name(c) {
+                    found = Some(n.to_string());
+                }
+            } else if let ExprKind::Member { member, .. } = &other.kind {
+                found = Some(member.to_string());
+            }
+        }
+    });
+    found
+}
+
+/// Classify a guard-target *name* (a state var, or a getter like `owner`) as a
+/// fixed protocol contract vs a discretionary admin.
+fn classify_guard_target_name(name: &str, contract: &Contract) -> GuardTarget {
+    let l = name.to_ascii_lowercase();
+    // Discretionary admin / human role holders — these are real admin levers, keep
+    // firing. Checked first so an `owner`/`governor`-named var never counts fixed.
+    if is_discretionary_admin_name(&l) {
+        return GuardTarget::DiscretionaryAdmin;
+    }
+    // A `constant`/`immutable` or contract/interface-typed state var is, by its
+    // declaration, a hard-wired protocol address — a fixed callee.
+    if let Some(sv) = contract.state_vars.iter().find(|v| v.name == name) {
+        if sv.constant || sv.immutable {
+            return GuardTarget::FixedContract;
+        }
+        let ty = sv.ty.trim();
+        if is_contract_typed(ty) {
+            return GuardTarget::FixedContract;
+        }
+        // A settable `address` whose *name* denotes a wired callee contract.
+        if ty.starts_with("address") && is_fixed_contract_name(&l) {
+            return GuardTarget::FixedContract;
+        }
+        return GuardTarget::Other;
+    }
+    // Not a known state var (e.g. an inherited getter): fall back to the name.
+    if is_fixed_contract_name(&l) {
+        GuardTarget::FixedContract
+    } else {
+        GuardTarget::Other
+    }
+}
+
+/// A textual type that is a contract/interface reference (not a Solidity value
+/// type / mapping / array). Used to recognize `IStaking staking` as a fixed
+/// protocol-contract reference.
+fn is_contract_typed(ty: &str) -> bool {
+    let t = ty.trim();
+    // Strip a trailing storage location / array / payable marker for the prefix
+    // test (we only need the leading type word).
+    const VALUE_PREFIXES: &[&str] = &[
+        "address", "uint", "int", "bool", "bytes", "string", "mapping", "enum", "fixed", "ufixed",
+    ];
+    if VALUE_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        return false;
+    }
+    // Arrays / tuples are not a single contract handle.
+    if t.contains('[') || t.starts_with('(') {
+        return false;
+    }
+    // A leading identifier char ⇒ a named (contract/interface/struct) type. We
+    // accept struct-typed too (rare as a guard target); the surrounding guard
+    // shape `msg.sender == X` makes a non-address X implausible unless it is a
+    // contract handle.
+    t.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
+/// Discretionary-admin / human-role variable names — a guard pinning to one of
+/// these is a genuine admin lever, never suppressed.
+fn is_discretionary_admin_name(l: &str) -> bool {
+    const ADMIN: &[&str] = &[
+        "owner",
+        "admin",
+        "governor",
+        "governance",
+        "guardian",
+        "authority",
+        "dao",
+        "multisig",
+        "council",
+        "committee",
+        "timelock",
+        "sudo",
+        "deployer",
+        "team",
+    ];
+    ADMIN.iter().any(|a| l.contains(a))
+}
+
+/// `address`-typed variable names that denote a **wired protocol callee contract**
+/// (not a human admin). A guard pinning to one of these means "only this specific
+/// protocol contract may call" — protocol plumbing.
+fn is_fixed_contract_name(l: &str) -> bool {
+    // The `*Address` / `*Contract` suffix convention (`stakingManagerAddress`,
+    // `mintingContract`) is a strong contract signal on its own.
+    if l.ends_with("address") || l.ends_with("contract") {
+        return true;
+    }
+    const CONTRACT_ROLES: &[&str] = &[
+        "staking",
+        "minter",
+        "bridge",
+        "manager",
+        "controller",
+        "hub",
+        "endpoint",
+        "gateway",
+        "router",
+        "distributor",
+        "module",
+        "factory",
+        "pool",
+        "vault",
+        "escrow",
+        "relayer",
+        "messenger",
+        "portal",
+        "inbox",
+        "outbox",
+        "silo",
+        "migrator",
+        "allocator",
+        "approved", // the "approved" minter role (`onlyApproved` mint/burn gate)
+    ];
+    if CONTRACT_ROLES.iter().any(|r| l.contains(r)) {
+        return true;
+    }
+    // Short, ambiguous tokens matched only as a whole word (an exact name, or a
+    // `_`/case-delimited segment) to avoid spurious substring hits (`yt` must not
+    // match `payToken`/`cryptoVault`). `yt` = a Pendle YieldToken handle (`onlyYT`).
+    const EXACT: &[&str] = &["yt"];
+    EXACT.iter().any(|t| l == *t || l == format!("_{t}"))
+}
+
+/// Does a modifier name classify as a `msg.sender` access-control guard? Mirrors
+/// `sluice_parse::classify_modifier`'s `MsgSenderCheck` arm so we only inspect the
+/// modifiers that actually gate the caller.
+fn modifier_is_access_control(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.contains("only")
+        || l.contains("auth")
+        || l.contains("owner")
+        || l.contains("admin")
+        || l.contains("role")
+        || l.contains("governance")
+        || l.contains("guardian")
+        || l.contains("restricted")
+}
+
+/// A modifier name that is *unmistakably* a discretionary admin/role guard, used
+/// only as a fallback when the modifier body cannot be resolved (e.g. inherited
+/// from an out-of-scope base such as OpenZeppelin `Ownable`/`AccessControl`).
+fn modifier_name_is_discretionary(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.contains("owner")
+        || l.contains("admin")
+        || l.contains("role")
+        || l.contains("governance")
+        || l.contains("governor")
+        || l.contains("guardian")
+        || l.contains("authority")
+}
+
+/// Resolve a modifier (by name) to the guard target it pins `msg.sender` to.
+/// Returns `None` if no definition of that modifier has a resolvable
+/// `msg.sender ==` check.
+///
+/// Robust to the realities of a multi-file corpus:
+///   * the modifier is commonly **inherited** from a base (Olympus
+///     `OlympusAccessControlled.onlyVault` is `require(msg.sender ==
+///     authority.vault())`, not in the token that applies it) — so all
+///     definitions of the name are considered, not just the same-contract one;
+///   * a definition may be **indirect** (`OlympusAccessControlledV2.onlyVault` is
+///     `{ _onlyVault(); _; }`) — so an internal helper the modifier body calls is
+///     resolved one level deep for its guard;
+///   * several same-named definitions may coexist (V1 / V2 / `VaultOwned`) — the
+///     results are combined conservatively: a discretionary-admin reading
+///     anywhere wins (keep firing), else a fixed-contract reading suffices.
+fn resolve_modifier_guard_target(
+    cx: &AnalysisContext,
+    f: &Function,
+    contract: &Contract,
+    mod_name: &str,
+) -> Option<GuardTarget> {
+    let mut saw_fixed = false;
+    // All modifier definitions of this name, same contract first (irrelevant to
+    // correctness since we combine, but keeps the common case cheap).
+    let defs = cx
+        .scir
+        .functions_of(f.contract)
+        .filter(|g| g.is_modifier() && g.name == mod_name)
+        .chain(
+            cx.scir
+                .all_functions()
+                .filter(|g| g.is_modifier() && g.name == mod_name && g.contract != f.contract),
+        );
+    for m in defs {
+        match guard_target_in_body(cx, f, contract, m, 1) {
+            Some(GuardTarget::DiscretionaryAdmin) => return Some(GuardTarget::DiscretionaryAdmin),
+            Some(GuardTarget::FixedContract) => saw_fixed = true,
+            _ => {}
+        }
+    }
+    saw_fixed.then_some(GuardTarget::FixedContract)
+}
+
+/// The guard target pinned by a function/modifier body: its inline
+/// `require(msg.sender == X)` / `if (msg.sender != X) revert`, descending up to
+/// `depth` levels into internal helper functions it calls (to follow the
+/// `modifier onlyVault { _onlyVault(); _; }` → `function _onlyVault()` indirection).
+fn guard_target_in_body(
+    cx: &AnalysisContext,
+    f: &Function,
+    contract: &Contract,
+    body_fn: &Function,
+    depth: u32,
+) -> Option<GuardTarget> {
+    for cond in inline_sender_guard_conds(body_fn) {
+        let t = classify_sender_guard(&cond, contract);
+        if t != GuardTarget::Other {
+            return Some(t);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    // Descend into internal helper functions the body calls (e.g. `_onlyVault()`).
+    let mut result: Option<GuardTarget> = None;
+    for callee_name in &body_fn.effects.internal_calls {
+        let Some(helper) = cx
+            .scir
+            .functions_of(f.contract)
+            .find(|g| &g.name == callee_name && !g.is_modifier())
+            .or_else(|| {
+                cx.scir
+                    .all_functions()
+                    .find(|g| &g.name == callee_name && !g.is_modifier())
+            })
+        else {
+            continue;
+        };
+        match guard_target_in_body(cx, f, contract, helper, depth - 1) {
+            Some(GuardTarget::DiscretionaryAdmin) => return Some(GuardTarget::DiscretionaryAdmin),
+            Some(GuardTarget::FixedContract) => result = Some(GuardTarget::FixedContract),
+            _ => {}
+        }
+    }
+    result
+}
+
+/// Best-effort callee name of a call (`owner` from `owner()`, `governor` from
+/// `authority.governor()`, `hasRole` from `hasRole(...)`).
+fn call_callee_name(c: &sluice_ir::Call) -> Option<&str> {
+    if let Some(n) = c.func_name.as_deref() {
+        return Some(n);
+    }
+    c.callee.simple_name()
+}
+
+/// True if the expression mentions `msg.sender` anywhere (deep), peeling casts at
+/// the root. Used to pre-filter guard conditions.
+fn expr_mentions_msg_sender(e: &Expr) -> bool {
+    let mut found = false;
+    e.visit(&mut |sub| {
+        if sub.mentions_member("msg", "sender") {
+            found = true;
+        }
+    });
+    found
+}
+
 /// True if **every** value-moving call in the body provably routes to / from the
 /// caller (`msg.sender`). Such a function lets the admin move funds only to
 /// itself, which is not a rug of *user* funds, so it is suppressed.
@@ -562,9 +1100,27 @@ fn all_value_moves_are_caller_own(f: &Function) -> bool {
                 let to_caller = call
                     .receiver
                     .as_deref()
-                    .map(|r| mentions_msg_sender(r))
+                    .map(mentions_msg_sender)
                     .unwrap_or(false);
                 if !to_caller {
+                    all_caller = false;
+                }
+                return;
+            }
+
+            // Supply ops on the caller's **own** balance: `_burn(msg.sender, x)` /
+            // `_mint(msg.sender, x)` / `burn(msg.sender, x)` / `burnFrom(msg.sender,
+            // x)`. The account is the **first** argument (`(account, amount)`). This
+            // is a user operation (e.g. a `cooldown`/`unstake` burning the caller's
+            // own stake), not an admin minting/burning *someone else's* balance.
+            if matches!(
+                call.func_name.as_deref(),
+                Some("mint") | Some("_mint") | Some("burn") | Some("_burn") | Some("burnFrom")
+            ) {
+                saw_move = true;
+                // Account = first arg; be robust to a `token.burn(account, amt)`
+                // member form too (account still leads the arg list).
+                if !arg_is_msg_sender(&call.args, 0) {
                     all_caller = false;
                 }
                 return;
@@ -629,7 +1185,7 @@ fn has_caller_chosen_value_move(f: &Function) -> bool {
             let ExprKind::Call(call) = &e.kind else { return };
             if let Some(dest) = value_move_dest(call) {
                 if let Some(name) = ident_name(unwrap_casts(dest)) {
-                    if params.iter().any(|&p| p == name) {
+                    if params.contains(&name) {
                         found = true;
                     }
                 }
@@ -776,10 +1332,23 @@ fn arg_is_msg_sender(args: &[Expr], idx: usize) -> bool {
     args.get(idx).map(|a| mentions_msg_sender(unwrap_casts(a))).unwrap_or(false)
 }
 
-/// `msg.sender` (best-effort, after cast-stripping).
+/// `msg.sender` (best-effort, after cast-stripping). Also accepts the OZ /
+/// ERC-2771 accessor `_msgSender()` / `msgSender()` (a zero-arg call resolving to
+/// the caller), so a `_mint(_msgSender(), x)` self-mint is recognized as
+/// caller-own just like `_mint(msg.sender, x)`.
 fn mentions_msg_sender(e: &Expr) -> bool {
     let e = unwrap_casts(e);
-    e.mentions_member("msg", "sender")
+    if e.mentions_member("msg", "sender") {
+        return true;
+    }
+    if let ExprKind::Call(c) = &e.kind {
+        if c.args.is_empty() {
+            if let Some(n) = c.func_name.as_deref().or_else(|| c.callee.simple_name()) {
+                return n == "_msgSender" || n == "msgSender";
+            }
+        }
+    }
+    false
 }
 
 /// Peel single-argument type casts (`address(x)`, `payable(x)`, `IERC20(x)`).
@@ -1338,4 +1907,245 @@ mod tests {
             c
         );
     }
+
+    // ===== R18 fixed-protocol-contract-guard regressions ==================
+
+    /// Helper: is the centralization detector entirely silent on `src`?
+    fn silent(src: &str) -> bool {
+        central(&run(src)).is_empty()
+    }
+
+    // (1) The exact task shape: `StakingDistributor.distribute` guarded by an
+    // inline `if (msg.sender != staking) revert` where `staking` is an
+    // `immutable` address, minting to that same fixed `staking` contract. The
+    // only caller is a fixed protocol contract (not a discretionary admin), so
+    // this is protocol-internal issuance — it must now be Info/suppressed (here:
+    // suppressed), never the Low "admin-can-rug" claim.
+    const DISTRIBUTE_STAKING_GUARD: &str = r#"
+        pragma solidity ^0.8.0;
+        interface ITreasury { function mint(address to, uint256 a) external; }
+        contract StakingDistributor {
+            ITreasury private immutable treasury;
+            address private immutable staking;
+            uint256 public rate;
+            error Only_Staking();
+            constructor(address _t, address _s) { treasury = ITreasury(_t); staking = _s; }
+            function distribute() external {
+                if (msg.sender != staking) revert Only_Staking();
+                treasury.mint(staking, nextReward());
+            }
+            function nextReward() internal view returns (uint256) { return rate; }
+        }
+    "#;
+
+    #[test]
+    fn distribute_guarded_by_immutable_staking_is_suppressed() {
+        let fs = run(DISTRIBUTE_STAKING_GUARD);
+        let c = central(&fs);
+        // Must NOT carry the strong rug title (the headline regression).
+        assert!(
+            c.iter().all(|f| !f.title.contains("move/re-route user funds")),
+            "msg.sender==staking-guarded distribute must not be a strong rug: {:?}",
+            c
+        );
+        // And in no case above Info — here it is suppressed entirely.
+        assert!(
+            c.iter().all(|f| f.severity <= Severity::Info),
+            "distribute() (fixed-contract gated) must never exceed Info: {:?}",
+            c
+        );
+        assert!(
+            c.is_empty(),
+            "distribute() gated by a fixed protocol contract should be silent: {:?}",
+            c
+        );
+    }
+
+    // (2) A token `mint(_to, amt)` whose ONLY caller is a fixed protocol contract
+    // — the guard is a modifier resolving to `require(msg.sender == bridge)` where
+    // `bridge` is `immutable`. Protocol plumbing (only the bridge can mint), not a
+    // discretionary admin → suppressed. (`OptimismMintableERC20`-shape.)
+    const MINT_GATED_BY_IMMUTABLE_BRIDGE: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Token {
+            address public immutable BRIDGE;
+            constructor(address _b) { BRIDGE = _b; }
+            modifier onlyBridge() { require(msg.sender == BRIDGE, "only bridge"); _; }
+            function _mint(address to, uint256 a) internal {}
+            function _burn(address from, uint256 a) internal {}
+            function mint(address _to, uint256 _a) external onlyBridge { _mint(_to, _a); }
+            function burn(address _from, uint256 _a) external onlyBridge { _burn(_from, _a); }
+        }
+    "#;
+
+    #[test]
+    fn mint_gated_by_immutable_contract_is_suppressed() {
+        assert!(
+            silent(MINT_GATED_BY_IMMUTABLE_BRIDGE),
+            "mint/burn callable only by an immutable bridge must be suppressed: {:?}",
+            central(&run(MINT_GATED_BY_IMMUTABLE_BRIDGE))
+        );
+    }
+
+    // (3) A mint gated by a *contract-typed* state var (`IManager manager`), via a
+    // modifier — the Olympus/etherfi `onlyXManager` shape. Suppressed.
+    const MINT_GATED_BY_CONTRACT_TYPED: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IManager {}
+        contract NFT {
+            IManager manager;
+            modifier onlyManager() { require(msg.sender == address(manager), "only mgr"); _; }
+            function _mint(address to, uint256 a) internal {}
+            function mint(address _to, uint256 _a) external onlyManager { _mint(_to, _a); }
+        }
+    "#;
+
+    #[test]
+    fn mint_gated_by_contract_typed_var_is_suppressed() {
+        assert!(
+            silent(MINT_GATED_BY_CONTRACT_TYPED),
+            "mint callable only by a contract-typed manager must be suppressed: {:?}",
+            central(&run(MINT_GATED_BY_CONTRACT_TYPED))
+        );
+    }
+
+    // (4) Over-suppression guard: an `onlyOwner mint(to, amt)` — a *discretionary*
+    // admin who can mint supply to ANY address — MUST still fire Low with the
+    // strong title. The fixed-contract suppression must not touch admin levers.
+    const OWNER_MINT_TO_ANYONE: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Token {
+            address public owner;
+            modifier onlyOwner() { require(msg.sender == owner, "no"); _; }
+            function _mint(address to, uint256 a) internal {}
+            function mint(address to, uint256 a) external onlyOwner { _mint(to, a); }
+        }
+    "#;
+
+    #[test]
+    fn owner_mint_to_anyone_still_fires_strong() {
+        let fs = run(OWNER_MINT_TO_ANYONE);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.severity >= Severity::Low
+                && f.title.contains("move/re-route user funds")),
+            "onlyOwner mint(to, amt) must remain a Low+ strong finding: {:?}",
+            c
+        );
+    }
+
+    // (5) Over-suppression guard: a `role`-gated mint (`onlyRole(MINTER_ROLE)`) is
+    // a discretionary role lever, not fixed-contract plumbing — it must still fire
+    // (the Ethena `EthenaMinting`-shape). The modifier name carries `role`.
+    const ROLE_GATED_MINT: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Minting {
+            mapping(bytes32 => mapping(address => bool)) roles;
+            bytes32 constant MINTER_ROLE = keccak256("M");
+            modifier onlyRole(bytes32 r) { require(roles[r][msg.sender], "role"); _; }
+            function _mint(address to, uint256 a) internal {}
+            function mint(address to, uint256 a) external onlyRole(MINTER_ROLE) { _mint(to, a); }
+        }
+    "#;
+
+    #[test]
+    fn role_gated_mint_still_fires() {
+        let fs = run(ROLE_GATED_MINT);
+        let c = central(&fs);
+        assert!(
+            !c.is_empty() && c.iter().any(|f| f.severity >= Severity::Low),
+            "onlyRole-gated mint is a discretionary lever and must still fire Low+: {:?}",
+            c
+        );
+    }
+
+    // (6) A supply op on the caller's OWN balance via `_burn(msg.sender, x)` (a
+    // `cooldown`/`unstake`), where the `msg.sender`-referencing `require` makes the
+    // function look access-controlled — must be treated as caller-own and
+    // suppressed (the Pendle `StakedPendle.cooldown`-shape).
+    const COOLDOWN_BURNS_SELF: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Staked {
+            struct CD { uint256 amount; }
+            mapping(address => CD) public userCooldown;
+            function _burn(address from, uint256 a) internal {}
+            function cooldown(uint256 amount) external {
+                require(amount > 0, "amt");
+                require(userCooldown[msg.sender].amount == 0, "in cooldown");
+                userCooldown[msg.sender] = CD({amount: amount});
+                _burn(msg.sender, amount);
+            }
+        }
+    "#;
+
+    #[test]
+    fn cooldown_burning_own_balance_is_suppressed() {
+        assert!(
+            silent(COOLDOWN_BURNS_SELF),
+            "a user cooldown burning its own balance must be suppressed: {:?}",
+            central(&run(COOLDOWN_BURNS_SELF))
+        );
+    }
+
+    // (7) Inherited-modifier indirection: the applying token has only
+    // `function mint(...) onlyVault`; `onlyVault` is defined in a base as
+    // `{ _onlyVault(); _; }` and `_onlyVault()` is `if (msg.sender !=
+    // authority.vault()) revert`. The detector must resolve the base modifier and
+    // its one-level internal helper to see the fixed-contract pin, and suppress.
+    // (Olympus `OlympusAccessControlledV2` shape.)
+    const INHERITED_INDIRECT_VAULT_GUARD: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IAuth { function vault() external view returns (address); }
+        abstract contract AC {
+            IAuth public authority;
+            error UNAUTHORIZED();
+            modifier onlyVault() { _onlyVault(); _; }
+            function _onlyVault() internal view {
+                if (msg.sender != authority.vault()) revert UNAUTHORIZED();
+            }
+        }
+        contract OToken is AC {
+            function _mint(address a, uint256 v) internal {}
+            function mint(address account_, uint256 amount_) external onlyVault {
+                _mint(account_, amount_);
+            }
+        }
+    "#;
+
+    #[test]
+    fn inherited_indirect_fixed_guard_is_suppressed() {
+        assert!(
+            silent(INHERITED_INDIRECT_VAULT_GUARD),
+            "mint gated by an inherited, indirect fixed-contract (vault) guard must be suppressed: {:?}",
+            central(&run(INHERITED_INDIRECT_VAULT_GUARD))
+        );
+    }
+
+    // (8) A treasury/recipient *address re-point* is a genuine fund-routing change
+    // regardless of who triggers it — even a fixed-contract guard must NOT suppress
+    // it (the `OlympusAuthority.pullVault` exception: a `msg.sender == newVault`
+    // two-step that reassigns `vault`).
+    const FIXED_GUARD_BUT_REASSIGNS_VAULT: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Authority {
+            address public vault;
+            address public newVault;
+            function pullVault() external {
+                require(msg.sender == newVault, "!newVault");
+                vault = newVault;
+            }
+        }
+    "#;
+
+    #[test]
+    fn fixed_guard_that_reassigns_recipient_still_fires() {
+        let fs = run(FIXED_GUARD_BUT_REASSIGNS_VAULT);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.title.contains("move/re-route user funds")),
+            "a recipient/treasury re-point must still fire strong even under a fixed-contract guard: {:?}",
+            c
+        );
+    }
 }
+

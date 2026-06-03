@@ -41,32 +41,43 @@
 //! can hand the contract assets and force the exact atomic re-price the vesting
 //! buffer exists to prevent — moving every downstream consumer of `getRate`.
 //!
-//! ## Why it is a finding (and the precision anchors — all required)
+//! ## Why it is a finding (the two REQUIRED structural anchors + one booster)
 //!
-//!   * **The price view** is a `view`/`pure` function whose body contains a
-//!     `balanceOf(address(this)) - G()` **subtraction** where:
+//! The bug is the donation-jumpable share price itself, so the fingerprint is the
+//! `balanceOf(this) - decaying-buffer` subtraction over a drip-gated var. An
+//! external rate publisher makes the blast radius bigger but is **not** required —
+//! the vault's own ERC4626 redemption math (`convertToAssets`/`previewRedeem`)
+//! already reads the jumpable price.
+//!
+//!   * **(required) The price view** is a `view`/`pure` function whose body contains
+//!     a `balanceOf(address(this)) - G()` **subtraction** where:
 //!       - the **minuend** is an external `balanceOf` call whose argument resolves to
 //!         `this` / `address(this)` (the donation-bumpable raw balance), and
 //!       - the **subtrahend** `G` is a **time-decaying vesting term**: an internal
 //!         view that reads `block.timestamp` *and* scales a **settable** state
 //!         variable (`vestingAmount`) by a Mul/Div (the linear-decay arithmetic);
-//!   * **the vesting var is drip-gated** — every function that writes it is either
-//!     access-controlled or an internal helper whose callers are all
+//!   * **(required) the vesting var is drip-gated** — every function that writes it is
+//!     either access-controlled or an internal helper whose callers are all
 //!     access-controlled (mutated only in the privileged reward drip, never by a
 //!     public path). This is the asymmetry that makes a donation bypass the buffer;
-//!   * **an external rate consumer exists** — some function (here in a *separate*
-//!     contract) publishes `… * UNIT / totalSupply()` as a rate, referencing
-//!     `totalAssets`/the priced contract and `totalSupply` in a `Mul`-over-`Div`.
-//!     Without a downstream price publisher the atomic jump has no consumer to harm.
+//!   * **(booster → High) an external rate consumer** — some function (typically in a
+//!     *separate* contract) publishes `… * UNIT / totalSupply()` as a rate,
+//!     referencing `totalAssets`/the priced contract and `totalSupply` in a
+//!     `Mul`-over-`Div`. When such a publisher is in scope the finding is raised from
+//!     Medium to High and the consumer is named; when it is not (e.g. a single-file
+//!     scan of the vault, where the rate provider lives in another file) the core
+//!     donation-jumpable price still fires at Medium.
 //!
 //! ## Suppression
 //!
-//!   * **No external rate publisher** → no consumer is moved by the jump → silent.
 //!   * **Donations are `sync()`-gated** — the contract exposes a `sync`/`skim`-style
 //!     resync, or the price view reads a *stored reserve* rather than the raw
 //!     `balanceOf(this)`. If the minuend is not a raw `balanceOf(this)` the
 //!     structural anchor simply does not match (a synced reserve cannot be bumped by
 //!     a bare transfer), and an explicit `sync`/`skim` resync also suppresses.
+//!   * **The vesting var is publicly bumpable** — if any non-access-controlled public
+//!     path writes the vesting var, the donation asymmetry is gone (anyone can move
+//!     the buffer too), so this is a different design and stays silent.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -121,19 +132,55 @@ impl Detector for VestingBufferedDonationDetector {
                 continue;
             }
 
-            // (3) An external rate consumer must republish a `… * UNIT / totalSupply()`
-            //     price tied to this priced contract. Without it the atomic jump moves
-            //     no downstream consumer.
-            let Some(consumer) = find_rate_consumer(cx, contract, f) else { continue };
+            // (3) An external rate consumer that republishes a `… * UNIT / totalSupply()`
+            //     price tied to this priced contract is a CONFIDENCE BOOSTER, not a hard
+            //     gate. The donation-jumpable `balanceOf(this) - decaying-buffer` share
+            //     price (anchors 1 + 2) is itself the bug: the gradual-vesting defense is
+            //     bypassed and every reader of the share price — the vault's own ERC4626
+            //     `convertToAssets` / `previewRedeem` redemption math, or an external rate
+            //     provider — sees an atomic re-price. Requiring the publisher to live in
+            //     the SAME scan was an overfit: the rate provider is a separate contract
+            //     in a separate file (Ethena's `EthenaBalancerRateProvider`), so a
+            //     single-file or partial scan of the vault saw no consumer and went
+            //     silent (the regression). When a consumer IS in scope we raise to High
+            //     and name it; otherwise we still fire at Medium on the structural shape.
+            let consumer = find_rate_consumer(cx, contract, f);
+
+            // High when a downstream rate publisher is visible (the full Ethena
+            // StakedUSDe + EthenaBalancerRateProvider chain); Medium for the core
+            // donation-jumpable vesting-buffered share price on its own (the Ethena
+            // finding itself shipped as a Medium).
+            let (severity, confidence) = if consumer.is_some() {
+                (Severity::High, 0.8)
+            } else {
+                (Severity::Medium, 0.6)
+            };
+
+            // A trailing clause that names the external consumer when one is visible, or
+            // points at the in-contract / separate-file price readers when it is not.
+            let consumer_clause = match &consumer {
+                Some((cn, fnm)) => format!(
+                    " The price `{cn}.{fnm}` republishes as `... * UNIT / totalSupply()` jumps in a single \
+                     block, so every consumer of that rate (here a Balancer rate provider) can be moved by an \
+                     unprivileged transfer.",
+                ),
+                None => String::from(
+                    " Any reader of this share price — the vault's own ERC4626 `convertToAssets`/`previewRedeem` \
+                     redemption math, or an external rate provider that republishes `... * UNIT / totalSupply()` \
+                     (Ethena ships this as a separate `EthenaBalancerRateProvider`) — is moved by an unprivileged \
+                     transfer in a single block.",
+                ),
+            };
 
             let b = report!(self, Category::VestingBufferedDonation,
-                title = "Vesting-buffered share price can be jumped atomically by a raw token donation and is republished by an external rate consumer",
-                severity = Severity::High,
-                // Multi-anchor structural fingerprint: the `balanceOf(this) - decaying
-                // vesting term` subtraction, the drip-only-mutated vesting var, AND an
-                // external `*UNIT/totalSupply()` rate publisher — with the sync()-gated
-                // and no-publisher suppressions. Tight enough for a High.
-                confidence = 0.8,
+                title = "Vesting-buffered share price can be jumped atomically by a raw token donation",
+                severity = severity,
+                // Structural fingerprint: a `view` returns `balanceOf(address(this)) -
+                // <time-decaying vesting term>` whose subtrahend scales a SETTABLE state
+                // var mutated ONLY by a role-gated drip — with the sync()-gated and
+                // public-drip suppressions. An external `*UNIT/totalSupply()` rate
+                // publisher, when visible, lifts this to a High.
+                confidence = confidence,
                 dimensions = [Dimension::ValueFlow, Dimension::Invariant],
                 message = format!(
                     "`{cn}.{fname}` prices the vault as `{bal} - {sub}`: the minuend is the contract's RAW \
@@ -141,18 +188,15 @@ impl Detector for VestingBufferedDonationDetector {
                      with a plain `transfer`, while the subtrahend `{sub}` is a TIME-DECAYING vesting buffer \
                      (`block.timestamp`-elapsed × the settable `{vv}`) that is mutated ONLY inside the role-gated \
                      reward drip. A donation raises `balanceOf(this)` without raising `{vv}`, so it is NOT \
-                     buffered — the entire donation is recognized into `{fname}` ATOMICALLY (the vesting drip's \
-                     gradual-recognition defense is bypassed), and the price `{consumer_cn}.{consumer_fn}` \
-                     republishes as `... * UNIT / totalSupply()` jumps in a single block. Every consumer of that \
-                     rate (here a Balancer rate provider) can be moved by an unprivileged transfer. This is the \
-                     Ethena `StakedUSDe.totalAssets` / `EthenaBalancerRateProvider.getRate` class.",
+                     buffered — the entire donation is recognized into `{fname}` ATOMICALLY, bypassing the \
+                     vesting drip's gradual-recognition defense.{consumer_clause} This is the Ethena \
+                     `StakedUSDe.totalAssets` / `EthenaBalancerRateProvider.getRate` class.",
                     cn = contract.name,
                     fname = f.name,
                     bal = hit.minuend_text,
                     sub = hit.subtrahend_text,
                     vv = hit.vesting_var,
-                    consumer_cn = consumer.0,
-                    consumer_fn = consumer.1,
+                    consumer_clause = consumer_clause,
                 ),
                 recommendation =
                     "Do not price from the raw `balanceOf(address(this))`. Track an internal `totalReserves` \
@@ -590,6 +634,13 @@ mod tests {
     fn fires(src: &str) -> bool {
         run(src).iter().any(|f| f.detector == "vesting-buffered-donation")
     }
+    /// Severity of the (first) `vesting-buffered-donation` finding, if any.
+    fn severity(src: &str) -> Option<sluice_findings::Severity> {
+        run(src)
+            .into_iter()
+            .find(|f| f.detector == "vesting-buffered-donation")
+            .map(|f| f.severity)
+    }
 
     // VULN — the Ethena StakedUSDe / EthenaBalancerRateProvider shape, condensed:
     // `totalAssets = balanceOf(this) - getUnvestedAmount()`, getUnvestedAmount is a
@@ -657,9 +708,13 @@ mod tests {
         }
     "#;
 
-    // SAFE — NO external rate publisher. Same vault math, but nothing republishes a
-    // `*UNIT/totalSupply()` rate, so the atomic jump moves no consumer.
-    const SAFE_NO_PUBLISHER: &str = r#"
+    // VULN (Medium) — NO external rate publisher in scope. The donation-jumpable
+    // `balanceOf(this) - getUnvestedAmount()` price is STILL the bug (the vault's own
+    // ERC4626 redemption math reads it, and a separate-file rate provider may consume
+    // it), so the core shape fires at Medium even though no `*UNIT/totalSupply()`
+    // publisher is co-scanned. Demoting this to "silent" was the overfit that caused
+    // the regression — re-tied here to assert the Medium tier.
+    const NO_PUBLISHER: &str = r#"
         interface IERC20 { function balanceOf(address) external view returns (uint256); }
         contract StakedUSDe {
             uint256 public vestingAmount;
@@ -767,19 +822,92 @@ mod tests {
         }
     "#;
 
+    // VULN (Medium) — a HIGH-FIDELITY reproduction of the REAL on-disk
+    // `StakedUSDe.sol` (ethena-vuln-analysis/.../contracts/StakedUSDe.sol): the exact
+    // `totalAssets() = balanceOf(address(this)) - getUnvestedAmount()` body, the real
+    // `getUnvestedAmount` with its early `>= VESTING_PERIOD` return and the `unchecked`
+    // `deltaT` block, `vestingAmount` written only by the internal `_updateVestingAmount`
+    // (guarded by `if (getUnvestedAmount() > 0) revert`), itself reached only from the
+    // role-gated `transferInRewards` (`onlyRole(REWARDER_ROLE)`) and
+    // `redistributeLockedAmount` (`onlyRole(DEFAULT_ADMIN_ROLE)`). Crucially the rate
+    // consumer (`EthenaBalancerRateProvider`) is a SEPARATE contract in a SEPARATE file
+    // and is NOT present here — exactly the single-file-scan condition under which the
+    // R12 detector silently regressed to 0. This must fire (at Medium) on the structural
+    // shape alone, so the regression can never silently return.
+    const REAL_STAKED_USDE: &str = r#"
+        interface IERC20 { function balanceOf(address) external view returns (uint256); }
+        contract StakedUSDe {
+            uint256 public vestingAmount;
+            uint256 public lastDistributionTimestamp;
+            uint256 private constant VESTING_PERIOD = 8 hours;
+            bytes32 private constant REWARDER_ROLE = keccak256("REWARDER_ROLE");
+            bytes32 private constant DEFAULT_ADMIN_ROLE = 0x00;
+            modifier onlyRole(bytes32 role) { _; }
+            modifier nonReentrant() { _; }
+            modifier notZero(uint256 amount) { _; }
+            function asset() public view returns (address) { return address(0); }
+            function totalSupply() public view returns (uint256) { return 1; }
+
+            function transferInRewards(uint256 amount)
+                external nonReentrant onlyRole(REWARDER_ROLE) notZero(amount)
+            {
+                _updateVestingAmount(amount);
+            }
+
+            function redistributeLockedAmount(address from, address to)
+                external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE)
+            {
+                if (to == address(0)) {
+                    _updateVestingAmount(123);
+                }
+            }
+
+            function totalAssets() public view returns (uint256) {
+                return IERC20(asset()).balanceOf(address(this)) - getUnvestedAmount();
+            }
+
+            function getUnvestedAmount() public view returns (uint256) {
+                uint256 timeSinceLastDistribution = block.timestamp - lastDistributionTimestamp;
+                if (timeSinceLastDistribution >= VESTING_PERIOD) {
+                    return 0;
+                }
+                uint256 deltaT;
+                unchecked {
+                    deltaT = (VESTING_PERIOD - timeSinceLastDistribution);
+                }
+                return (deltaT * vestingAmount) / VESTING_PERIOD;
+            }
+
+            function _updateVestingAmount(uint256 newVestingAmount) internal {
+                if (getUnvestedAmount() > 0) revert();
+                vestingAmount = newVestingAmount;
+                lastDistributionTimestamp = block.timestamp;
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_ethena_shape() {
         assert!(fires(VULN), "{:#?}", run(VULN));
+        // With the external rate publisher in scope the blast radius is largest → High.
+        assert_eq!(severity(VULN), Some(sluice_findings::Severity::High), "{:#?}", run(VULN));
     }
 
     #[test]
     fn fires_on_inline_buffer() {
         assert!(fires(VULN_INLINE), "{:#?}", run(VULN_INLINE));
+        assert_eq!(severity(VULN_INLINE), Some(sluice_findings::Severity::High), "{:#?}", run(VULN_INLINE));
     }
 
+    // REGRESSION GUARD (R12 overfit): the detector must fire on the bare
+    // donation-jumpable vesting-buffered share price even when NO `*UNIT/totalSupply()`
+    // rate publisher is co-scanned (the real `EthenaBalancerRateProvider` lives in a
+    // separate file, so a single-file scan of `StakedUSDe` saw no consumer and went
+    // silent — that was the regression). It now fires at Medium on the core shape.
     #[test]
-    fn silent_without_rate_publisher() {
-        assert!(!fires(SAFE_NO_PUBLISHER), "{:#?}", run(SAFE_NO_PUBLISHER));
+    fn fires_without_rate_publisher_at_medium() {
+        assert!(fires(NO_PUBLISHER), "{:#?}", run(NO_PUBLISHER));
+        assert_eq!(severity(NO_PUBLISHER), Some(sluice_findings::Severity::Medium), "{:#?}", run(NO_PUBLISHER));
     }
 
     #[test]
@@ -795,5 +923,19 @@ mod tests {
     #[test]
     fn silent_on_plain_erc4626() {
         assert!(!fires(SAFE_PLAIN_4626), "{:#?}", run(SAFE_PLAIN_4626));
+    }
+
+    // REGRESSION GUARD: the real on-disk Ethena `StakedUSDe` shape (rate consumer in a
+    // separate file, hence absent here) MUST fire. This is the exact condition the R12
+    // detector regressed on. See `REAL_STAKED_USDE`.
+    #[test]
+    fn fires_on_real_staked_usde_without_consumer() {
+        assert!(fires(REAL_STAKED_USDE), "{:#?}", run(REAL_STAKED_USDE));
+        assert_eq!(
+            severity(REAL_STAKED_USDE),
+            Some(sluice_findings::Severity::Medium),
+            "{:#?}",
+            run(REAL_STAKED_USDE)
+        );
     }
 }

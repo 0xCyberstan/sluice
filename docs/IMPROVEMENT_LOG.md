@@ -418,6 +418,27 @@ Audit method: scanned 12 source roots (all exit 0, 0.06–4.9s, ≤290MB; olympu
   4. `solver-convergence-trust` (12 pendle, 0 elsewhere — target-overfit): require the guess to FLOW to a fund-moving sink in the same call.
 - **C. Leave the 9 correctly-rare dormant** (untrusted-call-target, unprotected-initializer, erc721-mint-reentrancy, unchecked-erc1155-receiver, lp-slippage, msg-value-in-loop, gap-not-shrunk, uninitialized-storage-pointer, delegated-signer-single-step) — audited code is genuinely clean of them; forcing them would repeat the R7 overfit mistake.
 - **D. Corpus to acquire (ranked):** #1 **Uniswap v3-core + v4-core/periphery** (unlocks the already-built-but-starved `feegrowth-accounting` on `Tick.getFeeGrowthInside` + concentrated-liquidity classes — largest AMM TVL/bounty surface); #2 a canonical ERC-4337 **EntryPoint** (AA paymaster/validation); #3 **MasterChef**-class staking (gives `reward-debt` a live target); #4 a **GMX-v2/Synthetix-perps** engine (unblocks the deferred perps classes). Per the R7 lesson, build the needs-corpus classes only AFTER the corpus is on disk.
+
+### Round 18 — PRECISION round (executed the R17 meta-audit work-plan): measured noise reduction, recall preserved
+- **Result:** still 104 detectors (no new classes — pure precision). Measured FP reduction (R17→R18, all via worktree
+  agents + an independent re-dogfood): **centralization** olympus 27→22 / etherfi 29→21 / ethena 21→11 / optimism 20→12 /
+  pendle 13→10 (the #1 noise source cut 25–50% everywhere — inline-guard-on-fixed-protocol-contract + mint-to-protocol now
+  down-ranked); **reentrancy** optimism 49→**28** / symbiotic 15→**4** / olympus 11→9 / pendle 6→3 (trusted-immutable/system
+  callees + internal `_assertOnly*` guard-calls no longer arm reentrancy; Critical capped); **integer-issues** etherfi 23→15
+  (provenance width-safety); **solver-convergence-trust** pendle 12→**4** (now requires flow to a fund-moving sink); and the
+  **`vesting-buffered-donation` REGRESSION FIXED** — ethena 0→1 (fires on real StakedUSDe again, + a regression fixture so it
+  can't silently regress). Totals down: olympus 92→85, etherfi 126→109, ethena 31→28, optimism 154→130, pendle 107→93,
+  symbiotic 41→30. **Recall fully preserved: corpus 20/20 + 8/8, all 5 real-hack harnesses pass, 565 tests, 0 warnings.**
+  The 9 correctly-rare detectors left dormant (per the audit). A genuine signal-to-noise improvement on real code.
+
+#### R19 backlog (R18 WF3 — EigenLayer AVS-middleware: the AVS verification trust root; real eigenlayer-middleware targets; non-overlap verified vs the 104)
+1. **apk-membership-desync** — aggregate BLS pubkey built from one block-indexed history while membership/threshold reads a SEPARATE bitmap-history, with no co-update invariant → a forged `apk` passes the pairing for a non-quorum set. BLSSignatureChecker.sol:135-144 vs 101-117; root BLSApkRegistry.sol:168-201. (≠ dvn-quorum/batch-verify/netted-aggregate — this is aggregate-key-vs-membership over block histories + a pairing sink.)
+2. **verify-snapshot-block-caller-trust** — M-of-N stake threshold measured at a CALLER-SUPPLIED `referenceBlockNumber` bounded only `< block.number` → pick a stale block where a since-slashed/exited operator still had stake. BLSSignatureChecker.sol:60; ECDSAStakeRegistry twin :494-538. (≠ epoch-boundary-staleness/oracle-staleness — this is a verification reference block, older = attacker-favorable.)
+3. **churn-replace-stale-stake-double-count** — churn validates `newOperatorStake`/`totalQuorumStake` measured AFTER the newcomer self-registered (total already includes both newcomer + kicked) → total/per-operator stake desync. RegistryCoordinator._registerOperatorWithChurn.
+4. **index-registry-pop-swap-stale-id** — swap-and-pop operator-index bookkeeping leaves a stale id/index.
+5. **ejection-ratelimit-live-base-bypass** — auto-ejection rate-limit budget = percentage of a LIVE base (manipulable).
+6. **reregister-cooldown-vs-bitmap-residue** — deregistration clears the quorum bitmap but leaves residue enabling re-register-cooldown bypass.
+AVS verification is EigenLayer's trust root (high payout). Full signatures in the R18 WF3 transcript.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector

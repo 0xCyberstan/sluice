@@ -114,6 +114,30 @@ impl Detector for IntegerIssuesDetector {
                 // own span. See `classify_locals`.
                 let locals = classify_locals(cx, f);
 
+                // PROVENANCE WIDTHS: an upper bound (in bits) on the value each
+                // named variable in this function can hold. Built once and threaded
+                // through `operand_max_bits` so the WIDTH-SAFE suppression (A) can
+                // reason about identifiers, struct-field members, subtractions and
+                // `min`/`max` results — not just the cast's own syntactic shape:
+                //   * params / state vars → their *declared* type width;
+                //   * locals → the *tighter* of their declared type width and the
+                //     inferred width of their defining expression (so a `uint256`
+                //     local that only ever holds a `uint96` struct field is bounded
+                //     at 96). See `value_widths`.
+                // Struct field name → widest declared field width across all parsed
+                // structs (widest == sound upper bound when a field name is reused
+                // with different widths in different structs). Lets a cast operand
+                // `request.amountOfEEth` (a `uint96` struct field) be proven safe.
+                let fields = struct_field_widths(cx);
+                let widths = value_widths(cx, f, &fields);
+
+                // DEDUPE: collapse repeated same-width downcasts inside one function
+                // (e.g. `x += uint128(a); y += uint128(b);`) to a single finding,
+                // keyed by target bit width so two genuinely different-width
+                // truncations in one function are still both reported.
+                let mut reported_widths: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
                 visit_calls(f, |c, span| {
                     if c.kind != CallKind::TypeCast {
                         return;
@@ -138,7 +162,15 @@ impl Detector for IntegerIssuesDetector {
                     // `int128(uint128(uint64_var))`, and (via the nested-cast peel)
                     // the inner `uint160(msg.sender)` of
                     // `bytes32(uint256(uint160(msg.sender)))`.
-                    if let Some(operand_bits) = operand_max_bits(cx, f, arg) {
+                    //
+                    // PROVENANCE-extended: also kills the dominant etherfi shapes —
+                    //   * `uint128(request.amountOfEEth)` where `amountOfEEth` is a
+                    //     `uint96` STORAGE/STRUCT FIELD (rule a);
+                    //   * `uint96(request.shareOfEEth - x)` / a local bound to it,
+                    //     since `a - b <= a` and `a` is a `uint96` field (rule b);
+                    //   * `uint40(_max(p1, p2))` where both `p1`/`p2` are `uint40`
+                    //     locals (the max of `uintN`-typed operands is `<= uintN`).
+                    if let Some(operand_bits) = operand_max_bits(cx, f, arg, &widths, &fields) {
                         if operand_bits <= bits {
                             return;
                         }
@@ -200,6 +232,14 @@ impl Detector for IntegerIssuesDetector {
                     // Only flag when the value is attacker-controlled (and thus
                     // can be made to exceed the narrowed range to drop high bits).
                     if !cx.is_attacker_controlled(f.id, arg) {
+                        return;
+                    }
+
+                    // DEDUPE: one finding per (function, target width). A function
+                    // that narrows several values to the same `uintN` (the common
+                    // paired `x += uintN(a); y += uintN(b);` accounting update) is a
+                    // single review item, not N.
+                    if !reported_widths.insert(bits) {
                         return;
                     }
 
@@ -391,21 +431,212 @@ fn type_to_bits(ty: &str) -> Option<u32> {
     None
 }
 
-/// Resolve the declared textual type of a bare identifier `name` within function
-/// `f`: first its parameters, then its contract's state variables. Returns `None`
-/// for locals / unknowns (we then conservatively decline to suppress).
-fn lookup_ident_type(cx: &AnalysisContext, f: &sluice_ir::Function, name: &str) -> Option<String> {
+/// An upper bound (in bits) on the value each named variable in `f` can hold —
+/// the PROVENANCE backbone of the WIDTH-SAFE suppression. A name is bounded by:
+///   * params / state vars → their declared type width (Solidity guarantees the
+///     stored value fits the declared width);
+///   * locals → the *tighter* (minimum) of their declared type width and the
+///     inferred width of their defining expression. The defining-expression bound
+///     lets a `uint256 amountToWithdraw = request.amountWithFee;` local inherit the
+///     `uint96` field's 96-bit bound, and a `uint256 remainder = a96 > b ? a96 - b
+///     : 0;` local inherit 96 via the subtraction/ternary rules.
+///
+/// Computed as a forward pass in source order so a later local may reference an
+/// earlier one. Names whose width we cannot bound are simply absent (we then
+/// decline to suppress — precision over recall).
+fn value_widths(
+    cx: &AnalysisContext,
+    f: &sluice_ir::Function,
+    fields: &std::collections::HashMap<String, u32>,
+) -> std::collections::HashMap<String, u32> {
+    let mut widths: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+    // (1) Params and state vars: declared-type width.
     for p in &f.params {
-        if p.name.as_deref() == Some(name) {
-            return Some(p.ty.clone());
+        if let (Some(n), Some(b)) = (p.name.as_deref(), type_to_bits(&p.ty)) {
+            widths.insert(n.to_string(), b);
         }
     }
-    let contract = cx.scir.contract(f.contract)?;
-    contract
-        .state_vars
-        .iter()
-        .find(|v| v.name == name)
-        .map(|v| v.ty.clone())
+    if let Some(c) = cx.scir.contract(f.contract) {
+        for v in &c.state_vars {
+            if let Some(b) = type_to_bits(&v.ty) {
+                // Don't let a state var shadow a same-named param already bounded.
+                widths.entry(v.name.clone()).or_insert(b);
+            }
+        }
+    }
+
+    // (2) Locals, in source order: tighten declared width by the defining
+    //     expression's inferred width. Collect `(name, declared_ty, init)` first to
+    //     keep the statement walk a shared-borrow closure, then fold in order.
+    let mut defs: Vec<(String, String, Option<&Expr>)> = Vec::new();
+    for s in &f.body {
+        s.visit(&mut |st| match &st.kind {
+            sluice_ir::StmtKind::VarDecl { name: Some(n), ty, init } => {
+                defs.push((n.clone(), ty.clone(), init.as_ref()));
+            }
+            sluice_ir::StmtKind::Expr(Expr {
+                kind: ExprKind::Assign { op: sluice_ir::AssignOp::Assign, target, value },
+                ..
+            }) => {
+                if let ExprKind::Ident(n) = &target.kind {
+                    // A plain reassignment: type is whatever was declared earlier
+                    // (unknown here), so carry only the value's inferred width.
+                    defs.push((n.clone(), String::new(), Some(value.as_ref())));
+                }
+            }
+            _ => {}
+        });
+    }
+    for (name, ty, init) in defs {
+        let declared = type_to_bits(&ty);
+        let inferred = init.and_then(|e| operand_max_bits(cx, f, e, &widths, fields));
+        let bound = match (declared, inferred) {
+            (Some(d), Some(i)) => Some(d.min(i)),
+            (Some(d), None) => Some(d),
+            (None, Some(i)) => Some(i),
+            (None, None) => None,
+        };
+        match bound {
+            // Last-write-wins: a later definition replaces the earlier bound.
+            Some(b) => {
+                widths.insert(name, b);
+            }
+            // Unbounded redefinition: drop any earlier (now-stale) bound so a later
+            // cast cannot be wrongly suppressed by a superseded value.
+            None => {
+                widths.remove(&name);
+            }
+        }
+    }
+
+    widths
+}
+
+/// Map of struct-field name → an upper bound (in bits) on that field's declared
+/// integer width, scanned textually from every parsed source file's `struct { ...
+/// }` bodies. When the same field name appears with different widths in different
+/// structs we keep the **widest** (the sound upper bound, since a bare `base.field`
+/// member access does not tell us which struct `base` is). Non-integer fields and
+/// fields whose type we can't width (`address`, `bytesM` included via `type_to_bits`)
+/// are recorded too, so e.g. an `address` field bounds at 160.
+///
+/// This is the structural source-of-truth for rule (a): a downcast `uintN(x)` is
+/// width-safe when `x` is read from a `uintN`-or-narrower struct/state field.
+fn struct_field_widths(cx: &AnalysisContext) -> std::collections::HashMap<String, u32> {
+    let mut map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for file in &cx.scir.files {
+        scan_struct_fields(&file.content, &mut map);
+    }
+    map
+}
+
+/// Textually extract `type field;` declarations from every `struct <Name> { ... }`
+/// block in `src`, folding each field's width into `map` (keeping the widest on a
+/// name collision). Deliberately lightweight: it scans for the `struct` keyword,
+/// finds the matching `{`/`}` (brace-depth) and splits the body on `;`.
+fn scan_struct_fields(src: &str, map: &mut std::collections::HashMap<String, u32>) {
+    let bytes = src.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = src[search_from..].find("struct") {
+        let kw = search_from + rel;
+        // Require `struct` to be a standalone keyword (word boundaries).
+        let before_ok = kw == 0 || !is_ident_byte(bytes[kw - 1]);
+        let after = kw + "struct".len();
+        let after_ok = after < bytes.len() && !is_ident_byte(bytes[after]);
+        if !(before_ok && after_ok) {
+            search_from = after;
+            continue;
+        }
+        // Find the opening brace of the struct body.
+        let Some(open_rel) = src[after..].find('{') else { break };
+        let open = after + open_rel;
+        // Walk to the matching close brace by depth.
+        let mut depth = 0i32;
+        let mut i = open;
+        let mut close = None;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(close) = close else { break };
+        // Strip `//` line and `/* */` block comments from the body first, so a
+        // trailing `// 12 bytes` on one field does not bleed into the *next*
+        // `;`-entry and shadow its leading type token (the bug that left
+        // `amountWithFee` / `totalVaultShares` unresolved).
+        let body = strip_solidity_comments(&src[open + 1..close]);
+        // Each `;`-separated entry is `type name`. Take the first token as the type
+        // and the last identifier-ish token as the field name.
+        for entry in body.split(';') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some(tyf) = entry.split_whitespace().next() else { continue };
+            // The field name is the final whitespace-token (strip a trailing
+            // bracket for fixed arrays, which we don't width anyway).
+            let Some(field) = entry.split_whitespace().last() else { continue };
+            // Skip mapping/array/nested types (not a plain `uintN`/`address` scalar).
+            if field.ends_with(']') || tyf.starts_with("mapping") {
+                continue;
+            }
+            let field = field.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            if field.is_empty() {
+                continue;
+            }
+            if let Some(b) = type_to_bits(tyf) {
+                map.entry(field.to_string())
+                    .and_modify(|w| *w = (*w).max(b))
+                    .or_insert(b);
+            }
+        }
+        search_from = close + 1;
+    }
+}
+
+/// Identifier continuation byte (ASCII letter/digit/underscore/`$`).
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Replace `//` line comments and `/* ... */` block comments with whitespace. We
+/// only re-tokenize the result on whitespace, so collapsing comments to a single
+/// space is enough. Self-contained so this detector does not depend on the
+/// context's private stripper. Char-based to stay UTF-8 safe on comment text.
+fn strip_solidity_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            // Line comment: skip to end of line.
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            // Block comment: skip to closing `*/`.
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+            out.push(' ');
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Upper bound (in bits) on the value an operand of a narrowing cast can hold, or
@@ -413,15 +644,57 @@ fn lookup_ident_type(cx: &AnalysisContext, f: &sluice_ir::Function, name: &str) 
 /// width-suppressed). The nested-cast peel: the result of `uintK(...)` / `intK(...)`
 /// / `address(...)` / `bytesM(...)` is exactly the target width regardless of what
 /// is inside, so we read the inner cast's *target* type and never recurse further.
-fn operand_max_bits(cx: &AnalysisContext, f: &sluice_ir::Function, arg: &Expr) -> Option<u32> {
+///
+/// PROVENANCE-aware. Beyond the original nested-cast / `msg.sender` / declared-type
+/// cases, this also bounds:
+///   * a struct-field member `base.field` by `field`'s declared width (rule a),
+///     resolved from `fields` (built by [`struct_field_widths`]);
+///   * a subtraction `a - b` by the width of its minuend `a` (since `a - b <= a`,
+///     rule b);
+///   * a ternary `c ? x : y` by `max(width(x), width(y))`;
+///   * a `min`/`max` call by the appropriate bound over its argument widths
+///     (`min` <= the smaller arg, `max` <= the larger), so `uintN(_max(p, q))` with
+///     `uintN`-typed `p`/`q` is width-safe;
+///   * a bare identifier by its entry in `widths` (declared param/state-var/local
+///     type, tightened by its defining expression — see [`value_widths`]).
+fn operand_max_bits(
+    cx: &AnalysisContext,
+    f: &sluice_ir::Function,
+    arg: &Expr,
+    widths: &std::collections::HashMap<String, u32>,
+    fields: &std::collections::HashMap<String, u32>,
+) -> Option<u32> {
     match &arg.kind {
         // A nested type cast: its width is its own target type's width.
         ExprKind::Call(c) if c.kind == CallKind::TypeCast => {
             let ty = cast_target_type(c)?;
             type_to_bits(&ty)
         }
+        // `min`/`max` over operands of known width: the result cannot exceed the
+        // bound implied by the operands. `min(a, b) <= min(widths)`,
+        // `max(a, b) <= max(widths)`. Requires *every* argument's width to be
+        // known (an unknown arg leaves the result unbounded → `None`).
+        ExprKind::Call(c)
+            if c.kind == CallKind::Internal && is_min_max_name(c.func_name.as_deref()) =>
+        {
+            if c.args.is_empty() {
+                return None;
+            }
+            let mut acc: Option<u32> = None;
+            let is_min = is_min_name(c.func_name.as_deref());
+            for a in &c.args {
+                let w = operand_max_bits(cx, f, a, widths, fields)?;
+                acc = Some(match acc {
+                    None => w,
+                    Some(prev) if is_min => prev.min(w),
+                    Some(prev) => prev.max(w),
+                });
+            }
+            acc
+        }
         // `msg.sender` / `tx.origin` are `address` (160-bit). `.length` is a
-        // `uint256` and therefore *not* width-safe (returns 256).
+        // `uint256` and therefore *not* width-safe (returns 256). Otherwise, if the
+        // accessed `member` is a struct field of known width, use that.
         ExprKind::Member { base, member } => {
             if member == "length" {
                 return Some(256);
@@ -431,15 +704,75 @@ fn operand_max_bits(cx: &AnalysisContext, f: &sluice_ir::Function, arg: &Expr) -
                     return Some(160);
                 }
             }
-            None
+            // `base.field` where `field` is a declared struct field (rule a).
+            fields.get(member.as_str()).copied()
         }
-        // A bare identifier: resolve its declared (param/state-var) type.
-        ExprKind::Ident(name) => {
-            let ty = lookup_ident_type(cx, f, name)?;
-            type_to_bits(&ty)
+        // A subtraction is bounded by its minuend: `a - b <= a` (rule b). We do not
+        // bound `+`/`*` (those can grow), nor recurse into other binary ops here
+        // (division/shift are handled by the dedicated DIVISION-DOWN suppressions).
+        ExprKind::Binary { op: BinOp::Sub, lhs, .. } => {
+            operand_max_bits(cx, f, lhs, widths, fields)
         }
+        // A ternary is bounded by the wider of its two arms.
+        ExprKind::Ternary { then_e, else_e, .. } => {
+            let t = operand_max_bits(cx, f, then_e, widths, fields)?;
+            let e = operand_max_bits(cx, f, else_e, widths, fields)?;
+            Some(t.max(e))
+        }
+        // A numeric/hex literal: bounded by the bits its constant value occupies.
+        ExprKind::Lit(_) => literal_bits(arg),
+        // A bare identifier: its precomputed provenance width (declared type,
+        // tightened by its defining expression).
+        ExprKind::Ident(name) => widths.get(name.as_str()).copied(),
         _ => None,
     }
+}
+
+/// True if `name` is a recognized `min`/`max` helper (`min`, `max`, `_min`,
+/// `_max`, or `Math.min`/`Math.max` lowered to the bare member name). Used to
+/// bound the result of such a call by its arguments' widths.
+fn is_min_max_name(name: Option<&str>) -> bool {
+    is_min_name(name) || is_max_name(name)
+}
+fn is_min_name(name: Option<&str>) -> bool {
+    matches!(name, Some("min") | Some("_min") | Some("Math.min"))
+}
+fn is_max_name(name: Option<&str>) -> bool {
+    matches!(name, Some("max") | Some("_max") | Some("Math.max"))
+}
+
+/// Bits occupied by a non-negative integer literal, or `None` for anything we
+/// cannot evaluate cheaply (so the cast is not suppressed). A decimal/hex `0`
+/// occupies 0 bits; otherwise we round the value up to a byte-aligned EVM width.
+fn literal_bits(e: &Expr) -> Option<u32> {
+    let raw = match &e.kind {
+        ExprKind::Lit(sluice_ir::Lit::Number(n)) => n.trim().replace('_', ""),
+        ExprKind::Lit(sluice_ir::Lit::HexNumber(n)) => {
+            let h = n.trim().trim_start_matches("0x").trim_start_matches("0X").replace('_', "");
+            if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            // 4 bits per hex digit, byte-aligned, leading zeros trimmed.
+            let trimmed = h.trim_start_matches('0');
+            if trimmed.is_empty() {
+                return Some(0);
+            }
+            let bits = (trimmed.len() as u32) * 4;
+            return Some(bits.div_ceil(8) * 8);
+        }
+        _ => return None,
+    };
+    // Plain decimal only (no scientific/`ether`/`days` suffix — those are not bare
+    // digits and we conservatively decline). Parse into u128; bail if too large.
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v: u128 = raw.parse().ok()?;
+    if v == 0 {
+        return Some(0);
+    }
+    let bits = 128 - v.leading_zeros();
+    Some(bits.div_ceil(8) * 8)
 }
 
 /// SUPPRESSION (F) helper. True when *every* arithmetic operation inside the
@@ -1014,5 +1347,202 @@ contract C {
 }
 "#;
         assert!(fires(src), "downcast of an unbounded (sum) local must still fire");
+    }
+
+    // ------------------------------------------------------------------
+    // R7 PROVENANCE-WIDTH regressions: the residual etherfi downcast FPs.
+    // The dominant shape is `field/slot += uintN(x)` where the cast operand
+    // `x` is itself proven `<= N` bits by its provenance (a narrow struct
+    // field, a subtraction/ternary/min-max of narrow operands, or a local
+    // that inherits such a bound). Each must now stay SILENT.
+    // ------------------------------------------------------------------
+
+    // (A/rule-a) MEMBER → NARROW STRUCT FIELD: `uint128(request.amountOfEEth)`
+    // where `amountOfEEth` is a `uint96` struct field — the 128-bit target
+    // trivially holds a 96-bit field, so it cannot truncate. (etherfi
+    // PriorityWithdrawalQueue._claimWithdraw line 582.)
+    #[test]
+    fn silent_on_downcast_of_narrow_struct_field() {
+        let src = r#"
+pragma solidity ^0.8.20;
+interface I {
+    struct WithdrawRequest {
+        address user;        // 20 bytes
+        uint96 amountOfEEth; // 12 bytes
+        uint96 shareOfEEth;  // 12 bytes
+    }
+}
+contract C is I {
+    uint128 public ethLocked;
+    function claim(WithdrawRequest calldata request) external {
+        ethLocked -= uint128(request.amountOfEEth);
+    }
+}
+"#;
+        assert!(!fires(src), "uint128 cast of a uint96 struct field must be silent");
+    }
+
+    // (rule-b) SUBTRACTION/TERNARY bounded by a narrow field: a local
+    // `remainder = a96 > b ? a96 - b : 0` is `<= a96` (a `uint96` field), so
+    // `uint96(remainder)` cannot truncate. (etherfi PriorityWithdrawalQueue
+    // ._claimWithdraw line 580.)
+    #[test]
+    fn silent_on_downcast_of_subtraction_bounded_by_narrow_field() {
+        let src = r#"
+pragma solidity ^0.8.20;
+interface I { struct R { uint96 shareOfEEth; uint96 amountWithFee; } }
+contract C is I {
+    uint96 public totalRemainderShares;
+    function claim(R calldata request, uint256 sharesToBurn) external {
+        uint256 remainder = request.shareOfEEth > sharesToBurn
+            ? request.shareOfEEth - sharesToBurn
+            : 0;
+        totalRemainderShares += uint96(remainder);
+    }
+}
+"#;
+        assert!(!fires(src), "downcast of (narrow-field - x) ternary must be silent");
+    }
+
+    // (rule-a via-local) a `uint256` local that only ever holds a narrow struct
+    // field inherits the field's bound: `uint256 amt = request.amountWithFee;`
+    // (a `uint96` field) then `uint96(amt)` is width-safe. (etherfi
+    // PriorityWithdrawalQueue._claimWithdraw line 587.)
+    #[test]
+    fn silent_on_downcast_of_local_bound_to_narrow_field() {
+        let src = r#"
+pragma solidity ^0.8.20;
+interface I { struct R { address user; uint96 amountWithFee; } }
+contract C is I {
+    event Claimed(address user, uint96 amount);
+    function claim(R calldata request) external {
+        uint256 amountToWithdraw = request.amountWithFee;
+        emit Claimed(request.user, uint96(amountToWithdraw));
+    }
+}
+"#;
+        assert!(!fires(src), "downcast of a uint256 local that holds a uint96 field must be silent");
+    }
+
+    // (rule-b) MIN/MAX of `uintN`-typed operands: `uint40(_max(p, q))` with
+    // `p`/`q` declared `uint40` cannot exceed `type(uint40).max`. (etherfi
+    // MembershipManager._applyUnwrapPenalty line 718.)
+    #[test]
+    fn silent_on_downcast_of_max_of_narrow_operands() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    mapping(uint256 => uint40) public pts;
+    function f(uint256 id, uint40 a, uint40 b) external {
+        uint40 penalty = uint40(_max(a, b));
+        pts[id] = penalty;
+    }
+    function _max(uint256 x, uint256 y) internal pure returns (uint256) {
+        return x > y ? x : y;
+    }
+}
+"#;
+        assert!(!fires(src), "downcast of max() of uint40 operands must be silent");
+    }
+
+    // DEDUPE: a function narrowing several values to the SAME `uintN` is a
+    // single review item. Two `uint128(_p)` casts in one function => one finding.
+    // (etherfi MembershipManager._incrementTierVaultV1 lines 548/549.)
+    #[test]
+    fn dedupes_same_width_downcasts_in_one_function() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    struct V { uint128 a; uint128 b; }
+    V public v;
+    function inc(uint256 p, uint256 q) external {
+        v.a += uint128(p);
+        v.b += uint128(q);
+    }
+}
+"#;
+        let n = run(src).iter().filter(|f| f.detector == "integer-issues").count();
+        assert_eq!(n, 1, "two same-width downcasts in one function must dedupe to one finding");
+    }
+
+    // DEDUPE must NOT merge genuinely different target widths: a `uint128` and a
+    // `uint64` truncation in the same function are two distinct review items.
+    #[test]
+    fn does_not_dedupe_different_width_downcasts() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint128 public big;
+    uint64 public small;
+    function f(uint256 p, uint256 q) external {
+        big = uint128(p);
+        small = uint64(q);
+    }
+}
+"#;
+        let n = run(src).iter().filter(|f| f.detector == "integer-issues").count();
+        assert_eq!(n, 2, "distinct-width downcasts must each be reported");
+    }
+
+    // STRUCT PARSING: a field with a trailing `//` comment must still be picked
+    // up — the comment must not bleed into the *next* field's type token (the
+    // exact etherfi shape that initially leaked: `totalVaultShares`, the SECOND
+    // commented field, was missed). Casting that field to its own width is safe.
+    #[test]
+    fn silent_with_comment_annotated_struct_fields() {
+        let src = r#"
+pragma solidity ^0.8.20;
+interface I {
+    struct TierVault {
+        uint128 totalPooledEEthShares; // total share of eEth in the tier vault
+        uint128 totalVaultShares;      // total share of the tier vault
+    }
+}
+contract C is I {
+    uint128 public mirror;
+    function read(TierVault calldata tv) external {
+        // The *second* commented field, narrowed to its own width — width-safe
+        // only if the comment did not corrupt parsing of `totalVaultShares`.
+        mirror = uint128(tv.totalVaultShares);
+    }
+}
+"#;
+        assert!(!fires(src), "second comment-annotated struct field must parse and suppress");
+    }
+
+    // POSITIVE: the field-width provenance must not over-suppress. A downcast of
+    // a value read from a WIDE field (`uint256`) still FIRES.
+    #[test]
+    fn fires_on_downcast_of_wide_struct_field() {
+        let src = r#"
+pragma solidity ^0.8.20;
+interface I { struct R { uint256 bigValue; } }
+contract C is I {
+    uint64 public y;
+    function f(R calldata r) external {
+        y = uint64(r.bigValue);
+    }
+}
+"#;
+        assert!(fires(src), "downcast of a uint256 struct field must still fire");
+    }
+
+    // POSITIVE: `max()` of operands where ONE is wide is not bounded by the
+    // narrow one — `uint40(_max(wide, narrow))` can exceed uint40, so it FIRES.
+    #[test]
+    fn fires_on_downcast_of_max_with_wide_operand() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    mapping(uint256 => uint40) public pts;
+    function f(uint256 id, uint256 wide, uint40 narrow) external {
+        pts[id] = uint40(_max(wide, narrow));
+    }
+    function _max(uint256 x, uint256 y) internal pure returns (uint256) {
+        return x > y ? x : y;
+    }
+}
+"#;
+        assert!(fires(src), "max() with a wide operand must still fire");
     }
 }

@@ -76,20 +76,95 @@ fn is_trusted_call(cs: &CallSite, trusted: &rustc_hash::FxHashSet<String>) -> bo
 }
 
 /// True iff `f` contains at least one GENUINE (untrusted) reentrancy-capable
-/// external/low-level call. A function with none of these cannot be re-entered,
-/// so it must never trip a classic/cross-function reentrancy rule.
+/// external/low-level call that actually ARMS reentrancy (untrusted, and not an
+/// internal guard/assert helper). A function with none of these cannot be
+/// re-entered, so it must never trip a classic/cross-function reentrancy rule.
 fn has_genuine_reentry_vector(f: &Function, trusted: &rustc_hash::FxHashSet<String>) -> bool {
-    f.effects
-        .call_sites
-        .iter()
-        .any(|cs| is_reentry_vector(cs) && !is_trusted_call(cs, trusted))
+    f.effects.call_sites.iter().any(|cs| is_arming_call(cs, trusted))
+}
+
+/// True iff the arming external call is a low-level/value call to a
+/// CALLER-SUPPLIED target (`msg.sender`, a `target`/`to`/`recipient` parameter,
+/// an attacker-passed `token`) — the strongest re-entry surface, where the
+/// attacker fully controls the re-entered code. Used to gate the Critical
+/// severity escalation: a classic finding only deserves Critical when the callee
+/// is caller-controlled, not when it is merely an unrecognized in-protocol call.
+fn has_caller_supplied_value_vector(
+    f: &Function,
+    trusted: &rustc_hash::FxHashSet<String>,
+) -> bool {
+    f.effects.call_sites.iter().any(|cs| {
+        is_arming_call(cs, trusted)
+            && cs.sends_value
+            && {
+                let root = sluice_frontier::target_root(&cs.target).to_ascii_lowercase();
+                root == "msg"
+                    || root.contains("recipient")
+                    || root.contains("sender")
+                    || root == "to"
+                    || root == "target"
+                    || root == "receiver"
+                    || root == "caller"
+                    || root == "token"
+            }
+    })
+}
+
+/// True iff `name` reads like a VALUE / balance / accounting state variable — the
+/// only storage whose post-call corruption is the classic reentrancy payday
+/// (drain a balance, double-count a share, inflate a deposit). Every real-hack
+/// reentrancy fixture writes such a var after its call (`balances`,
+/// `accountBorrows`, `totalSupply`, `assetBalances`, `supplyShares`, `reserveETH`,
+/// `refundModeCredit`, …). A write to an unrelated bool/flag/registry/status var
+/// (`isFeatureEnabled`, `initialized`, `status`, `claimData`, `_disputeGames`,
+/// `l2Sender`, `drips`) is bookkeeping, not value at risk, and is the dominant
+/// classic false-positive shape (Optimism `SystemConfig.setFeature`).
+fn is_value_state_var(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    const VALUE_KEYS: &[&str] = &[
+        "balance", "borrow", "supply", "deposit", "share", "underlying", "reserve",
+        "credit", "collateral", "amount", "stake", "debt", "principal", "asset",
+        "liquidity", "funds", "owed", "escrow", "withdraw", "redeem", "payout",
+        "vault", "token", "reward", "ledger", "accru",
+    ];
+    VALUE_KEYS.iter().any(|k| l.contains(k))
+}
+
+/// True iff `name` is an INTERNAL guard / assertion helper — a function whose sole
+/// job is to authorize or revert (`_assertOnlyOwner`, `_checkRole`, `_onlyAdmin`,
+/// `_requireNotPaused`). A call to one of these is a CHECK, never the external
+/// re-entry vector that arms a reentrancy finding, even if (mis)modeled as a call
+/// site. (Optimism `SystemConfig.setFeature` opens with
+/// `_assertOnlyProxyAdminOrProxyAdminOwner()`.)
+fn is_guard_helper_name(name: Option<&str>) -> bool {
+    let Some(n) = name else { return false };
+    let l = n.trim_start_matches('_').to_ascii_lowercase();
+    l.starts_with("assert")
+        || l.starts_with("check")
+        || l.starts_with("require")
+        || l.starts_with("only")
+        || l.starts_with("verify")
+        || l.starts_with("validate")
+        || l.starts_with("ensure")
+}
+
+/// A reentry-capable call site that genuinely ARMS reentrancy: an untrusted
+/// re-entry vector that is NOT an internal guard/assert helper. The guard-helper
+/// exclusion is the `setFeature`-shape protection (an `_assertOnly*()` check must
+/// never be read as the arming external call).
+fn is_arming_call(cs: &CallSite, trusted: &rustc_hash::FxHashSet<String>) -> bool {
+    is_reentry_vector(cs)
+        && !is_trusted_call(cs, trusted)
+        && !is_guard_helper_name(cs.func_name.as_deref())
 }
 
 /// True iff `f` performs a storage WRITE to one of `vars` STRICTLY AFTER a
-/// genuine (untrusted) reentrancy-capable external call. This is the concrete
-/// classic checks-effects-interactions violation: a write whose position index
-/// is greater than the external call's index. A write that precedes the call is
-/// the safe shape and does not count.
+/// genuine (untrusted) reentrancy-capable external call, AND that written var is
+/// VALUE/balance state (the thing re-entry actually corrupts). This is the
+/// concrete classic checks-effects-interactions violation: a value write whose
+/// position index is greater than the arming call's index. A write that precedes
+/// the call is the safe shape; a write to a non-value flag/registry var is
+/// bookkeeping; neither counts.
 fn has_qualifying_post_call_write(
     f: &Function,
     vars: &[String],
@@ -99,14 +174,13 @@ fn has_qualifying_post_call_write(
         .effects
         .call_sites
         .iter()
-        .filter(|cs| is_reentry_vector(cs) && !is_trusted_call(cs, trusted))
+        .filter(|cs| is_arming_call(cs, trusted))
         .map(|cs| cs.order)
         .min();
     let Some(first) = first_vector else { return false };
-    f.effects
-        .storage_writes
-        .iter()
-        .any(|w| w.order > first && vars.iter().any(|v| v == &w.var))
+    f.effects.storage_writes.iter().any(|w| {
+        w.order > first && is_value_state_var(&w.var) && vars.iter().any(|v| v == &w.var)
+    })
 }
 
 impl Detector for ReentrancyDetector {
@@ -123,10 +197,13 @@ impl Detector for ReentrancyDetector {
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
         let mut out = Vec::new();
         for f in cx.functions() {
-            // Trusted call targets for f's contract (immutable/constant + the
-            // owner/governance-set infrastructure names). Used to discount calls
-            // into in-protocol modules (`distributor`/`treasury`/`veFXS`/…).
-            let trusted = sluice_frontier::trusted_targets(cx.scir, f.contract);
+            // Trusted call targets for f's contract: immutable/constant + the
+            // owner/governance-set infrastructure names, PLUS the contract's own
+            // no-arg view/pure getters (`weth()`, `optimismPortal()`). Used to
+            // discount calls into in-protocol modules
+            // (`distributor`/`treasury`/`veFXS`/a getter-dispatched module). This
+            // mirrors the frontier exactly so detector and producer agree.
+            let trusted = sluice_frontier::reentrancy_trusted_targets(cx.scir, f.contract);
 
             for r in cx.frontier.reentrancy_of(f.id) {
                 if r.guarded || cx.has_reentrancy_guard(f) {
@@ -224,8 +301,24 @@ impl Detector for ReentrancyDetector {
                         "Apply checks-effects-interactions (update storage before the external call) \
                          and/or a `nonReentrant` guard covering all entry points sharing this state.",
                     );
-                // Value-flow corroboration: sending ETH makes re-entry trivial.
-                if f.effects.call_sites.iter().any(|c| c.sends_value) {
+                // Value-flow corroboration — and the Critical-severity cap (d).
+                // The final label is promoted to Critical only at THREE
+                // corroborating dimensions; Frontier+Invariant alone settle at
+                // High. We therefore add the ValueFlow dimension (the third) ONLY
+                // when re-entry is genuinely attacker-controlled: a value-bearing
+                // call to a CALLER-SUPPLIED target with a value-state write strictly
+                // after it (the `reentrancy.sol`/`curve_vyper` drain shape). A
+                // value send to an in-protocol/getter-dispatched callee, or a
+                // classic with no caller-supplied value vector, stays capped at
+                // High — so an unrecognized in-protocol call can no longer over-rank
+                // to Critical (the `claimCredit` shape). Read-only / cross-function
+                // keep their existing value-flow corroboration.
+                let caller_supplied_value = has_caller_supplied_value_vector(f, &trusted);
+                let add_value_flow = match r.kind {
+                    ReentrancyKind::Classic => caller_supplied_value,
+                    _ => f.effects.call_sites.iter().any(|c| c.sends_value),
+                };
+                if add_value_flow {
                     b = b.dimension(Dimension::ValueFlow);
                 }
                 out.push(cx.finish(b, f.id, r.span));
@@ -392,6 +485,100 @@ mod tests {
         assert!(
             fs.iter().any(|f| f.category == Category::Reentrancy),
             "classic reentrancy (write strictly after the external call) must fire"
+        );
+    }
+
+    // ---- FP5 (claimCredit shape): write-before-call, then a call dispatched off
+    // a no-arg view/pure getter that returns an in-protocol immutable module, must
+    // stay silent. Optimism `FaultDisputeGame.claimCredit`: `hasUnlockedCredit[r]`
+    // is set BEFORE `weth().unlock(...)` (CEI-correct), and the later value writes
+    // (`refundModeCredit`/`normalModeCredit`) follow ONLY trusted `weth()` calls;
+    // the one genuine caller-supplied value call has no write after it. ----
+    #[test]
+    fn silent_on_write_before_getter_dispatched_trusted_call() {
+        let src = r#"
+            interface IWETH {
+                function unlock(address a, uint256 v) external;
+                function withdraw(address a, uint256 v) external;
+            }
+            contract FaultDisputeGame {
+                mapping(address => bool) public hasUnlockedCredit;
+                mapping(address => uint256) public refundModeCredit;
+                mapping(address => uint256) public normalModeCredit;
+                // no-arg pure getter returning a clones-with-immutable-args module
+                function weth() public pure returns (IWETH) { return IWETH(address(1)); }
+                function claimCredit(address _recipient) external {
+                    uint256 c = refundModeCredit[_recipient];      // read before
+                    if (!hasUnlockedCredit[_recipient]) {
+                        hasUnlockedCredit[_recipient] = true;      // flag write BEFORE the call
+                        weth().unlock(_recipient, c);              // trusted getter-dispatched call
+                        return;
+                    }
+                    refundModeCredit[_recipient] = 0;              // value writes follow trusted calls only
+                    normalModeCredit[_recipient] = 0;
+                    weth().withdraw(_recipient, c);
+                    (bool ok,) = _recipient.call{value: c}("");    // caller-supplied call has NO write after
+                    require(ok, "fail");
+                }
+            }
+        "#;
+        assert!(
+            !fires(src),
+            "claimCredit shape (write-before-call then trusted getter-dispatched call) must stay silent"
+        );
+    }
+
+    // ---- FP6 (setFeature shape): an internal `_assertOnly*()` guard followed by a
+    // write to a NON-value bool feature flag must stay silent. Optimism
+    // `SystemConfig.setFeature`: opens with `_assertOnlyProxyAdminOrProxyAdminOwner()`
+    // (an internal guard, not an external re-entry vector) and the only state write
+    // is `isFeatureEnabled` — a bool flag, not value/balance state. ----
+    #[test]
+    fn silent_on_assert_guard_then_flag_write() {
+        let src = r#"
+            interface IPortal { function ethLockbox() external returns (address); }
+            contract SystemConfig {
+                mapping(bytes32 => bool) public isFeatureEnabled;
+                function _assertOnlyProxyAdminOrProxyAdminOwner() internal view { require(true); }
+                function optimismPortal() public view returns (address) { return address(2); }
+                function setFeature(bytes32 _feature, bool _enabled) external {
+                    _assertOnlyProxyAdminOrProxyAdminOwner();        // internal guard, not a re-entry vector
+                    if (_enabled == isFeatureEnabled[_feature]) revert();   // read before
+                    address lb = IPortal(optimismPortal()).ethLockbox();    // external getter call
+                    require(lb != address(0) || _enabled, "x");
+                    isFeatureEnabled[_feature] = _enabled;           // write AFTER — but a bool flag, not value state
+                }
+            }
+        "#;
+        assert!(
+            !fires(src),
+            "setFeature shape (internal assert guard, then a non-value flag write) must stay silent"
+        );
+    }
+
+    // The Critical cap (d): a classic finding whose value-bearing call targets a
+    // caller-supplied address (the genuine drain shape) is still allowed to carry
+    // the ValueFlow dimension, so it can corroborate up. This guards that the cap
+    // is a precision fix, not a blanket downgrade that would weaken true positives.
+    #[test]
+    fn caller_supplied_value_keeps_value_flow_dimension() {
+        let src = r#"
+            contract Bank {
+                mapping(address => uint256) public balances;
+                function withdraw(uint256 amt) external {
+                    uint256 bal = balances[msg.sender];
+                    require(bal >= amt);
+                    (bool ok,) = msg.sender.call{value: amt}("");  // caller-supplied value call
+                    require(ok);
+                    balances[msg.sender] = bal - amt;              // value write strictly after
+                }
+            }
+        "#;
+        let fs = reentrancy_findings(src);
+        let classic = fs.iter().find(|f| f.title.contains("classic")).expect("classic must fire");
+        assert!(
+            classic.dimensions.contains(&Dimension::ValueFlow),
+            "a caller-supplied value re-entry must retain the ValueFlow corroboration dimension"
         );
     }
 }

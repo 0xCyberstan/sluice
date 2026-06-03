@@ -82,7 +82,11 @@ impl FrontierFacts {
 
             // Map storage var -> view getters that read it (for read-only reentrancy).
             let view_readers = view_readers_of(scir, c.id);
-            let trusted = trusted_targets(scir, c.id);
+            // Trusted call targets: immutable/constant + governance infra
+            // (`trusted_targets`) AND the contract's own no-arg view/pure getters
+            // (`weth()`, `optimismPortal()`), which dispatch off in-protocol
+            // immutable addresses rather than attacker-controlled ones.
+            let trusted = reentrancy_trusted_targets(scir, c.id);
 
             for f in scir.functions_of(c.id) {
                 // Constructors run once at deploy and modifiers are analyzed via
@@ -398,6 +402,35 @@ fn is_trusted_infra_var(v: &sluice_ir::StateVar) -> bool {
     TRUSTED_INFRA.iter().any(|k| n.contains(k))
 }
 
+/// Same-contract NO-ARG `view`/`pure` getter names. A call whose target *root*
+/// is one of these (e.g. `weth().unlock(...)`, `optimismPortal().ethLockbox()`)
+/// dispatches off a value computed by an in-contract getter that returns an
+/// immutable / `clones-with-immutable-args` / fixed-storage address — it is the
+/// protocol's own wired module, not an attacker-controlled address. Treating the
+/// getter root as a trusted call target (alongside `trusted_targets`) removes the
+/// `claimCredit`-shape false positive where a write follows a `weth().withdraw()`
+/// call. Restricted to ZERO-parameter getters so that an attacker-parameterized
+/// lookup (`getPool(userToken)`) is never trusted on this basis. As with
+/// `is_trusted_external`, this only ever discounts a plain, non-value,
+/// non-token-transfer call — value-bearing and ERC-20/777 transfer calls stay
+/// reentrancy-capable regardless of how the receiver was obtained.
+pub fn view_getter_targets(scir: &Scir, cid: ContractId) -> FxHashSet<String> {
+    scir.functions_of(cid)
+        .filter(|f| f.is_view_or_pure() && f.params.is_empty() && !f.is_modifier())
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// The full set of trusted call-target roots for reentrancy reasoning: the
+/// owner/governance/immutable `trusted_targets` plus the same-contract no-arg
+/// view/pure getter names (`view_getter_targets`). Shared by the frontier and the
+/// reentrancy detector so both agree on which callees are in-protocol.
+pub fn reentrancy_trusted_targets(scir: &Scir, cid: ContractId) -> FxHashSet<String> {
+    let mut t = trusted_targets(scir, cid);
+    t.extend(view_getter_targets(scir, cid));
+    t
+}
+
 fn function_has_lock(f: &Function) -> bool {
     f.effects
         .guards
@@ -444,12 +477,18 @@ fn detect_cross_function(
     // an external call that is NOT followed by their own write (so classic
     // doesn't fire) but leaves shared state for siblings.
     let funcs: Vec<&Function> = scir.functions_of(cid).filter(|f| f.has_body).collect();
-    let trusted = trusted_targets(scir, cid);
+    let trusted = reentrancy_trusted_targets(scir, cid);
     for f in &funcs {
         // Cross-function reentrancy is about an EXTERNAL entry point leaving
         // shared state mid-call; internal helpers and constructors are not entry
-        // points an attacker calls directly.
-        if !f.is_externally_reachable() || f.is_constructor() {
+        // points an attacker calls directly. A `view`/`pure` function is also
+        // never the leaving-state vector: it WRITES nothing, so re-entering a
+        // sibling cannot find it mid-write. (A value getter that merely *exposes*
+        // mid-update state is read-only reentrancy, handled separately and gated
+        // on `is_value_oracle_getter`.) Flagging every `view` getter that happens
+        // to read a shared var and make an interface call was the dominant
+        // cross-function false-positive source on real code.
+        if !f.is_externally_reachable() || f.is_constructor() || f.is_view_or_pure() {
             continue;
         }
         let Some(first) = first_reentrant_call(f, &trusted, view_methods) else {
@@ -553,5 +592,59 @@ mod tests {
         );
         let w = scir.all_functions().find(|f| f.name == "withdraw").unwrap();
         assert!(facts.reentrancy_of(w.id).all(|r| r.guarded));
+    }
+
+    // A no-arg view/pure getter (`weth()`) is an in-protocol immutable module: a
+    // plain call dispatched off it must NOT arm classic reentrancy even when a
+    // value-state write follows it. (Optimism `FaultDisputeGame.claimCredit`
+    // shape: writes `refundModeCredit`/`normalModeCredit` after `weth().unlock`.)
+    #[test]
+    fn getter_dispatched_call_is_trusted() {
+        let (scir, facts) = analyze(
+            r#"
+            interface IWETH { function unlock(address a, uint256 v) external; }
+            contract Game {
+                mapping(address => uint256) public refundModeCredit;
+                function weth() public pure returns (IWETH) { return IWETH(address(1)); }
+                function claimCredit(address r) external {
+                    uint256 c = refundModeCredit[r];   // read before
+                    weth().unlock(r, c);               // call dispatched off a no-arg getter
+                    refundModeCredit[r] = 0;           // value write after — but trusted callee
+                }
+            }
+            "#,
+        );
+        let f = scir.all_functions().find(|f| f.name == "claimCredit").unwrap();
+        assert!(
+            !facts.reentrancy_of(f.id).any(|r| r.kind == ReentrancyKind::Classic),
+            "a write after a no-arg-getter-dispatched call must not record classic reentrancy"
+        );
+    }
+
+    // A `view`/`pure` function that reads a shared var and makes an interface call
+    // writes nothing, so it can never be the cross-function "leaves state mid-call"
+    // vector. (Optimism `GasPriceOracle.scalar`, `ProxyAdmin.getProxyImplementation`
+    // shape.) The mutating sibling shares the var, but only the read-only lens (a
+    // value-oracle getter) applies — never cross-function.
+    #[test]
+    fn view_getter_not_cross_function() {
+        let (scir, facts) = analyze(
+            r#"
+            interface IL1 { function feeData() external returns (uint256); }
+            contract Oracle {
+                bool public isEcotone;
+                function configure(bool e) external { isEcotone = e; }   // mutating sibling
+                function scalar() public view returns (uint256) {
+                    if (isEcotone) { return IL1(address(2)).feeData(); }  // reads shared var + call
+                    return 0;
+                }
+            }
+            "#,
+        );
+        let f = scir.all_functions().find(|f| f.name == "scalar").unwrap();
+        assert!(
+            !facts.reentrancy_of(f.id).any(|r| r.kind == ReentrancyKind::CrossFunction),
+            "a view/pure getter must not be flagged as the cross-function reentrancy vector"
+        );
     }
 }
