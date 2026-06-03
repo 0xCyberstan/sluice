@@ -301,6 +301,30 @@ These broaden Sluice beyond restaking (synthetic-dollar / RFQ-mint / ERC4626-sta
 6. **solver-convergence-trust** — off-chain `approx` guess fed to an iterative solver whose unbounded/clamped output is trusted without a convergence/residual check; MarketApproxLibV2.
 7. **ratio-denominator-sign-edge** — YT/PT-ratio math with `r − 1` style denominators that hit 0/sign-flip at the rate boundary.
 These open a 5th domain (yield-tokenization/AMM); the AMM-curve math is invisible to the name-gated rounding detector. Full SCIR signatures in the R12 WF3 transcript.
+
+### Round 13 — 7 Pendle yield-tokenization/AMM detectors (worktree agents) — a 6th domain
+- **Result:** +7 → **84 active** (40 novel classes across 6 DeFi domains). Authored by 7 worktree agents via the prelude.
+  Independent dogfood: **all 7 fire on the real Pendle target** (24 hits on the SY-rate/index/curve/solver math),
+  **0 R13 FPs on all 7 other codebases** (olympus 92 / eigenlayer 24 / etherfi 126 / symbiotic 41 / karak 15 / renzo 50 /
+  ethena 31 — unchanged). Classes: sy-rate-jump-trust, monotone-clamp-negative-yield, post-expiry-dual-index,
+  curve-logit-domain-edge, stale-anchor-reset, solver-convergence-trust, ratio-denominator-sign-edge. The AMM-curve
+  math (ln/exp/logit, rate-scalar/anchor) was previously invisible to the name-gated rounding detector — now covered.
+  (solver-convergence-trust fires 12× on Pendle's router — eager on the target, 0-FP elsewhere; a Pendle-specific tighten
+  candidate, not a regression.) 419 tests, 0 warnings, corpus 20/20 + 8/8.
+
+#### R14+ STRATEGIC backlog (R13 WF3 completeness-critic — the structural blind spots; steers the next several rounds)
+Whole DeFi domains with ZERO detectors today. Ranked by payout × matchability × non-overlap; each tied to a real on-disk target:
+1. **interest-index-desync** (lending) — debt/LTV checked against a STALE interest accumulator (RO index gates a write). Target: Olympus `MonoCooler.sol` (interestAccumulatorRay, _globalStateRO vs RW). ≠ LiquidationAbuse (that's seize/bonus only).
+2. **rfq-fill-accounting** (intent/RFQ) — signed-order fill where fee/making/taking split isn't reconciled to the signed amounts, or partial-fill residual replay. Target: Pendle `PendleLimitRouter`/`LimitMathCore` (limitRouterCallback), Ethena `EthenaMinting`. ≠ SolverConvergence (that's approx-swap).
+3. **bad-debt-socialization** — insolvent loss written off against a shared pool index/totalAssets (all depositors eat it) or never deducted (last-redeemer holds the loss).
+4. **vote-weight-checkpoint** (governance) — quorum/vote weight from a manipulable checkpoint/snapshot or flash-acquired balance.
+5. **feegrowth-accounting** (concentrated-liquidity AMM) — tick/sqrtPrice rounding + fee-growth/liquidity-delta accounting.
+6. **perp-funding-mark** (perps) — funding-rate / mark-vs-index manipulation, ADL/insurance-fund accounting.
+7. **param-update-retroactive** — collateral-factor/LTV update applies retroactively to existing positions (no migration/grace).
+8. **tstore-guard-bypass** — EIP-1153 transient-storage reentrancy guard incorrectly scoped/cleared.
+9. **aa-paymaster-validation** — ERC-4337 paymaster/validation-phase storage-rule violation / griefing.
+10. **nft-claim-stale-rate** — NFT-fi redemption/withdrawal-queue claim at a stale rate.
+Lending (#1/#3) + RFQ (#2) are the highest-leverage next targets (huge TVL class, real on-disk targets, clean non-overlap). Full signatures in the R13 WF3 transcript.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector

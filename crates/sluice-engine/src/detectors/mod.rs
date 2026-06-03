@@ -97,6 +97,14 @@ pub mod vesting_buffered_donation;
 pub mod one_sided_peg_band;
 pub mod delegated_signer_single_step;
 pub mod preauth_callout_target;
+// Round 13 (perpetual loop) — Pendle yield-tokenization / AMM-curve classes.
+pub mod curve_logit_domain_edge;
+pub mod sy_rate_jump_trust;
+pub mod monotone_clamp_negative_yield;
+pub mod post_expiry_dual_index;
+pub mod stale_anchor_reset;
+pub mod solver_convergence_trust;
+pub mod ratio_denominator_sign_edge;
 
 use crate::detector::Detector;
 
@@ -205,6 +213,14 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(one_sided_peg_band::OneSidedPegBandDetector),
         Box::new(delegated_signer_single_step::DelegatedSignerSingleStepDetector),
         Box::new(preauth_callout_target::PreAuthCalloutTargetDetector),
+        // Round 13 — Pendle yield-tokenization / AMM-curve classes.
+        Box::new(curve_logit_domain_edge::CurveLogitDomainEdgeDetector),
+        Box::new(sy_rate_jump_trust::SyRateJumpTrustDetector),
+        Box::new(monotone_clamp_negative_yield::MonotoneClampNegativeYieldDetector),
+        Box::new(post_expiry_dual_index::PostExpiryDualIndexDetector),
+        Box::new(stale_anchor_reset::StaleAnchorResetDetector),
+        Box::new(solver_convergence_trust::SolverConvergenceTrustDetector),
+        Box::new(ratio_denominator_sign_edge::RatioDenominatorSignEdgeDetector),
     ]
 }
 
