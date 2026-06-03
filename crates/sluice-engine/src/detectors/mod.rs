@@ -90,6 +90,13 @@ pub mod clamp_residual_burn;
 pub mod external_root_caller_timestamp;
 pub mod proof_admission_only;
 pub mod shares_escrowed_repriced;
+// Round 12 (perpetual loop) — Ethena-mined classes.
+pub mod eip712_typehash_mismatch;
+pub mod escrow_exit_restriction_gap;
+pub mod vesting_buffered_donation;
+pub mod one_sided_peg_band;
+pub mod delegated_signer_single_step;
+pub mod preauth_callout_target;
 
 use crate::detector::Detector;
 
@@ -191,6 +198,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(clamp_residual_burn::ClampResidualBurnDetector),
         Box::new(proof_admission_only::ProofAdmissionOnlyDetector),
         Box::new(external_root_caller_timestamp::ExternalRootCallerTimestampDetector),
+        // Round 12 — Ethena-mined classes.
+        Box::new(eip712_typehash_mismatch::Eip712TypehashMismatchDetector),
+        Box::new(escrow_exit_restriction_gap::EscrowExitRestrictionGapDetector),
+        Box::new(vesting_buffered_donation::VestingBufferedDonationDetector),
+        Box::new(one_sided_peg_band::OneSidedPegBandDetector),
+        Box::new(delegated_signer_single_step::DelegatedSignerSingleStepDetector),
+        Box::new(preauth_callout_target::PreAuthCalloutTargetDetector),
     ]
 }
 

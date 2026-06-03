@@ -281,6 +281,26 @@ R7–R9 were all novel-detector rounds; the roadmap says interleave the optimiza
 5. **delegated-signer-single-step** — a signer/authorization delegate installed in one step (no two-step accept handshake).
 6. **pre-auth-callout-to-caller-supplied-target** — EIP-1271/external auth call dispatched to an attacker-named address BEFORE authorization.
 These broaden Sluice beyond restaking (synthetic-dollar / RFQ-mint / ERC4626-staking) and have ground truth (the user's confirmed Ethena High + Mediums). Full SCIR signatures in the R11 WF3 transcript.
+
+### Round 12 — 6 Ethena synthetic-dollar detectors (worktree agents) — detects a REAL confirmed High
+- **Result:** +6 → **77 active** (33 novel classes across 5 DeFi domains). Authored by 6 worktree agents via the prelude.
+  Independent dogfood: **0 R12 FPs on all 7 prior codebases** (olympus 92 / eigenlayer 24 / pendle 81 / etherfi 126 /
+  symbiotic 41 / karak 15, unchanged); on real Ethena, **`escrow-exit-restriction-gap` fires on the exact shape of the
+  confirmed High** the user's own audit found, `vesting-buffered-donation` detects the rate-donation Medium, and
+  `one-sided-peg-band` fires 3×. The 3 signature/auth detectors (eip712-typehash-mismatch / delegated-signer-single-step
+  / preauth-callout-target) stay silent on Ethena (it lacks those specific defects) — tight, 0-FP, self-test-validated,
+  correctly dormant (a possible later real-target-tuning candidate, but no regression). 379 tests, 0 warnings, corpus
+  20/20 + 8/8. **Milestone: a Sluice detector fires on a real, independently-confirmed High in a live protocol.**
+
+#### R13 candidate backlog (R12 WF3 research on PENDLE yield-tokenization/AMM — a 5th domain, none overlap the 77)
+1. **sy-exchange-rate-jump-trust** — external `exchangeRate()`/`pricePerShare` feeds pricing with monotonic `max()` clamp but NO per-update jump bound; PendleYieldToken.sol:406 (≠ price-bounds=Chainlink, ≠ crosschain-rate-staleness=timestamp).
+2. **monotone-clamp-masks-negative-yield** — `index = max(externalRate, stored)` self-ratchet hides a real loss (negative yield) → phantom YT interest/redemption; PendleYieldToken.sol:406 + InterestManagerYT.sol:76.
+3. **post-expiry-dual-index-settlement** — principal vs accrued-yield settled with two different indices (frozen `firstPYIndex` vs live) at a lazily-set, attacker-timeable freeze; PendleYieldToken.sol:353-392.
+4. **curve-logit-domain-edge** — `ln/exp` + `logit(proportion)` AMM math floor-divides near the 1.0/MAX_PROPORTION singularity; MarketMathCore (escapes name-gated rounding.rs).
+5. **stale-anchor-reset-first-trade** — implied-rate anchor reset on first trade after dormancy (spot-implied-rate manipulation window).
+6. **solver-convergence-trust** — off-chain `approx` guess fed to an iterative solver whose unbounded/clamped output is trusted without a convergence/residual check; MarketApproxLibV2.
+7. **ratio-denominator-sign-edge** — YT/PT-ratio math with `r − 1` style denominators that hit 0/sign-flip at the rate boundary.
+These open a 5th domain (yield-tokenization/AMM); the AMM-curve math is invisible to the name-gated rounding detector. Full SCIR signatures in the R12 WF3 transcript.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector
