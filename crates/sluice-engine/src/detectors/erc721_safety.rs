@@ -32,8 +32,17 @@
 //!     or in a contract that plainly deals in ERC-721. The recipient is keyed on
 //!     the 3-argument ERC-721 position (`from, to, tokenId` → `to == args[1]`), so
 //!     the 4-argument SafeERC20 library form `safeTransferFrom(token, from, to,
-//!     amount)` (whose `to` is `args[2]`) does **not** match — this keeps the
-//!     detector off ordinary ERC-20 code.
+//!     amount)` (whose `to` is `args[2]`) does **not** match.
+//!   * The token handle must not be an explicit **ERC-20**: an `IERC20(...)` /
+//!     `IERC20Upgradeable(...)` cast receiver, or a handle whose declared type
+//!     contains `erc20` (`IERC20`, `IERC20Upgradeable`, ...), is suppressed even
+//!     when the contract incidentally mentions `721`/`nft` elsewhere. This keeps
+//!     the detector off 3-argument ERC-20 transfers — `IERC20(x).safeTransferFrom(
+//!     a,b,amt)` and `eETH.transferFrom(a,b,amt)` (`eETH` typed `IERC20*`) — whose
+//!     third argument is an *amount*, not a tokenId.
+//!   * The 5-argument `safeTransferFrom(from, to, id, amount, data)` is the
+//!     **ERC-1155** signature (also `to == args[1]`); it is left to the
+//!     `unchecked-erc1155-receiver` detector and not reported here.
 //!   * Suppressed when the contract can safely receive: it defines
 //!     `onERC721Received`, or inherits `ERC721Holder` / `IERC721Receiver` /
 //!     `ERC721TokenReceiver`, or never custodies an NFT (only sends them out).
@@ -180,22 +189,42 @@ fn find_nft_pull_in(cx: &AnalysisContext, c: &Contract) -> Option<PullIn> {
                 // `safeTransferFrom(from, to, tokenId[, data])` both put `to` at
                 // args[1]. The SafeERC20 library form `safeTransferFrom(token, from,
                 // to, amount)` puts `to` at args[2], so it will not match here —
-                // which is exactly what keeps this detector off ERC-20 code.
+                // which is exactly what keeps this detector off the SafeERC20 form.
                 let Some(to_arg) = call.args.get(1) else { return };
                 if !arg_is_address_this(to_arg) {
+                    return;
+                }
+                // The 5-argument `safeTransferFrom(from, to, id, amount, data)` is
+                // the **ERC-1155** signature (it also puts `to` at args[1]). It is
+                // not ERC-721 — leave it to the `unchecked-erc1155-receiver`
+                // detector. The ERC-721 forms are `transferFrom(from,to,id)` (3),
+                // `safeTransferFrom(from,to,id)` (3), and `safeTransferFrom(from,to,
+                // id,data)` (4), so anything with 5+ args is out of scope here.
+                if call.args.len() >= 5 {
+                    return;
+                }
+                // Resolve the token handle's textual type once (cast type, or the
+                // declared type of the receiver's root param / state var).
+                let handle_ty = call.receiver.as_deref().and_then(|r| handle_type(c, f, r));
+                // Precision rule (A): an explicitly ERC-20 handle is never an NFT
+                // pull-in, regardless of any incidental `721`/`nft` mention in the
+                // contract. This covers `IERC20(x).safeTransferFrom(a,b,amt)` /
+                // `IERC20Upgradeable(x)...` casts and `IERC20*`/`...ERC20...`-typed
+                // state vars / params (e.g. `eETH` typed `IERC20Upgradeable`). A
+                // 3-arg `transferFrom(from,to,X)` is otherwise ambiguous (ERC-20
+                // amount vs ERC-721 tokenId); resolving the handle to ERC-20 settles
+                // it as an ERC-20 transfer and suppresses the finding.
+                if handle_ty.as_deref().is_some_and(type_is_erc20) {
                     return;
                 }
                 // NFT-ness gate (precision): the moved asset must look like an NFT,
                 // not an ERC-20. Strongest signal is an NFT-typed handle (the
                 // receiver root resolves to a state var / param whose type mentions
-                // `721`/`nft`). Otherwise accept `safeTransferFrom` in a contract
-                // that plainly deals in ERC-721, or a `transferFrom` likewise.
-                let handle_is_nft = call
-                    .receiver
-                    .as_deref()
-                    .and_then(|r| handle_type(c, f, r))
-                    .map(|ty| type_is_nfty(&ty))
-                    .unwrap_or(false);
+                // `721`/`nft`, or an `IERC721(...)` cast). Otherwise accept the call
+                // in a contract that plainly deals in ERC-721 (`source_is_nfty`
+                // corroboration) — but only because an explicitly-ERC-20 handle has
+                // already been ruled out above.
+                let handle_is_nft = handle_ty.as_deref().is_some_and(type_is_nfty);
                 if !handle_is_nft && !contract_is_nfty {
                     return;
                 }
@@ -276,6 +305,15 @@ fn type_is_nfty(ty: &str) -> bool {
     l.contains("721") || l.contains("nft")
 }
 
+/// A declared type that denotes an ERC-20 (fungible-token) handle: an `IERC20`
+/// cast / `IERC20`, `IERC20Upgradeable`, `IERC20Metadata`, `ERC20`, ... typed
+/// state var or parameter. Matched as a case-insensitive substring on `erc20`,
+/// which an ERC-721 type (`721`/`nft`) never contains — so this is a clean,
+/// higher-priority disqualifier for the NFT pull-in heuristic.
+fn type_is_erc20(ty: &str) -> bool {
+    ty.to_ascii_lowercase().contains("erc20")
+}
+
 /// The contract source plainly references ERC-721 (an `IERC721`/`ERC721`/`nft`
 /// mention). Used as corroboration that a `transferFrom`/`safeTransferFrom` into
 /// `address(this)` moves an NFT rather than an ERC-20.
@@ -342,5 +380,106 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "erc721-safety"));
+    }
+
+    // Regression (etherfi F-110): an explicit `IERC20(...)` cast receiver doing a
+    // 3-arg `safeTransferFrom(from, address(this), amount)` is an ERC-20 *amount*
+    // transfer, not an ERC-721 pull-in. The contract incidentally mentions
+    // `recoverERC721` (so the source-level `721`/`nft` corroboration is TRUE, as in
+    // the real `LiquidityPool`/`PriorityWithdrawalQueue`), which is exactly what
+    // made the old heuristic fire. The explicit `IERC20` cast must suppress it.
+    const ERC20_CAST_3ARG: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IERC20 {
+            function safeTransferFrom(address from, address to, uint256 amount) external;
+        }
+        contract Redemption {
+            IERC20 public eEth;
+            function redeem(uint256 eEthAmount) external {
+                IERC20(address(eEth)).safeTransferFrom(msg.sender, address(this), eEthAmount);
+            }
+            // Incidental NFT mention — corroboration tripwire for the old gate.
+            function recoverERC721(address token, address to, uint256 tokenId) external {}
+        }
+    "#;
+
+    // Regression (etherfi F-115): a 3-arg `eETH.transferFrom(from, address(this),
+    // amount)` where the `eETH` handle is typed `IERC20Upgradeable`. The third
+    // argument is an amount (ERC-20), not a tokenId. As in the real `WeETH` (which
+    // also defines `recoverERC721`), the contract mentions `721`, tripping the
+    // source corroboration — but the `IERC20*`-typed handle must suppress it.
+    const ERC20_TYPED_3ARG: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IERC20Upgradeable {
+            function transferFrom(address from, address to, uint256 amount) external returns (bool);
+        }
+        contract WrappedToken {
+            IERC20Upgradeable public eETH;
+            function wrap(uint256 eETHAmount) external {
+                eETH.transferFrom(msg.sender, address(this), eETHAmount);
+            }
+            function recoverERC721(address token, address to, uint256 tokenId) external {}
+        }
+    "#;
+
+    // Regression (rule C): the 5-arg `safeTransferFrom(from, to, id, amount, data)`
+    // is the ERC-1155 signature; it must NOT be reported under `erc721-safety`
+    // (the `unchecked-erc1155-receiver` detector owns it). The `nft`-named handle
+    // and the `721` mention make BOTH NFT-ness signals true here, so the *only*
+    // thing that can suppress this finding is the 5-argument (ERC-1155) rule — the
+    // test would fail without it.
+    const ERC1155_5ARG: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IERC721 {
+            function safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes calldata data) external;
+        }
+        contract Vault {
+            IERC721 public nft;
+            function deposit(uint256 id, uint256 amount) external {
+                nft.safeTransferFrom(msg.sender, address(this), id, amount, "");
+            }
+        }
+    "#;
+
+    // Positive control (rule A's NFT counterpart): a genuine ERC-721 pull-in via an
+    // explicit `IERC721(...)` cast receiver into `address(this)`, on a contract with
+    // no `onERC721Received` — must still fire.
+    const VULN_CAST: &str = r#"
+        pragma solidity ^0.8.20;
+        interface IERC721 {
+            function safeTransferFrom(address from, address to, uint256 tokenId) external;
+        }
+        contract NftEscrow {
+            address public nft;
+            mapping(uint256 => address) public depositorOf;
+            function stake(uint256 tokenId) external {
+                depositorOf[tokenId] = msg.sender;
+                IERC721(nft).safeTransferFrom(msg.sender, address(this), tokenId);
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_erc20_cast_3arg() {
+        let fs = run(ERC20_CAST_3ARG);
+        assert!(!fs.iter().any(|f| f.detector == "erc721-safety"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_erc20_typed_3arg() {
+        let fs = run(ERC20_TYPED_3ARG);
+        assert!(!fs.iter().any(|f| f.detector == "erc721-safety"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_erc1155_5arg() {
+        let fs = run(ERC1155_5ARG);
+        assert!(!fs.iter().any(|f| f.detector == "erc721-safety"), "{:?}", fs);
+    }
+
+    #[test]
+    fn fires_on_ierc721_cast_pull_in() {
+        let fs = run(VULN_CAST);
+        assert!(fs.iter().any(|f| f.detector == "erc721-safety"), "{:?}", fs);
     }
 }

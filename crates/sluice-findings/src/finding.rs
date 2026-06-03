@@ -91,6 +91,7 @@ pub enum Category {
     LpSlippage,
     Erc1155Safety,
     SignedCast,
+    UntrustedCallTarget,
     Other,
 }
 
@@ -157,6 +158,7 @@ impl Category {
             LpSlippage => "lp-slippage",
             Erc1155Safety => "unchecked-erc1155-receiver",
             SignedCast => "signed-cast",
+            UntrustedCallTarget => "untrusted-call-target",
             Other => "other",
         }
     }
@@ -205,6 +207,7 @@ impl Category {
             LpSlippage => &["CWE-682"],
             Erc1155Safety => &["CWE-20"],
             SignedCast => &["CWE-196", "CWE-681"],
+            UntrustedCallTarget => &["CWE-345", "CWE-20", "CWE-863"],
             _ => &[],
         }
     }

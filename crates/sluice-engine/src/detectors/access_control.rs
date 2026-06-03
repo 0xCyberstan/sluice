@@ -31,7 +31,16 @@ impl Detector for AccessControlDetector {
                     // are intentionally permissionless — neither is a missing-guard
                     // bug, so don't report them as consensus violations.
                     if let Some(f) = cx.scir.function(v.function) {
-                        if cx.is_initializer(f) || is_user_facing(&f.name) || is_framework_hook(&f.name) {
+                        // A function with its own inline `require(msg.sender == …)`
+                        // guard is not "missing" the sibling guard — it enforces it
+                        // in a different form. (The root cause is also fixed in
+                        // effects ordering, but this keeps the consensus path robust
+                        // to any guard the miner doesn't model.)
+                        if cx.has_access_control(f)
+                            || cx.is_initializer(f)
+                            || is_user_facing(&f.name)
+                            || is_framework_hook(&f.name)
+                        {
                             continue;
                         }
                     }

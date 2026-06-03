@@ -221,6 +221,25 @@ impl<'a> EffectCollector<'a> {
     }
 
     fn walk_call(&mut self, c: &Call, span: Span, return_checked: bool) {
+        // A `require`/`assert` guard must claim its order BEFORE its condition is
+        // walked. An external/internal call *inside* the condition — e.g.
+        // `require(msg.sender == authority.governor())` or
+        // `require(hasRole(ADMIN, msg.sender))` — would otherwise be assigned an
+        // earlier order than the guard, become the function's "first effect", and
+        // push the guard past the leading-guard cutoff in `collect()`, silently
+        // dropping a real access-control guard (and so under-suppressing every
+        // detector that keys on `has_access_control`). Claim the order first, build
+        // the guard, then walk the condition (whose nested calls get later orders).
+        if matches!(c.kind, CallKind::Builtin(Builtin::Require) | CallKind::Builtin(Builtin::Assert)) {
+            let ord = self.next();
+            if let Some(cond) = c.args.first() {
+                self.require_candidates.push((ord, mk_guard(cond)));
+            }
+            for a in &c.args {
+                self.walk_expr(a);
+            }
+            return;
+        }
         // Walk receiver/args/value first (they are evaluated before the call).
         if let Some(r) = &c.receiver {
             self.walk_expr(r);
@@ -240,12 +259,8 @@ impl<'a> EffectCollector<'a> {
             }
             CallKind::Builtin(b) => {
                 match b {
-                    Builtin::Require | Builtin::Assert => {
-                        let ord = self.next();
-                        if let Some(cond) = c.args.first() {
-                            self.require_candidates.push((ord, mk_guard(cond)));
-                        }
-                    }
+                    // `Require`/`Assert` are handled at the top of `walk_call` (they
+                    // claim their order before their condition is walked).
                     Builtin::ArrayPushPop => {
                         // `arr.push(x)` grows storage — record as a write.
                         if let Some(r) = &c.receiver {

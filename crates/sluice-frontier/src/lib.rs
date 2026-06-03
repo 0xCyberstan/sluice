@@ -51,6 +51,14 @@ pub struct ReentrancyRisk {
     pub guarded: bool,
     /// Storage variables written after the external call.
     pub vars_written_after: Vec<String>,
+    /// True iff the path that produced this risk contains at least one genuine
+    /// reentrancy-capable external / low-level call (`.call`/`.delegatecall`/a
+    /// non-view interface call/`.transfer`/`.send`). For `Classic`/`CrossFunction`
+    /// this is the flagged function's own call; for `ReadOnly` it reflects the
+    /// *mutating writer* path that seeded the getter. A risk with this set to
+    /// `false` must never be reported — a function whose effects contain no
+    /// external/low-level call site cannot be reentered.
+    pub backed_by_call: bool,
     pub span: Span,
 }
 
@@ -126,6 +134,16 @@ impl FrontierFacts {
                         .filter(|r| r.order < first)
                         .map(|r| r.var.as_str())
                         .collect();
+                    // A qualifying post-call state update: a write whose position
+                    // index is STRICTLY GREATER than the external call's index
+                    // (`w.order > first`) AND whose variable was read before the
+                    // call (its stale value is what re-entry corrupts). A write
+                    // that PRECEDES the call (`w.order <= first`, e.g.
+                    // `proposal.executed = true;` before a timelock call) is the
+                    // safe checks-effects-interactions shape and must NEVER be
+                    // treated as the vulnerable post-call update. If no such write
+                    // exists, there is nothing an attacker can corrupt by
+                    // re-entering, so no classic risk is recorded at all.
                     let vars_after: Vec<String> = f
                         .effects
                         .storage_writes
@@ -134,17 +152,26 @@ impl FrontierFacts {
                         .map(|w| w.var.clone())
                         .collect();
                     if !vars_after.is_empty() {
+                        // `first` is, by construction, the order of a genuine
+                        // reentrancy-capable, non-trusted external/low-level call
+                        // (see `first_reentrant_call`), so this risk is backed by a
+                        // real re-entry vector.
                         facts.reentrancy.push(ReentrancyRisk {
                             function: f.id,
                             contract: c.id,
                             kind: ReentrancyKind::Classic,
                             guarded,
                             vars_written_after: dedup(vars_after.clone()),
+                            backed_by_call: true,
                             span: f.span,
                         });
 
-                        // Read-only reentrancy: a view getter reads one of the
-                        // vars updated after the call.
+                        // Read-only reentrancy: a value/price-like view getter reads
+                        // one of the vars this mutating path updates AFTER its real
+                        // external call. The re-entry vector lives on THIS writer
+                        // path (which has a genuine call), not in the getter, so the
+                        // read-only risk is `backed_by_call: true` even though the
+                        // getter itself makes no external call.
                         for v in &vars_after {
                             if let Some(getters) = view_readers.get(v) {
                                 if let Some(getter) = getters.first() {
@@ -154,6 +181,7 @@ impl FrontierFacts {
                                         kind: ReentrancyKind::ReadOnly,
                                         guarded: false, // view fns are typically unguarded
                                         vars_written_after: vec![v.clone()],
+                                        backed_by_call: true,
                                         span: scir.function(*getter).map(|g| g.span).unwrap_or(f.span),
                                     });
                                 }
@@ -291,24 +319,83 @@ fn is_token_transfer_method(name: Option<&str>) -> bool {
 }
 
 /// Leading identifier of a textual call target (`MINTR.x[y]` -> `MINTR`).
-fn target_root(target: &str) -> &str {
+pub fn target_root(target: &str) -> &str {
     target
         .split(|c: char| c == '.' || c == '(' || c == '[' || c == ' ')
         .next()
         .unwrap_or(target)
 }
 
-/// State variables that are immutable or constant addresses — trusted targets.
-fn trusted_targets(scir: &Scir, cid: ContractId) -> FxHashSet<String> {
+/// State variables that are trusted call targets — calls to them (when the call
+/// is a plain, non-value, non-token-transfer external method invocation, see
+/// `is_trusted_external`) are not attacker-controlled re-entry vectors. Two
+/// sources of trust:
+///   1. `immutable`/`constant` address vars: wired once at construction (WETH, a
+///      router, an in-protocol module) and never reassignable.
+///   2. Owner/governance-set protocol infrastructure: an address-typed var whose
+///      NAME matches a well-known trusted-component pattern (`distributor`,
+///      `treasury`, `timelock`, `veFXS`, a `gauge`/`minter`/`staking` module,
+///      etc.). These are set by privileged setters to in-protocol contracts, so a
+///      method call into them is not an open re-entry surface. This is the
+///      `harvest`-calls-`distributor`/`treasury` false-positive class.
+/// Mapping/array/numeric vars are never trusted targets (they are not addresses).
+pub fn trusted_targets(scir: &Scir, cid: ContractId) -> FxHashSet<String> {
     scir.contract(cid)
         .map(|c| {
             c.state_vars
                 .iter()
-                .filter(|v| v.immutable || v.constant)
+                .filter(|v| v.immutable || v.constant || is_trusted_infra_var(v))
                 .map(|v| v.name.clone())
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// True for an address/interface-typed state var whose name reads like a piece of
+/// owner/governance-configured protocol infrastructure (a module the protocol
+/// itself deploys/sets, not an end-user-supplied address). Used to extend the
+/// trusted-target set beyond `immutable`/`constant`.
+fn is_trusted_infra_var(v: &sluice_ir::StateVar) -> bool {
+    // Must be address-like: an explicit `address`, or a custom/interface type
+    // (capitalized type name, e.g. `ITreasury`, `IDistributor`). Exclude
+    // mappings, arrays, and value types — those are never call targets.
+    let ty = v.ty.trim();
+    let address_like = ty == "address"
+        || ty == "address payable"
+        || (!v.is_mapping()
+            && !ty.contains('[')
+            && !v.is_scalar_numeric()
+            && !ty.starts_with("string")
+            && !ty.starts_with("bytes")
+            && ty.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
+    if !address_like {
+        return false;
+    }
+    let n = v.name.trim_start_matches('_').to_ascii_lowercase();
+    const TRUSTED_INFRA: &[&str] = &[
+        "distributor",
+        "treasury",
+        "vefxs",
+        "vefx",
+        "timelock",
+        "staking",
+        "gauge",
+        "minter",
+        "rewarder",
+        "rewards",
+        "controller",
+        "comptroller",
+        "registry",
+        "router",
+        "factory",
+        "vault",
+        "module",
+        "kernel",
+        "authority",
+        "governor",
+        "governance",
+    ];
+    TRUSTED_INFRA.iter().any(|k| n.contains(k))
 }
 
 fn function_has_lock(f: &Function) -> bool {
@@ -406,6 +493,9 @@ fn detect_cross_function(
                     kind: ReentrancyKind::CrossFunction,
                     guarded: false,
                     vars_written_after: dedup(shared),
+                    // `first` came from `first_reentrant_call`, so `f` makes a
+                    // genuine reentrancy-capable external/low-level call.
+                    backed_by_call: true,
                     span: f.span,
                 });
                 break;

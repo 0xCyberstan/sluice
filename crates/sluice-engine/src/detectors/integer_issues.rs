@@ -14,7 +14,7 @@ use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::detectors::visit_calls;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{BinOp, CallKind, Expr, ExprKind};
+use sluice_ir::{BinOp, CallKind, Expr, ExprKind, UnOp};
 
 pub struct IntegerIssuesDetector;
 
@@ -54,7 +54,16 @@ impl Detector for IntegerIssuesDetector {
             // On >=0.8, `has_unchecked_math` is set *only* for arithmetic inside
             // an `unchecked { }` block — plain checked +/-/* never set it — so we
             // are not flagging compiler-protected math.
-            if f.effects.has_unchecked_math && takes_attacker_input {
+            //
+            // SUPPRESSION (F) — SAFE UNCHECKED: the canonical `unchecked { x =
+            // nonce + 1; }` / `unchecked { ++counter; }` increment of a 256-bit
+            // accumulator is not a reachable overflow (2^256 increments are
+            // infeasible), and `unchecked` there is the standard gas
+            // optimization. If *every* arithmetic op inside the function's
+            // `unchecked` blocks is an increment-by-one, this is that pattern and
+            // we stay silent. Any other unchecked arithmetic (`+ amount`, `- x`,
+            // `* y`) still fires.
+            if f.effects.has_unchecked_math && takes_attacker_input && !unchecked_is_only_increment(f) {
                 let b = FindingBuilder::new(self.id(), Category::UncheckedMath)
                     .title("Unchecked arithmetic on attacker-controlled input")
                     .severity(Severity::Medium)
@@ -76,6 +85,15 @@ impl Detector for IntegerIssuesDetector {
 
             // ---- (2) narrowing downcast of an attacker-controlled / large value ----
             if !uses_safecast {
+                // SUPPRESSION (D) — DOMINATING GUARD: a function whose body has a
+                // `type(uint...)`-bounds check feeding a `revert`/`require` (e.g.
+                // `if (amount > type(uint96).max) revert E();`) has already proven
+                // its values fit before narrowing. Suppress this function's
+                // unsigned downcast findings entirely. Computed once per function.
+                let fn_src = cx.source_text(f.span);
+                let has_dominating_guard = fn_src.contains("type(uint")
+                    && (fn_src.contains("revert") || fn_src.contains("require"));
+
                 visit_calls(f, |c, span| {
                     if c.kind != CallKind::TypeCast {
                         return;
@@ -90,6 +108,46 @@ impl Detector for IntegerIssuesDetector {
 
                     // Single-argument cast only; the argument is the value cast.
                     let Some(arg) = c.args.first() else { return };
+                    if c.args.len() != 1 {
+                        return;
+                    }
+
+                    // SUPPRESSION (A) — WIDTH-SAFE: the operand provably cannot
+                    // exceed the target width, so truncation can never drop a set
+                    // bit. Kills `uint160(address(x))`, `uint32(bytes4_var)`,
+                    // `int128(uint128(uint64_var))`, and (via the nested-cast peel)
+                    // the inner `uint160(msg.sender)` of
+                    // `bytes32(uint256(uint160(msg.sender)))`.
+                    if let Some(operand_bits) = operand_max_bits(cx, f, arg) {
+                        if operand_bits <= bits {
+                            return;
+                        }
+                    }
+
+                    // SUPPRESSION (B) — CLAMPED: `uintN(_min(x, type(uintN).max))`
+                    // is explicitly saturated to the target max before narrowing,
+                    // so it cannot truncate. Detect the `min(` + `type(uint` shape
+                    // in the cast's own source span.
+                    let cast_src = cx.source_text(span);
+                    if cast_src.contains("min(") && cast_src.contains("type(uint") {
+                        return;
+                    }
+
+                    // SUPPRESSION (C) — DIVISION-DOWN: `uintN(a / b)` shrinks the
+                    // value monotonically (integer division rounds toward zero),
+                    // so casting a quotient does not introduce a fresh truncation
+                    // hazard the author did not already reason about. Kills
+                    // `uint32((t - g) / s)`.
+                    if matches!(&arg.kind, ExprKind::Binary { op: BinOp::Div, .. }) {
+                        return;
+                    }
+
+                    // SUPPRESSION (D) — see `has_dominating_guard` above. Only
+                    // applies to unsigned (`uintN`) narrowings, matching the
+                    // `type(uintN).max` guard idiom.
+                    if has_dominating_guard && ty.trim_start().starts_with("uint") {
+                        return;
+                    }
 
                     // Suppress provably-bounded values (constant literals can't
                     // overflow the target unless written that way on purpose).
@@ -102,6 +160,8 @@ impl Detector for IntegerIssuesDetector {
                         return;
                     }
 
+                    // (E) LOCATION: report at the cast expression `span` (the
+                    // `uintN(...)` site), never `f.span`/the signature line.
                     let b = FindingBuilder::new(self.id(), Category::IntegerOverflow)
                         .title(format!("Narrowing downcast to `{ty}` silently truncates high bits"))
                         .severity(Severity::Medium)
@@ -256,6 +316,143 @@ fn is_zero_lit(e: &Expr) -> bool {
         })
 }
 
+/// Bit-width that an EVM value of textual type `ty` occupies, or `None` for
+/// types whose width we can't bound:
+///   * `address` / `payable` → 160
+///   * `uintK` / `intK` → K (bare `uint`/`int` == 256)
+///   * `bytesM` → 8*M (the fixed-size `bytes1`..`bytes32`; *not* dynamic `bytes`)
+/// Used by the WIDTH-SAFE suppression (A): a cast `uintN(x)` cannot truncate when
+/// the operand's width is `<= N`.
+fn type_to_bits(ty: &str) -> Option<u32> {
+    let ty = ty.trim();
+    // Strip a storage-location / `payable` suffix if present (`address payable`).
+    let head = ty.split_whitespace().next().unwrap_or(ty);
+    if head == "address" || head == "payable" {
+        return Some(160);
+    }
+    if let Some(digits) = head.strip_prefix("uint").or_else(|| head.strip_prefix("int")) {
+        if digits.is_empty() {
+            return Some(256); // bare `uint`/`int`
+        }
+        let bits: u32 = digits.parse().ok()?;
+        return (bits > 0 && bits <= 256 && bits % 8 == 0).then_some(bits);
+    }
+    // Fixed-size `bytesM` (M in 1..=32). Dynamic `bytes` has no digits → unbounded.
+    if let Some(digits) = head.strip_prefix("bytes") {
+        if digits.is_empty() {
+            return None; // dynamic `bytes`
+        }
+        let m: u32 = digits.parse().ok()?;
+        return (m >= 1 && m <= 32).then_some(m * 8);
+    }
+    None
+}
+
+/// Resolve the declared textual type of a bare identifier `name` within function
+/// `f`: first its parameters, then its contract's state variables. Returns `None`
+/// for locals / unknowns (we then conservatively decline to suppress).
+fn lookup_ident_type(cx: &AnalysisContext, f: &sluice_ir::Function, name: &str) -> Option<String> {
+    for p in &f.params {
+        if p.name.as_deref() == Some(name) {
+            return Some(p.ty.clone());
+        }
+    }
+    let contract = cx.scir.contract(f.contract)?;
+    contract
+        .state_vars
+        .iter()
+        .find(|v| v.name == name)
+        .map(|v| v.ty.clone())
+}
+
+/// Upper bound (in bits) on the value an operand of a narrowing cast can hold, or
+/// `None` when we cannot prove a bound (in which case the cast is *not*
+/// width-suppressed). The nested-cast peel: the result of `uintK(...)` / `intK(...)`
+/// / `address(...)` / `bytesM(...)` is exactly the target width regardless of what
+/// is inside, so we read the inner cast's *target* type and never recurse further.
+fn operand_max_bits(cx: &AnalysisContext, f: &sluice_ir::Function, arg: &Expr) -> Option<u32> {
+    match &arg.kind {
+        // A nested type cast: its width is its own target type's width.
+        ExprKind::Call(c) if c.kind == CallKind::TypeCast => {
+            let ty = cast_target_type(c)?;
+            type_to_bits(&ty)
+        }
+        // `msg.sender` / `tx.origin` are `address` (160-bit). `.length` is a
+        // `uint256` and therefore *not* width-safe (returns 256).
+        ExprKind::Member { base, member } => {
+            if member == "length" {
+                return Some(256);
+            }
+            if let ExprKind::Ident(root) = &base.kind {
+                if (root == "msg" && member == "sender") || (root == "tx" && member == "origin") {
+                    return Some(160);
+                }
+            }
+            None
+        }
+        // A bare identifier: resolve its declared (param/state-var) type.
+        ExprKind::Ident(name) => {
+            let ty = lookup_ident_type(cx, f, name)?;
+            type_to_bits(&ty)
+        }
+        _ => None,
+    }
+}
+
+/// SUPPRESSION (F) helper. True when *every* arithmetic operation inside the
+/// function's `unchecked { }` blocks is an increment-by-one (`x + 1`, `1 + x`,
+/// `x++`, `++x`) — the canonical bounded nonce/counter bump on a 256-bit
+/// accumulator, which cannot realistically overflow. Returns `false` if any
+/// other arithmetic (`+ amount`, `- x`, `* y`, division, ...) appears, so genuine
+/// attacker-influenced wrap-around still fires. Returns `false` if there is no
+/// unchecked arithmetic at all (nothing to suppress here).
+fn unchecked_is_only_increment(f: &sluice_ir::Function) -> bool {
+    let mut saw_arith = false;
+    let mut all_increment = true;
+
+    fn is_one_lit(e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Lit(sluice_ir::Lit::Number(n)) if n.trim() == "1")
+    }
+
+    // Walk a statement subtree, recording arithmetic seen within it.
+    fn scan(stmt: &sluice_ir::Stmt, saw_arith: &mut bool, all_increment: &mut bool) {
+        stmt.visit_exprs(&mut |e| match &e.kind {
+            ExprKind::Binary { op, lhs, rhs } if op.is_arithmetic() => {
+                *saw_arith = true;
+                // Only a `+ 1` / `1 +` add counts as a safe increment.
+                let is_inc = matches!(op, BinOp::Add) && (is_one_lit(rhs) || is_one_lit(lhs));
+                if !is_inc {
+                    *all_increment = false;
+                }
+            }
+            ExprKind::Unary { op, .. } => {
+                if matches!(op, UnOp::PreInc | UnOp::PostInc) {
+                    // `++x` / `x++` — a safe increment; does not flip the flag.
+                    *saw_arith = true;
+                } else if matches!(op, UnOp::PreDec | UnOp::PostDec) {
+                    // A decrement inside `unchecked` can underflow → not safe.
+                    *saw_arith = true;
+                    *all_increment = false;
+                }
+            }
+            _ => {}
+        });
+    }
+
+    // Find `unchecked { }` blocks and scan their contents.
+    for s in &f.body {
+        s.visit(&mut |st| {
+            if let sluice_ir::StmtKind::Block { unchecked: true, stmts } = &st.kind {
+                for inner in stmts {
+                    scan(inner, &mut saw_arith, &mut all_increment);
+                }
+            }
+        });
+    }
+
+    saw_arith && all_increment
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -311,5 +508,143 @@ contract Safe {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "integer-issues"));
+    }
+
+    // ------------------------------------------------------------------
+    // Tightening regressions (false positives that must now stay SILENT).
+    // Each wraps the cast in an externally-callable function with a
+    // parameter so the operand is attacker-controlled — i.e. these WOULD
+    // have fired before the suppressions were added.
+    // ------------------------------------------------------------------
+
+    fn fires(src: &str) -> bool {
+        run(src).iter().any(|f| f.detector == "integer-issues")
+    }
+
+    // (A) WIDTH-SAFE: `uint160(msg.sender)` (the inner cast of
+    // `bytes32(uint256(uint160(msg.sender)))`) cannot truncate — `msg.sender`
+    // is 160-bit. The wrapping `uint256(...)`/`bytes32(...)` are non-narrowing.
+    #[test]
+    fn silent_on_address_packed_to_bytes32() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    mapping(bytes32 => bool) public seen;
+    function mark(uint256 salt) external {
+        seen[bytes32(uint256(uint160(msg.sender)))] = true;
+        salt;
+    }
+}
+"#;
+        assert!(!fires(src), "width-safe address->bytes32 pack must be silent");
+    }
+
+    // (A) WIDTH-SAFE: `uint160(address(x))`, `uint32(b4)` (bytes4 == 32-bit),
+    // and `int128(uint128(u64))` (nested-cast peel + uint64 <= 128).
+    #[test]
+    fn silent_on_width_safe_casts() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint64 public u64;
+    uint160 public a160;
+    int128 public i128;
+    function f(address x) external {
+        a160 = uint160(address(x));
+    }
+    function g(uint64 v) external {
+        // nested-cast peel: inner cast result is uint128 (<= int128 target).
+        i128 = int128(uint128(v));
+    }
+    function h(bytes4 b4) external {
+        // bytes4 param narrowed to uint32 (8*4 == 32 bits) — width-safe.
+        u64 = uint64(uint32(b4));
+    }
+}
+"#;
+        assert!(!fires(src), "width-safe casts must be silent");
+    }
+
+    // (B) CLAMPED: `uint40(_min(p, type(uint40).max))` is saturated first.
+    #[test]
+    fn silent_on_min_clamped_cast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint40 public packed;
+    function set(uint256 p) external {
+        packed = uint40(_min(p, type(uint40).max));
+    }
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}
+"#;
+        assert!(!fires(src), "min()-clamped downcast must be silent");
+    }
+
+    // (C) DIVISION-DOWN: `uint32((t - g) / s)` — division rounds down.
+    #[test]
+    fn silent_on_division_down_cast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint32 public rate;
+    function f(uint256 t, uint256 g, uint256 s) external {
+        require(s != 0);
+        rate = uint32((t - g) / s);
+    }
+}
+"#;
+        assert!(!fires(src), "downcast of a division quotient must be silent");
+    }
+
+    // (D) DOMINATING GUARD: `uint96(amount)` guarded by an explicit
+    // `if (amount > type(uint96).max) revert E();` bounds check.
+    #[test]
+    fn silent_on_dominating_guard_cast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    error E();
+    uint96 public packed;
+    function f(uint256 amount) external {
+        if (amount > type(uint96).max) revert E();
+        packed = uint96(amount);
+    }
+}
+"#;
+        assert!(!fires(src), "type(uintN).max-guarded downcast must be silent");
+    }
+
+    // (F) SAFE UNCHECKED: a bare `unchecked { x = nonce + 1; }` increment of a
+    // 256-bit accumulator is not a reachable overflow.
+    #[test]
+    fn silent_on_unchecked_nonce_increment() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint256 public nonce;
+    function bump(uint256 x) external {
+        unchecked { nonce = nonce + 1; }
+        x;
+    }
+}
+"#;
+        assert!(!fires(src), "unchecked +1 nonce increment must be silent");
+    }
+
+    // POSITIVE: a genuinely-unbounded downcast of a full-width attacker value
+    // still FIRES — the tightening must not silence real truncation bugs.
+    #[test]
+    fn fires_on_unbounded_downcast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint64 public y;
+    function f(uint256 x) external { y = uint64(x); }
+}
+"#;
+        assert!(fires(src), "unbounded uint256->uint64 downcast must still fire");
     }
 }

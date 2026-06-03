@@ -27,7 +27,7 @@ const HACKS: &[(&str, &str, &str)] = &[
     ("gamma.sol", "oracle-manipulation", "Gamma Strategies ($6M LP price manipulation, Jan 2024)"),
     ("jimbo.sol", "oracle-manipulation", "Jimbo's Protocol ($7.5M floor-price manipulation, May 2023)"),
     ("midas.sol", "oracle-manipulation", "Midas Capital ($660K read-only oracle, Jan 2023)"),
-    ("templedao.sol", "access-control", "TempleDAO ($2.3M unprotected migrateStake, Oct 2022)"),
+    ("templedao.sol", "untrusted-call-target", "TempleDAO ($2.3M unprotected migrateStake, Oct 2022)"),
 ];
 
 /// Read a fixture, returning `None` (with a printed `WARN`) if it is missing or

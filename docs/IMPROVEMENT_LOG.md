@@ -114,3 +114,39 @@ zero crashes; the bug surface is **precision/labeling**, plus one parser gap). T
   arbitrary-transfer, reentrancy, and the new untrusted-call-target detector; + a parse-layer pre-pass that strips the
   Solidity 0.8.29 `contract X layout at <slot> is ...` directive solang 0.3.5 rejects (eigenlayer AllocationManagerView.sol
   silently dropped). _status: launching._
+- **Result:** 50 detectors; corpus 20/20 recall + 8/8 clean; **R4 hacks now 8/8** (TempleDAO caught by the
+  new `untrusted-call-target` detector — the R4 MISS, closed). 153 tests, 0 warnings. Delivered:
+  - **WF1 cast precision:** integer-issues width-bit suppression (`uintN(address)`/`uintN(bytesM)`/narrower-int
+    operand), `min()`-clamp, division-down, `type(uintN).max`-dominating-guard, unchecked-nonce — **etherfi
+    integer-issues 48→31, eigenlayer 8→0** (measured). signed-cast width-safety added.
+  - **WF2 reentrancy precision:** read-only-reentrancy now requires a real external call on the path (the etherfi
+    zero-call getter FP); classic CEI requires a write STRICTLY after the call (write-before-call no longer fires);
+    trusted (immutable/constant) callee downgrade — **olympus reentrancy 14→11** (measured).
+  - **WF3 labeling/trust:** centralization fund-flow split (soft "parameter setter" title), erc721-vs-erc20 type
+    exclusion (**etherfi erc721 3→0**), gas-griefing constant/immutable-callee exclusion (**eigenlayer 3→0**),
+    selector EIP-712 `\x19\x01` allowlist + length-pinned-arg rule (**eigenlayer selector 3→0**).
+  - **Core (direct):** new **untrusted-call-target** detector; **`layout at` parser recovery** (offset-preserving
+    blank — Solidity 0.8.29 files no longer silently dropped); **guard-ordering root fix** — a `require(...)`/`assert(...)`
+    now claims its order before its condition is walked, so an inline `require(msg.sender == authority.governor())`
+    (call in the condition) is recognized as access control instead of being dropped past the leading-guard cutoff.
+    This lifts `has_access_control` accuracy for EVERY detector (olympus access-control 8→6).
+  - Dogfood re-measure (olympus/eigenlayer/pendle/etherfi): all exit 0, zero crashes. eigenlayer 32→26, etherfi
+    143→134. **olympus 83→97 is correct, not a regression** — the guard-fix exposed ~21 genuinely privileged
+    authority-guarded fund-movers that the ordering bug had hidden from centralization. _done._
+
+### Round 6 — core: per-call-site trust map + return-value provenance
+Driven by the R5 dogfood re-measure (the two real FP sources it surfaced). Three workflows:
+- **WF1 — signed-cast & integer residual:** signed-cast fires on function **return-tuple signature lines**
+  (`(int256 _netSyIn, int256 _netSyFee, …)` — pendle calcSyIn/calcSyOut, 6 FPs) and on width-safe / constant
+  casts (`uint256(ONE_18)`, `uint16(year-1)`) — fix the location/false-match (only real `TypeCast` expression
+  spans, never a return-param list) and port integer-issues' width-bit + clamp + guard suppression into signed-cast;
+  also drive etherfi integer-issues 31→lower. Regression fixtures from the pendle/eigenlayer cases.
+- **WF2 — upgradeable & DoS context (untouched in R5):** upgradeable self-delegatecall (`address(this).delegatecall`
+  / `_delegateToSelf` — pendle, 3+ FPs) must not carry the foreign-takeover "Parity" message; cap `simulate()`-then-
+  `revert` entrypoints below Critical; DoS must not fire on fault-tolerant `try*`/read-only multicalls (pendle
+  Multicall2). + new detector: **uninitialized-storage-pointer** or **divide-before-multiply** (precision-loss).
+- **WF3 — centralization severity & dogfood:** suppress initializers/`setVault`-style from centralization; reserve
+  Low+ for genuine fund-sinks, Info for the rest (olympus 30 → tighter); re-scan all four targets + a fresh codebase
+  (symbiotic / karak / renzo) to measure and to find new FP classes.
+- Core: a per-call-site trust classifier (constant/immutable/param/storage/return-derived) + first-class external-
+  return provenance, shared by signed-cast, gas-griefing, reentrancy, untrusted-call-target, upgradeable. _status: pending._

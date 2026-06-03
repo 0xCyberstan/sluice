@@ -27,6 +27,20 @@
 //!     `uint`-typed balance — which cannot flip sign on a cast *to* `uint`), and
 //!     whenever the source leans on OpenZeppelin `SafeCast` / `toInt256` /
 //!     `toUint256`, which bounds-check the conversion and revert on overflow.
+//!
+//! Width-safety (pre-empts the over-fire class the narrowing detector hit):
+//!   * For the `uint -> int` direction, a *narrower* unsigned operand widened
+//!     into a *wider* signed target cannot reach the sign bit — `int256(uint8 x)`
+//!     spans `[0, 2**8)`, far inside `int256`'s positive range — so the cast is
+//!     provably sign-stable and is suppressed when the target's signed bit-width
+//!     strictly exceeds the operand's known unsigned width. (The `int -> uint`
+//!     direction gets no such relief: a *negative* `int8` still wraps huge in any
+//!     wider `uintN`, so widening never makes it safe.)
+//!   * An operand bounded by a surrounding `require`/`if (...) revert` ordering
+//!     check or a `min(...)`/`max(...)` clamp that *names that operand* can no
+//!     longer take the out-of-range value the flip needs, so it is suppressed.
+//!     The bound must reference the operand identifier — a guard on some other
+//!     variable does not relax the cast.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -81,6 +95,20 @@ impl Detector for SignedCastDetector {
                 // Provably non-negative arguments cannot flip sign: a literal, a
                 // `.length`, or a value already known unsigned/non-negative.
                 if is_provably_nonneg(arg) {
+                    return;
+                }
+                // Width-safe widening into a signed target: a narrower unsigned
+                // operand (`uint8(x)`, or a `uint8`-typed identifier) cast to a
+                // wider `intN` never reaches the sign bit, so the value is provably
+                // non-negative after the cast. Only the `uint -> int` direction
+                // benefits — see `is_width_safe_widen`.
+                if target_signed && is_width_safe_widen(f, contract, &target, arg) {
+                    return;
+                }
+                // A `require` / `if (...) revert` ordering bound or a `min`/`max`
+                // clamp that *names the operand* keeps it inside range, so the cast
+                // can no longer take the out-of-range value the flip requires.
+                if operand_is_bounded(cx, f, arg) {
                     return;
                 }
 
@@ -284,6 +312,170 @@ fn peel_int_casts(e: &Expr) -> &Expr {
     }
 }
 
+/// Bit-width of an integer type name. `uint`/`int` (no digits) is the 256-bit
+/// alias; `uint128` -> 128, `int8` -> 8. `None` for a malformed width.
+fn bit_width(ty: &str) -> Option<u32> {
+    let t = ty.trim();
+    let digits = if let Some(d) = t.strip_prefix("uint") {
+        d
+    } else if let Some(d) = t.strip_prefix("int") {
+        d
+    } else {
+        return None;
+    };
+    if digits.is_empty() {
+        return Some(256); // bare `uint` / `int`
+    }
+    digits.parse::<u32>().ok().filter(|w| *w >= 8 && *w <= 256 && w % 8 == 0)
+}
+
+/// The tightest unsigned bit-width that bounds `arg`, if known. An explicit
+/// `uintM(...)` cast wrapper clamps the value to `[0, 2**M)` regardless of what
+/// is inside it, so it dominates; otherwise a `uintM`-typed identifier carries
+/// its declared width. Returns `None` when no unsigned bound is provable (e.g.
+/// the operand is signed-typed, or an unresolved expression).
+fn operand_unsigned_width(f: &Function, contract: Option<&Contract>, arg: &Expr) -> Option<u32> {
+    // An outermost explicit unsigned cast `uintM(...)` bounds the value to uintM.
+    if let ExprKind::Call(c) = &arg.kind {
+        if c.kind == CallKind::TypeCast && c.args.len() == 1 {
+            if let Some(t) = cast_target_type(c) {
+                if is_uint_type(&t) {
+                    return bit_width(&t);
+                }
+            }
+        }
+    }
+    // Otherwise fall back to a `uintM`-typed identifier's declared width.
+    let ty = resolve_decl_type(f, contract, arg)?;
+    if is_uint_type(&ty) {
+        bit_width(&ty)
+    } else {
+        None
+    }
+}
+
+/// `uint -> int` widening that cannot flip sign: the operand is bounded to an
+/// unsigned width strictly smaller than the signed target's width, so its max
+/// value (`2**w - 1`) stays inside the target's positive range (`2**(N-1) - 1`).
+/// `int256(uint8 x)` is safe (`8 < 256`); `int8(uint8 x)` is *not* (`8 == 8`, a
+/// `uint8` of 200 becomes a negative `int8`); `int256(uint256 x)` is *not*
+/// (`256 == 256`, the top bit flips). Only ever called for a signed target.
+fn is_width_safe_widen(
+    f: &Function,
+    contract: Option<&Contract>,
+    target: &str,
+    arg: &Expr,
+) -> bool {
+    let Some(target_bits) = bit_width(target) else { return false };
+    match operand_unsigned_width(f, contract, arg) {
+        Some(op_bits) => op_bits < target_bits,
+        None => false,
+    }
+}
+
+/// Root identifiers appearing in `arg` (after peeling integer casts): the names a
+/// surrounding bound would have to mention to actually constrain this operand.
+/// Walks a subtraction `a - b` into both sides; ignores literals and `.length`.
+fn operand_idents(arg: &Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_idents(peel_int_casts(arg), &mut out);
+    out
+}
+
+fn collect_idents(e: &Expr, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Ident(name) => out.push(name.clone()),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_idents(peel_int_casts(lhs), out);
+            collect_idents(peel_int_casts(rhs), out);
+        }
+        ExprKind::Member { base, .. } => collect_idents(peel_int_casts(base), out),
+        ExprKind::Index { base, .. } => collect_idents(peel_int_casts(base), out),
+        ExprKind::Unary { operand, .. } => collect_idents(peel_int_casts(operand), out),
+        _ => {}
+    }
+}
+
+/// True if the function body bounds the operand so the sign flip can no longer
+/// occur: a `min(...)`/`max(...)` clamp or a `require` / `if (...) revert`
+/// *ordering* comparison (`<`, `>`, `<=`, `>=`) that names one of the operand's
+/// identifiers. Keyed on the whole-function source (`f.span`) because the bound
+/// lives in a sibling statement, not inside the cast's own span — but it must
+/// reference the operand, so a guard on an unrelated variable does not relax the
+/// cast (preserving genuine unbounded-downcast fires).
+fn operand_is_bounded(cx: &AnalysisContext, f: &Function, arg: &Expr) -> bool {
+    let idents = operand_idents(arg);
+    if idents.is_empty() {
+        return false;
+    }
+    // Comment-stripped, lowercased function text (so a comment cannot trip this).
+    let src = cx.source_text(f.span);
+    let names: Vec<String> = idents.iter().map(|n| n.to_ascii_lowercase()).collect();
+
+    // A `min(... operand ...)` / `max(... operand ...)` clamp.
+    for kw in ["min(", "max("] {
+        let mut from = 0;
+        while let Some(rel) = src[from..].find(kw) {
+            let open = from + rel + kw.len();
+            if let Some(end_rel) = src[open..].find(')') {
+                let inner = &src[open..open + end_rel];
+                if names.iter().any(|n| mentions_ident(inner, n)) {
+                    return true;
+                }
+            }
+            from = open;
+        }
+    }
+
+    // A `require(...)` / `revert`-guarded ordering comparison referencing the
+    // operand. We scan each `require(` / `if (` clause head and require both an
+    // ordering operator and one of the operand idents inside it.
+    for kw in ["require(", "if(", "if ("] {
+        let mut from = 0;
+        while let Some(rel) = src[from..].find(kw) {
+            let open = from + rel + kw.len();
+            // Bound the clause at the matching close (best-effort: first ')').
+            let end = src[open..].find(')').map(|e| open + e).unwrap_or(src.len());
+            let clause = &src[open..end];
+            let has_order = clause.contains("<=")
+                || clause.contains(">=")
+                || clause.contains('<')
+                || clause.contains('>');
+            if has_order && names.iter().any(|n| mentions_ident(clause, n)) {
+                return true;
+            }
+            from = open;
+        }
+    }
+    false
+}
+
+/// Whole-identifier match of `name` in `hay` (both already lowercased): the
+/// chars bordering the hit must not be identifier characters, so `amount` does
+/// not match inside `amountIn` / `totalAmount`.
+fn mentions_ident(hay: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = hay.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(name) {
+        let start = from + rel;
+        let end = start + name.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -319,6 +511,81 @@ mod tests {
         }
     "#;
 
+    // Width-safe widening: a `uint8` operand widened into `int256` spans only
+    // `[0, 2**8)`, far below `int256`'s positive max, so the sign can never flip.
+    // Before width-safety this fired (a `uint`-typed value cast to `int` =>
+    // `UintIdentToInt`); the detector must now stay silent.
+    const WIDTH_SAFE_CAST: &str = r#"
+        pragma solidity ^0.8.20;
+        contract M {
+            function f(uint256 x) external pure returns (int256) {
+                return int256(uint8(x));
+            }
+        }
+    "#;
+
+    // Width-safe via the operand's *declared* width: a `uint8` parameter widened
+    // into `int256` is likewise sign-stable. Also fired pre-change.
+    const WIDTH_SAFE_DECL: &str = r#"
+        pragma solidity ^0.8.20;
+        contract M {
+            function f(uint8 small) external pure returns (int256) {
+                return int256(small);
+            }
+        }
+    "#;
+
+    // NOT width-safe: a full-width `uint256` cast to `int256` can have its top bit
+    // set and flip negative — widths are equal, not strictly smaller. Must FIRE.
+    const WIDTH_UNSAFE_FULL: &str = r#"
+        pragma solidity ^0.8.20;
+        contract M {
+            function f(uint256 big) external pure returns (int256) {
+                return int256(big);
+            }
+        }
+    "#;
+
+    // Guarded: `require(a >= b)` makes `a - b` provably non-negative before the
+    // cast, so the int->uint wrap cannot occur. The same cast fires unguarded
+    // (see VULN); the operand-named bound must suppress it here.
+    const GUARDED_REQUIRE: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Ledger {
+            function settle(int256 a, int256 b) external pure returns (uint256) {
+                require(a >= b, "underflow");
+                return uint256(a - b);
+            }
+        }
+    "#;
+
+    // Clamped: `a = max(a, b)` forces `a >= b`, so `a - b` cannot go negative.
+    // The `max(` clamp names the operand, so the cast is suppressed.
+    const CLAMPED_MAX: &str = r#"
+        pragma solidity ^0.8.20;
+        library Math { function max(int256 p, int256 q) internal pure returns (int256) { return p > q ? p : q; } }
+        contract Ledger {
+            using Math for int256;
+            function settle(int256 a, int256 b) external pure returns (uint256) {
+                a = Math.max(a, b);
+                return uint256(a - b);
+            }
+        }
+    "#;
+
+    // A guard on an *unrelated* variable must NOT relax the cast: `c` is bounded
+    // but the dangerous operand is `a - b`, which stays unbounded. Must FIRE so a
+    // real downcast bug is never silenced by a spurious nearby check.
+    const GUARD_OTHER_VAR: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Ledger {
+            function settle(int256 a, int256 b, int256 c) external pure returns (uint256) {
+                require(c >= 0, "bad c");
+                return uint256(a - b);
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_vuln() {
         let fs = run(VULN);
@@ -329,5 +596,41 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "signed-cast"));
+    }
+
+    #[test]
+    fn silent_on_width_safe_cast() {
+        let fs = run(WIDTH_SAFE_CAST);
+        assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_width_safe_decl() {
+        let fs = run(WIDTH_SAFE_DECL);
+        assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn fires_on_full_width_uint_to_int() {
+        let fs = run(WIDTH_UNSAFE_FULL);
+        assert!(fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_when_operand_guarded() {
+        let fs = run(GUARDED_REQUIRE);
+        assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_when_operand_clamped() {
+        let fs = run(CLAMPED_MAX);
+        assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn fires_when_guard_names_other_var() {
+        let fs = run(GUARD_OTHER_VAR);
+        assert!(fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
     }
 }

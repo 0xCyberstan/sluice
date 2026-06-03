@@ -10,8 +10,8 @@ use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::detectors::visit_calls;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{Builtin, CallKind, Expr, ExprKind, Function, Span};
-use std::collections::HashMap;
+use sluice_ir::{BinOp, Builtin, CallKind, Expr, ExprKind, Function, Lit, Span};
+use std::collections::{HashMap, HashSet};
 
 pub struct SelectorCollisionDetector;
 
@@ -19,11 +19,13 @@ pub struct SelectorCollisionDetector;
 #[derive(PartialEq, Clone, Copy)]
 enum ArgClass {
     /// Fixed-width / non-ambiguous (`uintN`, `intN`, `address`, `bool`,
-    /// `bytes1..bytes32`, numeric/address literals). Cannot create an ambiguous
-    /// byte boundary on its own.
+    /// `bytes1..bytes32`, numeric/address/string/bytes literals, and any
+    /// `string`/`bytes`/array whose length is pinned by a preceding
+    /// `require(x.length == K)`). Cannot create an ambiguous byte boundary on its
+    /// own: its length is known at the call site.
     Fixed,
-    /// Variable-length (`string`, `bytes`, `T[]`). Two of these adjacent in a
-    /// packed buffer are the collision primitive.
+    /// Variable-length (`string`, `bytes`, `T[]`) whose length is *not* pinned.
+    /// Two of these adjacent in a packed buffer are the collision primitive.
     Dynamic,
     /// Type could not be resolved (nested expression, external-call result,
     /// unresolved identifier). Treated as "non-fixed" but not proof of dynamism.
@@ -64,6 +66,14 @@ impl Detector for SelectorCollisionDetector {
                 }
             }
 
+            // Names whose dynamic length is pinned to a constant by a
+            // `require(x.length == K)` (either argument order) somewhere in the
+            // function. Once the length is fixed, the value can no longer slide
+            // the packed boundary, so such operands are treated as fixed-width.
+            // This is the SSZ / fixed-pubkey idiom
+            // (`require(pubkey.length == 48); abi.encodePacked(pubkey, bytes16(0))`).
+            let length_pinned = length_pinned_names(f);
+
             // First pass: spans of every `encodePacked` call that sits inside a
             // hashing / signature-building builtin's argument subtree, i.e. the
             // packed bytes flow into a digest/selector. Higher confidence there.
@@ -78,7 +88,20 @@ impl Detector for SelectorCollisionDetector {
                     return; // single arg can't produce an ambiguous boundary
                 }
 
-                let classes: Vec<ArgClass> = c.args.iter().map(|a| classify_arg(a, &types)).collect();
+                // Hard allowlist: the canonical EIP-712 digest preamble
+                // `abi.encodePacked("\x19\x01", domainSeparator, structHash)`.
+                // The leading `\x19\x01` is a fixed two-byte literal and the
+                // following operands are `bytes32`s, so there is no ambiguous
+                // boundary — this is a correct, ubiquitous construction, not a bug.
+                if is_eip712_prefixed(&c.args) {
+                    return;
+                }
+
+                let classes: Vec<ArgClass> = c
+                    .args
+                    .iter()
+                    .map(|a| classify_arg(a, &types, &length_pinned))
+                    .collect();
 
                 let dynamic_typed = classes.iter().filter(|k| **k == ArgClass::Dynamic).count();
                 // Two adjacent args that are both not provably fixed.
@@ -138,24 +161,40 @@ impl Detector for SelectorCollisionDetector {
 }
 
 /// Classify one `encodePacked` argument as fixed-width, dynamic-length, or unknown.
-fn classify_arg(arg: &Expr, types: &HashMap<String, String>) -> ArgClass {
+///
+/// `length_pinned` carries identifier names whose dynamic length was fixed by a
+/// `require(x.length == K)` guard; such operands are demoted to [`ArgClass::Fixed`]
+/// because their byte width is constant at the call site.
+fn classify_arg(arg: &Expr, types: &HashMap<String, String>, length_pinned: &HashSet<String>) -> ArgClass {
     match &arg.kind {
-        // Identifier: resolve its declared type (param or state var).
+        // Identifier: resolve its declared type (param or state var). A
+        // dynamic-typed identifier whose length is pinned by a preceding
+        // `require(name.length == K)` packs at a constant width, so it cannot
+        // create an ambiguous boundary — treat it as fixed.
         ExprKind::Ident(name) => match types.get(name) {
-            Some(ty) => classify_type(ty),
+            Some(ty) => {
+                let class = classify_type(ty);
+                if class == ArgClass::Dynamic && length_pinned.contains(name) {
+                    ArgClass::Fixed
+                } else {
+                    class
+                }
+            }
             None => ArgClass::Unknown,
         },
-        // A string literal is variable-length; numeric/address/bytes literals are fixed.
-        ExprKind::Lit(lit) => {
-            use sluice_ir::Lit;
-            match lit {
-                Lit::String(_) => ArgClass::Dynamic,
-                Lit::Number(_) | Lit::HexNumber(_) | Lit::Bool(_) | Lit::Address(_) | Lit::HexBytes(_) => {
-                    ArgClass::Fixed
-                }
-                Lit::Other(_) => ArgClass::Unknown,
-            }
-        }
+        // Literals are fixed: a string/byte *literal* (e.g. the EIP-712
+        // `"\x19\x01"` prefix, or a constant domain tag) has a known, constant
+        // length and content. The collision primitive requires two *variable*
+        // operands sharing a boundary; a constant cannot slide that boundary.
+        ExprKind::Lit(lit) => match lit {
+            Lit::String(_)
+            | Lit::Number(_)
+            | Lit::HexNumber(_)
+            | Lit::Bool(_)
+            | Lit::Address(_)
+            | Lit::HexBytes(_) => ArgClass::Fixed,
+            Lit::Other(_) => ArgClass::Unknown,
+        },
         // A cast such as `uint256(x)`, `address(x)`, `bytes32(x)` yields a fixed
         // width; `bytes(x)` / `string(x)` are dynamic.
         ExprKind::Call(c) if c.kind == CallKind::TypeCast => c
@@ -167,6 +206,86 @@ fn classify_arg(arg: &Expr, types: &HashMap<String, String>) -> ArgClass {
         // not provably fixed, but not proof of dynamism either.
         _ => ArgClass::Unknown,
     }
+}
+
+/// True when `args` begin with the canonical EIP-712 byte preamble: either a
+/// single `"\x19\x01"` literal, or the two adjacent literals `"\x19"` then
+/// `"\x01"`. `solang-parser` keeps string-literal bodies as the raw,
+/// still-escaped source slice, so the stored content is the textual
+/// `\x19\x01` / `\x19` / `\x01`.
+fn is_eip712_prefixed(args: &[Expr]) -> bool {
+    let lit = |e: &Expr| -> Option<String> {
+        match &e.kind {
+            ExprKind::Lit(Lit::String(s)) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    // Normalize a literal body to its EIP-712 prefix shape, tolerating the few
+    // equivalent spellings of the same two bytes (`\x19\x01`, `\x19\u{01}`).
+    let norm = |s: &str| -> String { s.replace("\\u{01}", "\\x01").replace("\\u{19}", "\\x19") };
+
+    if let Some(first) = args.first().and_then(&lit) {
+        let f = norm(&first);
+        if f.starts_with("\\x19\\x01") {
+            return true;
+        }
+        // Split spelling: `abi.encodePacked("\x19", "\x01", ...)`.
+        if f == "\\x19" {
+            if let Some(second) = args.get(1).and_then(&lit) {
+                if norm(&second).starts_with("\\x01") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Collect identifier names pinned to a constant length by a
+/// `require(name.length == K)` (or `require(K == name.length)`) call anywhere in
+/// the function body. Such names pack at a fixed byte width regardless of the
+/// caller's input, so they are not a collision boundary.
+fn length_pinned_names(f: &Function) -> HashSet<String> {
+    let mut pinned = HashSet::new();
+    for s in &f.body {
+        s.visit_exprs(&mut |e: &Expr| {
+            let ExprKind::Call(c) = &e.kind else { return };
+            if c.kind != CallKind::Builtin(Builtin::Require) && c.kind != CallKind::Builtin(Builtin::Assert) {
+                return;
+            }
+            // The condition is the first argument; scan it (and any `&&`-joined
+            // sub-conditions, reached by the recursive `visit`) for a
+            // `<x>.length == <number>` equality.
+            if let Some(cond) = c.args.first() {
+                cond.visit(&mut |inner: &Expr| {
+                    if let ExprKind::Binary { op: BinOp::Eq, lhs, rhs } = &inner.kind {
+                        if let Some(name) = length_eq_name(lhs, rhs).or_else(|| length_eq_name(rhs, lhs)) {
+                            pinned.insert(name);
+                        }
+                    }
+                });
+            }
+        });
+    }
+    pinned
+}
+
+/// If `len_side` is `<name>.length` and `k_side` is a numeric literal, return
+/// the pinned identifier name.
+fn length_eq_name(len_side: &Expr, k_side: &Expr) -> Option<String> {
+    // `k_side` must be a compile-time numeric constant.
+    let k_is_const = matches!(&k_side.kind, ExprKind::Lit(Lit::Number(_) | Lit::HexNumber(_)));
+    if !k_is_const {
+        return None;
+    }
+    if let ExprKind::Member { base, member } = &len_side.kind {
+        if member == "length" {
+            if let ExprKind::Ident(name) = &base.kind {
+                return Some(name.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Map a textual Solidity type to its packing class.
@@ -208,8 +327,7 @@ fn is_fixed_bytes(base: &str) -> bool {
 /// argument subtree of a hashing / signature-building builtin (`keccak256`,
 /// `sha256`, `abi.encodeWithSignature/Selector`). These are the high-signal
 /// cases where the packed bytes become a digest, merkle leaf, or selector.
-fn encode_packed_spans_feeding_hash(f: &Function) -> std::collections::HashSet<Span> {
-    use std::collections::HashSet;
+fn encode_packed_spans_feeding_hash(f: &Function) -> HashSet<Span> {
     let mut spans = HashSet::new();
     for s in &f.body {
         s.visit_exprs(&mut |e: &Expr| {
@@ -270,6 +388,57 @@ mod tests {
         }
     "#;
 
+    // Canonical EIP-712 digest: `keccak256("\x19\x01" ++ domainSeparator ++
+    // structHash)`. The `\x19\x01` prefix is a fixed two-byte literal and the
+    // following operands are `bytes32`s, so there is no ambiguous boundary. This
+    // is the F-011 / F-021 dogfood false positive — it must stay silent.
+    const EIP712_DIGEST: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Verifier {
+            function hashTypedData(bytes32 sep, bytes32 structHash) public pure returns (bytes32) {
+                return keccak256(abi.encodePacked("\x19\x01", sep, structHash));
+            }
+        }
+    "#;
+
+    // Same EIP-712 preamble, but split across two adjacent string literals
+    // `"\x19"` then `"\x01"`. Still the canonical construction — must stay silent.
+    const EIP712_SPLIT_PREFIX: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Verifier {
+            function hashTypedData(bytes32 sep, bytes32 structHash) public pure returns (bytes32) {
+                return keccak256(abi.encodePacked("\x19", "\x01", sep, structHash));
+            }
+        }
+    "#;
+
+    // SSZ-style fixed-width hashing: a `bytes` pubkey whose length is pinned to a
+    // constant by a preceding `require(pubkey.length == 48)`, packed beside a
+    // fixed `bytes16(0)` pad. With the length pinned the value packs at a constant
+    // width, so there is no ambiguous boundary. This is the F-012 dogfood false
+    // positive — it must stay silent.
+    const SSZ_PINNED_LENGTH: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Deposit {
+            function pubkeyRoot(bytes calldata pubkey) external pure returns (bytes32) {
+                require(pubkey.length == 48, "bad pubkey");
+                return sha256(abi.encodePacked(pubkey, bytes16(0)));
+            }
+        }
+    "#;
+
+    // Two *unpinned* dynamic `bytes` parameters packed together — a genuine
+    // ambiguous boundary. The length pin / EIP-712 softening must NOT silence
+    // this real collision.
+    const TWO_UNPINNED_BYTES: &str = r#"
+        pragma solidity ^0.8.20;
+        contract Bad {
+            function id(bytes calldata a, bytes calldata b) external pure returns (bytes32) {
+                return keccak256(abi.encodePacked(a, b));
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_vuln() {
         let fs = run(VULN);
@@ -280,5 +449,38 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "selector-collision"));
+    }
+
+    // Regression (F-011 / F-021): the canonical EIP-712 `\x19\x01` digest is a
+    // correct construction and must not be flagged.
+    #[test]
+    fn silent_on_eip712_digest() {
+        let fs = run(EIP712_DIGEST);
+        assert!(!fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
+    }
+
+    // Regression: the split `"\x19"`,`"\x01"` spelling of the same preamble is
+    // likewise allow-listed.
+    #[test]
+    fn silent_on_eip712_split_prefix() {
+        let fs = run(EIP712_SPLIT_PREFIX);
+        assert!(!fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
+    }
+
+    // Regression (F-012): a length-pinned `bytes` packs at a constant width, so
+    // `abi.encodePacked(pubkey, bytes16(0))` after `require(pubkey.length == 48)`
+    // has no ambiguous boundary.
+    #[test]
+    fn silent_on_ssz_pinned_length() {
+        let fs = run(SSZ_PINNED_LENGTH);
+        assert!(!fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
+    }
+
+    // Positive: two unpinned dynamic `bytes` params still collide and must fire,
+    // proving the softenings did not silence a real bug.
+    #[test]
+    fn fires_on_two_unpinned_bytes() {
+        let fs = run(TWO_UNPINNED_BYTES);
+        assert!(fs.iter().any(|f| f.detector == "selector-collision"), "{:?}", fs);
     }
 }

@@ -57,6 +57,8 @@ pub mod erc1155_receiver;
 pub mod l2_sequencer;
 pub mod lp_slippage;
 pub mod signed_cast;
+// Round 5 (perpetual loop) detectors.
+pub mod untrusted_call_target;
 
 use crate::detector::Detector;
 
@@ -118,6 +120,8 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(lp_slippage::LpSlippageDetector),
         Box::new(erc1155_receiver::Erc1155ReceiverDetector),
         Box::new(signed_cast::SignedCastDetector),
+        // Round 5 (perpetual loop).
+        Box::new(untrusted_call_target::UntrustedCallTargetDetector),
     ]
 }
 

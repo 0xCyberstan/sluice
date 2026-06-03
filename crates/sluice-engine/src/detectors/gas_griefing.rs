@@ -33,7 +33,7 @@
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{CallKind, ExprKind, Function, Span, Stmt, StmtKind};
+use sluice_ir::{Call, CallKind, Expr, ExprKind, Function, Lit, Span, Stmt, StmtKind};
 
 pub struct GasGriefingDetector;
 
@@ -78,6 +78,21 @@ impl Detector for GasGriefingDetector {
                 // return data by hand (assembly returndatasize/returndatacopy).
                 if call_handles_returndata(cx, span) {
                     continue;
+                }
+
+                // The grief only exists if the *callee* is externally controlled.
+                // A call whose target is a compile-time `constant`/`immutable`
+                // state var, a bare address literal, or `address(CONST)` — e.g. an
+                // EIP-7002/7251 system predeploy declared
+                // `address internal constant SYS = 0x...0007002;` — is a fixed,
+                // contract-controlled address. Whatever gas it consumes is the
+                // protocol's own concern, not an attacker's lever, so it is not a
+                // gas-griefing finding. Require a storage- or parameter-sourced
+                // (mutable, non-immutable) address before flagging.
+                if let Some(call) = find_call_at(f, span) {
+                    if !callee_is_untrusted(cx, f, call) {
+                        continue;
+                    }
                 }
 
                 let looped = in_loop.contains(&span);
@@ -193,6 +208,112 @@ fn call_handles_returndata(cx: &AnalysisContext, span: Span) -> bool {
     src.contains("returndatasize") || src.contains("returndatacopy")
 }
 
+/// Locate the low-level [`Call`] node whose expression span equals `span` (the
+/// span recorded by [`uncapped_low_level_calls`]). Lets the callee-trust gate
+/// inspect the receiver without changing the existing `(Span, bool)` plumbing.
+fn find_call_at(f: &Function, span: Span) -> Option<&Call> {
+    let mut found: Option<&Call> = None;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found.is_some() {
+                return;
+            }
+            if e.span == span {
+                if let ExprKind::Call(c) = &e.kind {
+                    found = Some(c);
+                }
+            }
+        });
+        if found.is_some() {
+            break;
+        }
+    }
+    found
+}
+
+/// True when the callee of a low-level call is an *externally controlled* (and
+/// therefore griefable) address: a storage- or parameter-sourced, mutable,
+/// non-immutable address.
+///
+/// It is **not** untrusted — and so not a finding — when the target is a fixed,
+/// compile-time address that the protocol itself pinned:
+///   * the receiver (after stripping `address(...)`/cast wrappers) is a bare
+///     address/hex literal (`0x...`), or
+///   * its root identifier resolves to a `constant` or `immutable` state var of
+///     the function's contract (e.g. the EIP-7002/7251 system predeploys
+///     `address internal constant WITHDRAWAL_REQUEST_ADDRESS = 0x...0007002;`).
+///
+/// Anything else — a function parameter, a mutable storage address, or an
+/// unresolved local — is treated as untrusted, so genuine relayer/loop griefing
+/// (`target.call(...)` with a caller-supplied `target`) keeps firing.
+fn callee_is_untrusted(cx: &AnalysisContext, f: &Function, call: &Call) -> bool {
+    // No resolvable receiver (e.g. `address(this).call`, an odd shape): be
+    // conservative and keep the existing behaviour (treat as a candidate).
+    let Some(recv) = call.receiver.as_deref() else {
+        return true;
+    };
+    let recv = unwrap_casts(recv);
+
+    // A bare address / hex-number literal target is a fixed predeploy-style
+    // address, never attacker-controlled.
+    if is_address_literal(recv) {
+        return false;
+    }
+
+    // A target whose root is a compile-time `constant`/`immutable` state var is
+    // contract-pinned and cannot be redirected by an attacker.
+    if root_is_const_or_immutable_state_var(cx, f, recv) {
+        return false;
+    }
+
+    true
+}
+
+/// Peel single-argument type casts (`address(x)`, `payable(x)`, `IERC20(x)`) so
+/// the underlying callee can be inspected. Mirrors the cast-stripping used by
+/// the arbitrary-transfer detector.
+fn unwrap_casts(e: &Expr) -> &Expr {
+    let mut cur = e;
+    loop {
+        match &cur.kind {
+            ExprKind::Call(c) if c.kind == CallKind::TypeCast && c.args.len() == 1 => {
+                cur = &c.args[0];
+            }
+            _ => return cur,
+        }
+    }
+}
+
+/// True if the expression is a literal address (`0x...`). Solidity lexes a
+/// 20-byte hex value as an `Address` literal when it checksums, otherwise as a
+/// `HexNumber`; either way a literal target is a fixed, contract-chosen address.
+fn is_address_literal(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Lit(Lit::Address(_)) | ExprKind::Lit(Lit::HexNumber(_)))
+}
+
+/// True if the expression's root identifier names a `constant` or `immutable`
+/// state variable of the function's contract — a compile-time-fixed address that
+/// an attacker cannot redirect.
+fn root_is_const_or_immutable_state_var(cx: &AnalysisContext, f: &Function, e: &Expr) -> bool {
+    let Some(root) = root_ident_of(e) else { return false };
+    cx.contract_of(f.id)
+        .map(|c| {
+            c.state_vars
+                .iter()
+                .any(|v| v.name == root && (v.constant || v.immutable))
+        })
+        .unwrap_or(false)
+}
+
+/// Root identifier of an identifier/member/index chain (`a.b[c]` -> `a`).
+fn root_ident_of(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some(n),
+        ExprKind::Member { base, .. } | ExprKind::Index { base, .. } => root_ident_of(base),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -241,5 +362,156 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "gas-griefing"));
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: a low-level call to a compile-time-fixed address is not an
+    // *untrusted external* callee, so it must not be flagged — even in a
+    // relayer/keeper context. This is the eigenlayer dogfood FP (F-009/F-010):
+    // the EIP-7002/7251 system predeploys are declared
+    // `address internal constant ... = 0x...` and called with
+    // `SYS.call{value: fee}(data)`. The relayer-name gate (`execute`) is
+    // satisfied here on purpose, so what keeps it silent is the callee-trust
+    // check, not the context gate.
+
+    // `constant` predeploy callee (the literal F-009/F-010 shape) → silent.
+    const CONST_PREDEPLOY: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Withdrawals {
+            address internal constant WITHDRAWAL_REQUEST_ADDRESS =
+                0x00000961Ef480Eb55e80D19ad83579A64c007002;
+            function executeWithdrawal(bytes calldata data) external payable {
+                uint256 fee = msg.value;
+                (bool ok, ) = WITHDRAWAL_REQUEST_ADDRESS.call{value: fee}(data);
+                require(ok, "predeploy call failed");
+            }
+        }
+    "#;
+
+    // `immutable` address callee → also contract-pinned → silent.
+    const IMMUTABLE_TARGET: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Forwarder {
+            address private immutable SYSTEM;
+            constructor(address s) { SYSTEM = s; }
+            function forwardCall(bytes calldata data) external payable {
+                (bool ok, ) = SYSTEM.call{value: msg.value}(data);
+                require(ok, "forward failed");
+            }
+        }
+    "#;
+
+    // `address(CONST).call(...)` — the constant wrapped in a cast → silent.
+    const CAST_CONST: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Consolidations {
+            address internal constant CONSOLIDATION_REQUEST_ADDRESS =
+                0x0000BBdDc7CE488642fb579F8B00f3a590007251;
+            function executeConsolidation(bytes calldata data) external payable {
+                (bool ok, ) = address(CONSOLIDATION_REQUEST_ADDRESS).call{value: msg.value}(data);
+                require(ok, "consolidation failed");
+            }
+        }
+    "#;
+
+    // A bare address literal callee `0x....call(...)` → fixed address → silent.
+    const LITERAL_TARGET: &str = r#"
+        pragma solidity ^0.8.0;
+        contract LiteralRelayer {
+            function executeFixed(bytes calldata data) external payable {
+                (bool ok, ) = address(0x00000961Ef480Eb55e80D19ad83579A64c007002)
+                    .call{value: msg.value}(data);
+                require(ok, "fixed call failed");
+            }
+        }
+    "#;
+
+    // Positive control: an attacker-chosen `target` *parameter* (mutable, not a
+    // constant/immutable) in the same relayer context still grieves the
+    // relayer — this MUST stay a finding so the suppression above is precise,
+    // not a blanket silencer.
+    const PARAM_TARGET: &str = r#"
+        pragma solidity ^0.8.0;
+        contract ParamRelayer {
+            function execute(address target, bytes calldata data) external payable {
+                uint256 v = msg.value;
+                (bool ok, ) = target.call{value: v}(data);
+                require(ok, "call failed");
+            }
+        }
+    "#;
+
+    // Positive control: a *mutable* storage address (settable post-deploy) is
+    // not compile-time-pinned, so a call to it stays a finding.
+    const MUTABLE_STORAGE_TARGET: &str = r#"
+        pragma solidity ^0.8.0;
+        contract MutableRelayer {
+            address public target;
+            function setTarget(address t) external { target = t; }
+            function execute(bytes calldata data) external payable {
+                (bool ok, ) = target.call{value: msg.value}(data);
+                require(ok, "call failed");
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_constant_predeploy_callee() {
+        let fs = run(CONST_PREDEPLOY);
+        assert!(
+            !fs.iter().any(|f| f.detector == "gas-griefing"),
+            "constant predeploy callee should not be gas-griefing: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_immutable_callee() {
+        let fs = run(IMMUTABLE_TARGET);
+        assert!(
+            !fs.iter().any(|f| f.detector == "gas-griefing"),
+            "immutable address callee should not be gas-griefing: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_cast_constant_callee() {
+        let fs = run(CAST_CONST);
+        assert!(
+            !fs.iter().any(|f| f.detector == "gas-griefing"),
+            "address(CONST) callee should not be gas-griefing: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_literal_address_callee() {
+        let fs = run(LITERAL_TARGET);
+        assert!(
+            !fs.iter().any(|f| f.detector == "gas-griefing"),
+            "literal address callee should not be gas-griefing: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn fires_on_param_target() {
+        let fs = run(PARAM_TARGET);
+        assert!(
+            fs.iter().any(|f| f.detector == "gas-griefing"),
+            "caller-supplied target param should still be gas-griefing: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn fires_on_mutable_storage_target() {
+        let fs = run(MUTABLE_STORAGE_TARGET);
+        assert!(
+            fs.iter().any(|f| f.detector == "gas-griefing"),
+            "mutable storage target should still be gas-griefing: {:?}",
+            fs
+        );
     }
 }

@@ -85,6 +85,97 @@ fn excessive_nesting(src: &str, limit: usize) -> Option<usize> {
     (max > limit).then_some(max)
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// True if position `i` begins a word (the byte before it is not an identifier
+/// byte) — used to match keywords (`layout`, `at`, `is`) without matching a
+/// substring inside a larger identifier.
+fn word_boundary_before(bytes: &[u8], i: usize) -> bool {
+    i == 0 || !is_ident_byte(bytes[i - 1])
+}
+
+/// End (exclusive) of a `layout at <expr>` directive: the offset of the `is`
+/// keyword or the `{` that begins the contract body, scanning at bracket depth 0.
+/// Returns `None` if neither is found before a `;`/EOF (malformed → don't touch).
+fn find_layout_expr_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut k = start;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b'{' if depth == 0 => return Some(k),
+            b';' if depth == 0 => return None,
+            b'i' if depth == 0
+                && bytes[k..].starts_with(b"is")
+                && word_boundary_before(bytes, k)
+                && (k + 2 >= bytes.len() || !is_ident_byte(bytes[k + 2])) =>
+            {
+                return Some(k)
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Solidity 0.8.29 introduced the `contract X layout at <slot> is ...` custom
+/// storage-layout directive (EIP-7201 era). `solang-parser` 0.3.5 predates it and
+/// rejects the **entire file**, silently dropping every contract in it from
+/// analysis. We blank the `layout at <expr>` span with spaces — preserving every
+/// byte offset, so all `Span`s still line up with the original source we keep for
+/// reporting — before handing the text to the parser. Returns `None` when the
+/// directive is absent (the overwhelmingly common case → no allocation).
+fn blank_layout_directive(src: &str) -> Option<String> {
+    const KW: &[u8] = b"layout";
+    if !src.contains("layout") {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i + KW.len() <= bytes.len() {
+        if &bytes[i..i + KW.len()] == KW && word_boundary_before(bytes, i) {
+            // After `layout`: whitespace, then the `at` keyword, then whitespace.
+            let mut j = i + KW.len();
+            let ws_start = j;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let saw_ws = j > ws_start;
+            if saw_ws
+                && j + 2 <= bytes.len()
+                && &bytes[j..j + 2] == b"at"
+                && (j + 2 == bytes.len() || !is_ident_byte(bytes[j + 2]))
+            {
+                j += 2;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if let Some(end) = find_layout_expr_end(bytes, j) {
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    for b in buf.iter_mut().take(end).skip(i) {
+                        // Preserve newlines (line numbers) and any non-ASCII byte;
+                        // blank everything else of the directive to a space.
+                        if *b != b'\n' && *b != b'\r' && *b < 0x80 {
+                            *b = b' ';
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // We only ever overwrote ASCII bytes with ASCII spaces, so the buffer is still
+    // valid UTF-8; `from_utf8` cannot fail, but stay lossless to be safe.
+    out.map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 /// Parse in-memory `(path, content)` sources into an [`Scir`].
 pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     let mut scir = Scir::new();
@@ -108,7 +199,12 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
             srcs.push(content);
             continue;
         }
-        match solang_parser::parse(&content, file_no as usize) {
+        // Recover Solidity 0.8.29 `contract X layout at <slot> is ...` headers that
+        // solang-parser 0.3.5 rejects, by blanking the directive (offset-preserving,
+        // so spans still index the original `content` we store below for reporting).
+        let blanked = blank_layout_directive(&content);
+        let parse_input: &str = blanked.as_deref().unwrap_or(&content);
+        match solang_parser::parse(parse_input, file_no as usize) {
             Ok((unit, _comments)) => {
                 units.push((file_no, unit));
             }
@@ -660,6 +756,70 @@ mod tests {
         let out = parse_sources(vec![("bomb.sol".into(), src)]);
         assert!(out.file_errors.iter().any(|e| e.message.contains("nesting")));
         assert!(out.scir.contract_named("C").is_none(), "pathological file is skipped");
+    }
+
+    #[test]
+    fn inline_require_with_call_in_condition_is_access_control() {
+        // `require(msg.sender == authority.governor())` — the condition contains an
+        // external call. The guard must still be recognized as a MsgSenderCheck
+        // (regression: the inner call used to be ordered ahead of the guard, pushing
+        // it past the leading-guard cutoff and silently dropping it).
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.20;
+            interface IAuthority { function governor() external view returns (address); }
+            contract Treasury {
+                IAuthority public authority;
+                mapping(uint256 => bool) public flags;
+                function disable(uint256 s) external {
+                    require(msg.sender == authority.governor(), "unauth");
+                    flags[s] = true;
+                }
+            }
+            "#,
+        );
+        let c = scir.contract_named("Treasury").unwrap();
+        let f = scir.functions_of(c.id).find(|f| f.name == "disable").unwrap();
+        assert!(
+            f.effects.guards.iter().any(|g| matches!(g.kind, GuardKind::MsgSenderCheck)),
+            "inline msg.sender==authority.governor() guard must be captured; guards={:?}",
+            f.effects.guards
+        );
+    }
+
+    #[test]
+    fn recovers_solidity_0_8_29_layout_at_directive() {
+        // The `layout at <slot>` header (Solidity 0.8.29) must not drop the file.
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.29;
+            interface IFoo { function x() external view returns (uint256); }
+            contract Foo layout at 151 is IFoo {
+                uint256 public x;
+                function set(uint256 v) external { x = v; }
+            }
+            "#,
+        );
+        let c = scir.contract_named("Foo").expect("Foo recovered despite `layout at`");
+        assert!(c.bases.iter().any(|b| b == "IFoo"), "inheritance after the directive preserved");
+        let set = scir.functions_of(c.id).find(|f| f.name == "set").expect("set");
+        assert!(set.effects.writes_var("x"));
+        // Offset preservation: the span of the function still reads real source.
+        assert!(scir.span_text(set.span).contains("x = v"));
+    }
+
+    #[test]
+    fn layout_at_no_inheritance_blanks_to_brace() {
+        let scir = parse_one(
+            r#"
+            pragma solidity ^0.8.29;
+            contract Bar layout at 42 {
+                uint256 public y;
+                function g() external { y = 1; }
+            }
+            "#,
+        );
+        assert!(scir.contract_named("Bar").is_some(), "Bar recovered (blank up to `{{`)");
     }
 
     #[test]
