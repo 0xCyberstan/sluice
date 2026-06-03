@@ -1,14 +1,26 @@
-//! Slippage / deadline protection: AMM swaps and liquidity operations that are
-//! routed with no minimum-output bound (`amountOutMin: 0` / `minOut: 0`) or with
-//! a no-op deadline (`block.timestamp` / `type(uint256).max`). This is the
-//! pervasive MEV value-leak class — a router call with `minOut == 0` can be
-//! sandwiched and drained to dust; a `block.timestamp` deadline is satisfied by
-//! the very block the transaction lands in, so it provides no expiry guarantee.
+//! Slippage / deadline protection. Two value-leak shapes:
+//!
+//! 1. **Routed swap/LP op** with no minimum-output bound (`amountOutMin: 0` /
+//!    `minOut: 0`) or a no-op deadline (`block.timestamp` / `type(uint256).max`).
+//!    A router call with `minOut == 0` can be sandwiched and drained to dust; a
+//!    `block.timestamp` deadline is satisfied by the very block the transaction
+//!    lands in, so it provides no expiry guarantee.
+//!
+//! 2. **Self-priced mint/redeem with no slippage bound** — a public/external
+//!    function that itself *mints* or *redeems/burns* tokens at a price derived
+//!    from current pool/curve state (a bonding curve such as Frankencoin's cubic
+//!    `calculateShares`/`calculateProceeds`, or an AMM/spot read), moving value
+//!    to/from the caller, while taking **no** `minOut`/`maxIn`/`minShares`/
+//!    `deadline`-style protection parameter and enforcing no such bound. The price
+//!    moves with reserves/supply, so the trade can be sandwiched on the curve and
+//!    the caller front-run for the full slippage. This is the same MEV class as a
+//!    `minOut: 0` router swap, but the priced operation *is* the function rather
+//!    than a downstream router call, so the arg-level check in (1) never sees it.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{Call, Expr, ExprKind, Lit, Span};
+use sluice_ir::{Call, Expr, ExprKind, Function, Lit, Span};
 
 pub struct SlippageDetector;
 
@@ -94,9 +106,235 @@ impl Detector for SlippageDetector {
                     out.push(cx.finish(b, f.id, e.span));
                 });
             }
+
+            // Class 2: the function is *itself* a curve/pool-priced mint or
+            // redeem with no slippage protection (see module docs).
+            if let Some(finding) = self_priced_mint_redeem(cx, f) {
+                out.push(finding);
+            }
         }
         out
     }
+}
+
+/// Class 2 — a self-priced mint/redeem entry point that lacks any slippage
+/// bound. Returns at most one finding for the function (anchored at its span).
+///
+/// Conservative by construction: it requires *all* of
+///   (a) the body mints or burns shares (`_mint`/`mint`/`_burn`/`burn`),
+///   (b) value moves to/from the caller — a token/ETH transfer out, a `{value:}`
+///       send, or the function is an inbound value-receive hook (ERC677/777/1363),
+///   (c) the sizing is derived from current pool/curve state — a bonding-curve /
+///       share-pricing helper (`calculateShares`, `calculateProceeds`, `_power3`,
+///       `price`, `previewMint`, ...) or a manipulable spot-price read, and
+///   (d) the function neither takes nor enforces any min-out / max-in / min-shares
+///       / deadline-style protection.
+/// A plain router swap is unaffected: it forwards a `minOut`/`deadline` to a
+/// downstream call (so (d) suppresses it) and does not itself mint/burn (so (a)
+/// fails). A vault deposit/withdraw that already takes a `minShares`/`minAmountOut`
+/// guard stays silent via (d).
+fn self_priced_mint_redeem(cx: &AnalysisContext, f: &Function) -> Option<Finding> {
+    let (mints, redeems) = mint_or_redeem_action(f);
+    if !mints && !redeems {
+        return None;
+    }
+    if !moves_value_to_or_from_caller(f) {
+        return None;
+    }
+    if !priced_off_curve_or_pool(cx, f) {
+        return None;
+    }
+    if has_slippage_protection(cx, f) {
+        return None;
+    }
+
+    let (verb, action) = if mints && redeems {
+        ("mint/redeem", "mints and redeems")
+    } else if mints {
+        ("mint", "mints")
+    } else {
+        ("redeem", "redeems")
+    };
+
+    let b = FindingBuilder::new("slippage", Category::Slippage)
+        .title("Curve/pool-priced mint or redeem with no slippage bound")
+        .severity(Severity::Medium)
+        .confidence(0.55)
+        .dimension(Dimension::ValueFlow)
+        .message(format!(
+            "`{}` {action} tokens at a price read from current pool/curve state \
+             (a bonding curve or AMM/spot reserves) and moves value to/from the caller, \
+             but takes no `minOut`/`minShares`/`maxIn` parameter and enforces no \
+             minimum-output bound or deadline. Because the price moves with the pool's \
+             reserves/supply within a block, a searcher can sandwich the {verb}: shift the \
+             curve price just before the victim's transaction and back after it, capturing \
+             the entire unbounded slippage as MEV and returning only dust to the caller. \
+             This is the same value-leak class as a `minOut: 0` router swap — here the \
+             priced operation is the function itself, so an argument-level `minOut` check \
+             never applies.",
+            f.name
+        ))
+        .recommendation(
+            "Add a caller-supplied minimum-output (e.g. `minShares` on mint, `minProceeds`/\
+             `minAmountOut` on redeem) computed off-chain with a slippage tolerance, and \
+             `require` the realized amount meets it; a real future `deadline` further bounds \
+             how long the quote stays valid. Never price a mint/redeem off live curve state \
+             without a user-enforced bound.",
+        );
+    Some(cx.finish(b, f.id, f.span))
+}
+
+/// `(mints, redeems)` — does the body invoke a mint and/or a burn primitive?
+/// Matches an internal call whose name (lowercased, leading `_` stripped) begins
+/// with `mint` or `burn` — the OpenZeppelin/ERC20 convention (`_mint`, `_burn`,
+/// `mint`, `burnFrom`, `_mintShares`, ...). A redeem path burns the caller's
+/// shares, so `burn` is the redeem signal.
+fn mint_or_redeem_action(f: &Function) -> (bool, bool) {
+    let mut mints = false;
+    let mut redeems = false;
+    for n in &f.effects.internal_calls {
+        let s = n.trim_start_matches('_').to_ascii_lowercase();
+        if s.starts_with("mint") {
+            mints = true;
+        }
+        if s.starts_with("burn") {
+            redeems = true;
+        }
+    }
+    (mints, redeems)
+}
+
+/// True if value (tokens or native ETH) moves to/from the caller: a `transfer`/
+/// `transferFrom`/`safeTransfer*`/`send` call site, a `{value:}` ETH send, or the
+/// function is an inbound value-*receive* hook (the caller is paying in by the
+/// very act of calling it). The receive-hook arm is what catches an ERC677
+/// `onTokenTransfer` mint, where the inbound ZCHF is the value being priced.
+fn moves_value_to_or_from_caller(f: &Function) -> bool {
+    if is_value_receive_hook(&f.name) {
+        return true;
+    }
+    f.effects.call_sites.iter().any(|c| {
+        if c.sends_value {
+            return true;
+        }
+        matches!(
+            c.func_name.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("transfer" | "transferfrom" | "safetransfer" | "safetransferfrom" | "send")
+        )
+    })
+}
+
+/// ERC677 / ERC777 / ERC1363 inbound value-receive hooks. When a token is sent to
+/// the contract, the token contract calls back into one of these with the inbound
+/// `amount`; minting against that amount on a curve is the Frankencoin shape.
+fn is_value_receive_hook(name: &str) -> bool {
+    matches!(
+        name,
+        "onTokenTransfer"      // ERC677
+            | "tokensReceived" // ERC777
+            | "onTransferReceived" // ERC1363
+            | "onERC1363Received"
+    )
+}
+
+/// True if the operation is sized from *current* pool/curve state. Two signals:
+/// an internal call to a bonding-curve / share-pricing helper (curated names
+/// covering the cubic-curve and ERC4626-preview families), or a body
+/// sub-expression the dataflow labels price-like (a manipulable spot read such as
+/// `getReserves`/`slot0`/`balanceOf(pool)`). `price` is a pricing-helper name:
+/// Frankencoin's `price()` is the curve spot
+/// (`VALUATION_FACTOR * equity * 1e18 / totalSupply`).
+fn priced_off_curve_or_pool(cx: &AnalysisContext, f: &Function) -> bool {
+    if f.effects.internal_calls.iter().any(|n| is_curve_pricing_name(n)) {
+        return true;
+    }
+    // Manipulable spot-price read anywhere in the body (e.g. `getReserves()`).
+    let mut price_like = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if !price_like && matches!(&e.kind, ExprKind::Call(_)) && cx.is_price_like(f.id, e) {
+                price_like = true;
+            }
+        });
+        if price_like {
+            break;
+        }
+    }
+    price_like
+}
+
+/// Curated bonding-curve / share-pricing helper names (lowercased, `_` ignored).
+/// Deliberately a fixed family — bonding-curve math (`cubicRoot`/`power3`), the
+/// Frankencoin `calculateShares`/`calculateProceeds`/`price` curve, and the
+/// ERC4626 `preview*`/`convertTo*` quote — rather than any function containing
+/// "price", so an unrelated helper does not trip it.
+fn is_curve_pricing_name(name: &str) -> bool {
+    let n = name.trim_start_matches('_').to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "calculateshares"
+            | "calculatesharesinternal"
+            | "calculateproceeds"
+            | "cubicroot"
+            | "power3"
+            | "price"
+            | "currentprice"
+            | "spotprice"
+            | "getpriceperfullshare"
+            | "pricepershare"
+            | "previewmint"
+            | "previewredeem"
+            | "previewdeposit"
+            | "previewwithdraw"
+            | "converttoshares"
+            | "converttoassets"
+    )
+}
+
+/// True if the function takes *or* enforces any slippage/deadline protection.
+/// This is a suppressor: if the author wired up any min-out / max-in / min-shares
+/// / deadline machinery (a parameter so named, or the keyword anywhere in the
+/// comment-stripped body), we assume the operation is bounded and stay silent —
+/// trading a little recall for precision so bounded vault deposits/withdrawals do
+/// not fire.
+fn has_slippage_protection(cx: &AnalysisContext, f: &Function) -> bool {
+    if f.params.iter().any(|p| {
+        p.name
+            .as_deref()
+            .map(|n| is_protection_token(&n.to_ascii_lowercase()))
+            .unwrap_or(false)
+    }) {
+        return true;
+    }
+    let body = cx.source_text(f.span);
+    PROTECTION_TOKENS.iter().any(|t| body.contains(t))
+}
+
+/// Substrings that name a slippage / deadline guard. Kept specific (`minout`,
+/// `minshares`, ...) so they don't match unrelated identifiers like Frankencoin's
+/// `MINIMUM_EQUITY` (which contains "minimum" but none of these tokens).
+const PROTECTION_TOKENS: &[&str] = &[
+    "minout",
+    "minamount",
+    "minamountout",
+    "amountoutmin",
+    "minshares",
+    "mintokens",
+    "minreturn",
+    "minreceived",
+    "minproceeds",
+    "minprice",
+    "maxin",
+    "maxamountin",
+    "amountinmax",
+    "maxslippage",
+    "slippage",
+    "deadline",
+    "sqrtpricelimit",
+];
+
+fn is_protection_token(name: &str) -> bool {
+    PROTECTION_TOKENS.iter().any(|t| name.contains(t))
 }
 
 /// Swap / liquidity router method names worth inspecting. Restricting to these
@@ -305,5 +543,125 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "slippage"));
+    }
+
+    // ---- Class 2: self-priced mint/redeem on a bonding curve ----
+
+    // Frankencoin-shaped Equity: mint via the ERC677 `onTokenTransfer` hook and
+    // redeem via `redeem`, both priced off a cubic bonding curve, neither taking a
+    // min-out / deadline. Both must fire.
+    const CURVE_VULN: &str = r#"
+        interface IZCHF {
+            function equity() external view returns (uint256);
+            function transfer(address to, uint256 amount) external returns (bool);
+        }
+        contract Equity {
+            IZCHF public zchf;
+            uint256 public totalSupply;
+            function _mint(address to, uint256 amt) internal { totalSupply += amt; }
+            function _burn(address from, uint256 amt) internal { totalSupply -= amt; }
+            function _cubicRoot(uint256 x) internal pure returns (uint256) { return x; }
+            function _power3(uint256 x) internal pure returns (uint256) { return x; }
+            function calculateSharesInternal(uint256 capital, uint256 inv) internal view returns (uint256) {
+                return _cubicRoot(capital + inv);
+            }
+            function calculateProceeds(uint256 shares) public view returns (uint256) {
+                return _power3(shares);
+            }
+            // ERC677 receive hook: mints FPS for inbound ZCHF, priced on the curve.
+            function onTokenTransfer(address from, uint256 amount, bytes calldata) external returns (bool) {
+                uint256 shares = calculateSharesInternal(zchf.equity() - amount, amount);
+                _mint(from, shares);
+                return true;
+            }
+            // Burns shares and pays out ZCHF, priced on the curve.
+            function redeem(address target, uint256 shares) public returns (uint256) {
+                uint256 proceeds = calculateProceeds(shares);
+                _burn(msg.sender, shares);
+                zchf.transfer(target, proceeds);
+                return proceeds;
+            }
+        }
+    "#;
+
+    // Same redeem, but it now takes and enforces a caller `minProceeds` bound —
+    // the operation is slippage-protected, so it must stay silent.
+    const CURVE_SAFE: &str = r#"
+        interface IZCHF {
+            function equity() external view returns (uint256);
+            function transfer(address to, uint256 amount) external returns (bool);
+        }
+        contract Equity {
+            IZCHF public zchf;
+            uint256 public totalSupply;
+            function _burn(address from, uint256 amt) internal { totalSupply -= amt; }
+            function _power3(uint256 x) internal pure returns (uint256) { return x; }
+            function calculateProceeds(uint256 shares) public view returns (uint256) {
+                return _power3(shares);
+            }
+            function redeem(address target, uint256 shares, uint256 minProceeds) public returns (uint256) {
+                uint256 proceeds = calculateProceeds(shares);
+                require(proceeds >= minProceeds, "slippage");
+                _burn(msg.sender, shares);
+                zchf.transfer(target, proceeds);
+                return proceeds;
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_curve_priced_mint_and_redeem() {
+        let fs = run(CURVE_VULN);
+        let slip: Vec<_> = fs
+            .iter()
+            .filter(|f| f.detector == "slippage" && f.category == sluice_findings::Category::Slippage)
+            .collect();
+        assert!(
+            slip.iter().any(|f| f.function == "onTokenTransfer"),
+            "expected a slippage finding on the curve mint hook: {:?}",
+            fs
+        );
+        assert!(
+            slip.iter().any(|f| f.function == "redeem"),
+            "expected a slippage finding on the curve redeem: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_curve_redeem_with_minout() {
+        let fs = run(CURVE_SAFE);
+        assert!(
+            !fs.iter()
+                .any(|f| f.detector == "slippage" && f.function == "redeem"),
+            "a redeem that enforces minProceeds must not fire: {:?}",
+            fs
+        );
+    }
+
+    // A bounded vault deposit (takes `minShares`) priced off a curve must stay
+    // silent — guards the precision side of the broadening.
+    #[test]
+    fn silent_on_bounded_vault_deposit() {
+        let src = r#"
+            contract Vault {
+                uint256 public totalSupply;
+                function _mint(address to, uint256 amt) internal { totalSupply += amt; }
+                function previewDeposit(uint256 assets) public view returns (uint256) { return assets; }
+                function deposit(uint256 assets, uint256 minShares, address to) external returns (uint256) {
+                    uint256 shares = previewDeposit(assets);
+                    require(shares >= minShares, "slippage");
+                    _mint(to, shares);
+                    return shares;
+                }
+            }
+        "#;
+        let fs = run(src);
+        assert!(
+            !fs.iter()
+                .any(|f| f.detector == "slippage" && f.function == "deposit"),
+            "a deposit that enforces minShares must not fire: {:?}",
+            fs
+        );
     }
 }

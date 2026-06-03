@@ -70,6 +70,25 @@ impl Detector for TwapManipulationDetector {
 
             let src = cx.source_text(f.span);
 
+            // --- (0) Pump / oracle reserve-reader surface (the Basin MultiFlowPump
+            //         class) ---
+            //
+            // Beyond the Uniswap-v2/v3 vocabulary handled below, a whole family of
+            // AMM *Pumps* expose their own oracle surface as a `read*Reserves` /
+            // `readInstantaneous*` getter that hands back the pool's geometric-mean
+            // reserves. Downstream integrators consume these as a price. The
+            // last-stored reserves (`readLastReserves`) are written by a single
+            // `update`/seeded `_init`, and the "instantaneous" EMA collapses toward
+            // the live `getReserves()` for a short elapsed window — so a single large
+            // swap in the same/adjacent block before the read moves the reported
+            // reserves. This shape calls none of `slot0`/`observe`/`consult`/a
+            // cumulative getter, so step (1) below never sees it. Recognize it here,
+            // tightly scoped so we do not fire on every `getReserves`.
+            if let Some(finding) = pump_reserve_reader_finding(self, cx, f, &src) {
+                out.push(finding);
+                continue;
+            }
+
             // --- (1) Does this function actually *call* a Uniswap-style oracle read? ---
             //
             // Precision-critical: we classify the body by its CALL EXPRESSIONS, not by
@@ -240,6 +259,138 @@ impl Detector for TwapManipulationDetector {
 }
 
 // ------------------------------------------------------------------ heuristics
+
+/// The Basin-`MultiFlowPump` class: a Pump/oracle contract whose oracle surface is
+/// a `read*Reserves` / `readInstantaneous*` getter returning the pool's geometric-
+/// mean reserves, where the returned value reflects the **last-stored** or
+/// **instantaneous** reserves (movable by a same/adjacent-block swap) and there is
+/// no enforced minimum averaging window. Returns a finding anchored on `f` when the
+/// shape matches, else `None`.
+///
+/// Scoped tightly to avoid the "every `getReserves`" false positive (precision is
+/// make-or-break here):
+///   * the owning contract must be **pump/oracle-like** (its name, or one of its
+///     bases/implemented interfaces, contains `pump` or `oracle`) — a plain money-
+///     market `Comet.getReserves()` returning protocol-treasury reserves is on a
+///     contract with neither marker and is therefore never matched;
+///   * the function name must be a **reserve/price reader** (`read*reserves`,
+///     `readinstantaneous*`, or exactly `getreserves`);
+///   * it must be a **last-stored / instantaneous** reader, NOT a true cumulative
+///     or time-weighted-average reader — a name containing `cumulative` or `twa`
+///     (Basin's `readLastCumulativeReserves` / `readCumulativeReserves` /
+///     `readTwaReserves`) is the genuine TWA surface and is left silent;
+///   * it must **return a numeric quantity** (`uint*`/`int*`, incl. arrays) — a
+///     `bytes`/`string` encoder return is not a directly-consumed price;
+///   * no meaningful min-window / lower-bound guard is present (the same window
+///     suppressions used for the Uniswap path).
+fn pump_reserve_reader_finding(
+    det: &TwapManipulationDetector,
+    cx: &AnalysisContext,
+    f: &sluice_ir::Function,
+    src: &str,
+) -> Option<Finding> {
+    use crate::detector::Detector;
+
+    // (a) Owning contract must look like a pump / oracle (by its own name or by a
+    //     base/implemented-interface name). This is the key precision gate.
+    let contract = cx.contract_of(f.id)?;
+    let cname = contract.name.to_ascii_lowercase();
+    let contract_is_pump_or_oracle = is_pump_or_oracle_marker(&cname)
+        || contract.bases.iter().any(|b| is_pump_or_oracle_marker(&b.to_ascii_lowercase()));
+    if !contract_is_pump_or_oracle {
+        return None;
+    }
+
+    // (b) Function name must be a reserve/price reader surface.
+    let fname = f.name.to_ascii_lowercase();
+    let is_reserve_reader =
+        (fname.starts_with("read") && fname.contains("reserves")) || fname == "getreserves";
+    if !is_reserve_reader {
+        return None;
+    }
+
+    // (c) Must be a last-stored / instantaneous reader — NOT the genuine cumulative
+    //     / time-weighted-average surface, which is the protocol's correct
+    //     manipulation-resistant read and must stay silent.
+    if fname.contains("cumulative") || fname.contains("twa") {
+        return None;
+    }
+
+    // (d) Must return a numeric reserves/price quantity (a `bytes`/`string` encoder
+    //     return such as `readCumulativeReserves`'s `abi.encode(...)` is excluded by
+    //     (c) already; this also drops any non-quantity getter that slipped through).
+    if !f.returns.iter().any(|r| ty_is_numeric_quantity(&r.ty)) {
+        return None;
+    }
+
+    // (e) Window suppression: if a meaningful fixed window constant, or an enforced
+    //     lower bound on a caller-supplied window, is present (in the function or
+    //     anywhere on the contract), this is a properly time-guarded reader.
+    if has_meaningful_window_constant(src) || enforces_window_lower_bound(src) {
+        return None;
+    }
+    let csrc = cx.source_text(contract.span);
+    if has_meaningful_window_constant(&csrc) {
+        return None;
+    }
+
+    // Positive description of why the read is single-update / spot-manipulable.
+    let why = if fname.contains("instantaneous") {
+        "returns an \"instantaneous\" geometric-mean reserve whose EMA collapses toward the \
+         live pool reserves over a short elapsed window"
+    } else if fname.contains("last") {
+        "returns the *last-stored* reserves, which are written by a single `update` (and the \
+         seeded first update skips the per-block change cap entirely)"
+    } else {
+        "returns reserves that reflect the current/last-stored pool state"
+    };
+
+    let b = FindingBuilder::new(det.id(), Category::TwapManipulation)
+        .title("Pump/oracle reserve reader is single-update / spot-manipulable (no min averaging window)")
+        // Medium, matching the calibrated severity for this class: a raw pump reader
+        // is a manipulable SURFACE (a consumer footgun), directly exploitable only
+        // when a downstream integrator trusts it as a price feed without adding its
+        // own averaging — so absent a proven on-chain consumer it is not a standalone
+        // Crit/High. (Single ValueFlow dimension keeps the corroboration scorer from
+        // promoting it past Medium on the reader alone.)
+        .severity(Severity::Medium)
+        .confidence(0.5)
+        .dimension(Dimension::ValueFlow)
+        .message(format!(
+            "`{}` on `{}` is a pump/oracle reserve reader that {}. Downstream integrators consume \
+             this getter as a price feed, but the returned reserves track the current/last-stored \
+             pool state with no enforced minimum averaging window, so an attacker can move the pool \
+             with a single large swap in the same/adjacent block (optionally flash-loan-assisted) \
+             right before the read and mint/borrow/liquidate against a manipulated reserve ratio. A \
+             geometric-mean / EMA over a per-block cap does not by itself bound a single-update or \
+             same-block move.",
+            f.name, contract.name, why
+        ))
+        .recommendation(
+            "Consume the time-weighted-average surface instead (read cumulative reserves at a \
+             stored checkpoint and divide by a meaningful elapsed window — Basin's \
+             `readTwaReserves`/`readCumulativeReserves`), enforce a minimum elapsed window between \
+             the start and end observations, and never feed a last-stored / instantaneous reserve \
+             read into valuation; cross-check against an independent oracle where possible.",
+        );
+    Some(cx.finish(b, f.id, f.span))
+}
+
+/// True if a (lowercased) name contains a pump/oracle marker — used to scope the
+/// pump-reserve-reader class to contracts that actually expose an oracle surface.
+fn is_pump_or_oracle_marker(name: &str) -> bool {
+    name.contains("pump") || name.contains("oracle")
+}
+
+/// True if a return type denotes a numeric quantity (`uint*` / `int*`), including a
+/// dynamic/fixed array of one (`uint256[]`). A `bytes`/`string`/`bool`/`address`
+/// return is not a directly-consumed numeric price.
+fn ty_is_numeric_quantity(ty: &str) -> bool {
+    // Strip any storage-location/keyword suffix, array brackets, and whitespace to
+    // get the element base, e.g. `uint256[] memory` -> `uint256`.
+    let base = ty.trim().split([' ', '[']).next().unwrap_or("").trim();
+    base.starts_with("uint") || base.starts_with("int")
+}
 
 /// Which Uniswap-style oracle reads a function body actually *calls*.
 #[derive(Default)]
@@ -793,6 +944,134 @@ mod tests {
             fs.iter().any(|f| f.detector == "twap-manipulation"),
             "a genuine price0CumulativeLast TWAP read used for a price must still fire: {:?}",
             fs
+        );
+    }
+
+    // ---- Pump/oracle reserve-reader class (the Basin MultiFlowPump shape) ----
+
+    // Vulnerable (real shape: Basin `MultiFlowPump.readLastReserves`): a Pump/oracle
+    // contract whose oracle surface is a `read*Reserves` getter handing back the
+    // *last-stored* geometric-mean reserves (written by a single `update`). It calls
+    // none of slot0/observe/consult/a cumulative getter — the Uniswap path never sees
+    // it — yet integrators consume it as a price, and a single same/adjacent-block
+    // swap before the read moves the reported reserves. MUST fire.
+    const PUMP_LAST_RESERVES: &str = r#"
+        interface IPump {}
+        interface IInstantaneousPump {}
+        library LibLastReserveBytes {
+            function readLastReserves(bytes32 slot) internal pure returns (uint8, uint40, bytes16[] memory) {}
+        }
+        contract MultiFlowPump is IPump, IInstantaneousPump {
+            using LibLastReserveBytes for bytes32;
+            function readLastReserves(address well) public view returns (uint256[] memory reserves) {
+                bytes32 slot = bytes32(bytes20(well));
+                (uint8 n,, bytes16[] memory bytesReserves) = slot.readLastReserves();
+                reserves = new uint256[](n);
+                for (uint256 i; i < n; ++i) {
+                    reserves[i] = uint256(uint128(bytesReserves[i]));
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn pump_last_reserves_reader_fires() {
+        let fs = run(PUMP_LAST_RESERVES);
+        let hit: Vec<_> = fs.iter().filter(|f| f.detector == "twap-manipulation").collect();
+        assert!(
+            hit.iter().any(|f| f.function == "readLastReserves"),
+            "a pump/oracle last-reserves reader (single-update-manipulable, no window) must fire: {:?}",
+            fs
+        );
+    }
+
+    // Safe (the genuine TWA surface on the SAME pump): a `readTwaReserves` reader that
+    // takes a caller-supplied start checkpoint + `startTimestamp` and divides the
+    // cumulative-reserve delta by a non-zero elapsed window (reverting on zero). This
+    // is the protocol's correct manipulation-resistant read; its name contains `twa`
+    // and it is a cumulative consumer — MUST stay silent.
+    const PUMP_TWA_RESERVES: &str = r#"
+        interface ICumulativePump {}
+        contract MultiFlowPump is ICumulativePump {
+            error NoTimePassed();
+            function _readCumulativeReserves(address) internal view returns (bytes16[] memory) {}
+            function readTwaReserves(
+                address well,
+                bytes calldata startCumulativeReserves,
+                uint256 startTimestamp,
+                bytes memory
+            ) public view returns (uint256[] memory twaReserves) {
+                bytes16[] memory cum = _readCumulativeReserves(well);
+                bytes16[] memory startCum = abi.decode(startCumulativeReserves, (bytes16[]));
+                uint256 deltaTimestamp = block.timestamp - startTimestamp;
+                if (deltaTimestamp == 0) revert NoTimePassed();
+                twaReserves = new uint256[](cum.length);
+                for (uint256 i; i < cum.length; ++i) {
+                    twaReserves[i] = uint256(uint128(cum[i]) - uint128(startCum[i])) / deltaTimestamp;
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn pump_twa_reserves_reader_is_silent() {
+        let fs = run(PUMP_TWA_RESERVES);
+        assert!(
+            !fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "the genuine time-weighted-average (`readTwaReserves`) surface must not fire: {:?}",
+            fs.iter().filter(|f| f.detector == "twap-manipulation").collect::<Vec<_>>()
+        );
+    }
+
+    // Safe (the Comet false-positive guard): a money-market `getReserves()` returning
+    // a single `int` of *protocol-treasury* reserves — NOT a pool oracle. The owning
+    // contract carries no `pump`/`oracle` marker, so the pump-reader class must not
+    // claim it. MUST stay silent (this is the precision gate the dogfood relies on).
+    const NON_ORACLE_GETRESERVES: &str = r#"
+        interface IERC20 { function balanceOf(address) external view returns (uint256); }
+        contract Comet {
+            address public baseToken;
+            uint256 public totalSupplyBase;
+            uint256 public totalBorrowBase;
+            function getReserves() public view returns (int) {
+                uint256 balance = IERC20(baseToken).balanceOf(address(this));
+                return int(balance) - int(totalSupplyBase) + int(totalBorrowBase);
+            }
+        }
+    "#;
+
+    #[test]
+    fn non_oracle_getreserves_is_silent() {
+        let fs = run(NON_ORACLE_GETRESERVES);
+        assert!(
+            !fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "a money-market getReserves (no pump/oracle contract marker) must not fire: {:?}",
+            fs.iter().filter(|f| f.detector == "twap-manipulation").collect::<Vec<_>>()
+        );
+    }
+
+    // Over-suppression guard within the pump class: a pump reserve reader that DOES
+    // enforce a meaningful minimum averaging window (a `>= 1800` lower bound on a
+    // caller-supplied window) is properly guarded and MUST stay silent — the window
+    // suppression must apply to the pump-reader path too.
+    const PUMP_RESERVES_WINDOWED: &str = r#"
+        interface IPump {}
+        contract WindowedPump is IPump {
+            function readReserves(address well, uint256 window) public view returns (uint256[] memory reserves) {
+                require(window >= 1800, "window too short");
+                reserves = new uint256[](2);
+                reserves[0] = window;
+            }
+        }
+    "#;
+
+    #[test]
+    fn pump_reserves_reader_with_window_bound_is_silent() {
+        let fs = run(PUMP_RESERVES_WINDOWED);
+        assert!(
+            !fs.iter().any(|f| f.detector == "twap-manipulation"),
+            "a pump reserve reader enforcing a >= 1800s window must not fire: {:?}",
+            fs.iter().filter(|f| f.detector == "twap-manipulation").collect::<Vec<_>>()
         );
     }
 }

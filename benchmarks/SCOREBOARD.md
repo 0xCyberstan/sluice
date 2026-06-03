@@ -9,13 +9,13 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 | Contest | In-class recall | Out-of-class recall | Crit/High | Unmatched C/H | Total findings |
 |---|---|---|---|---|---|
 | `2022-12-tigris` | 100% (5/5) | 0% (0/3) | 3 | 3 | 155 |
-| `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 84 |
+| `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 86 |
 | `2023-04-caviar` | 67% (2/3) | 0% (0/3) | 0 | 0 | 41 |
-| `2023-04-frankencoin` | 50% (4/8) | 0% (0/13) | 2 | 1 | 62 |
+| `2023-04-frankencoin` | 88% (7/8) | 0% (0/13) | 2 | 1 | 66 |
 | `2023-06-stader` | 50% (2/4) | 0% (0/11) | 3 | 2 | 29 |
-| `2023-07-basin` | 0% (0/3) | 0% (0/2) | 0 | 0 | 33 |
+| `2023-07-basin` | 100% (3/3) | 0% (0/2) | 0 | 0 | 42 |
 | `2024-05-loop` | 100% (2/2) | 33% (1/3) | 1 | 0 | 4 |
-| **AGGREGATE** | **63% (19/30)** | **3% (1/37)** | **22** | **17** | **408** |
+| **AGGREGATE** | **83% (25/30)** | **3% (1/37)** | **22** | **17** | **423** |
 
 ## Per-finding detail
 
@@ -75,14 +75,14 @@ Repo `code-423n4/2023-04-frankencoin` @ `0761a287999fa3efac5c9fa9b70fcef5eeecc21
 | H-06 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | Self-challenging a position created at an inflated price lets an attacker extract the 2% CHALLENGER_REWARD from reserves repeatedly, draining the protocol / mi… |
 | M-01 | Medium | `loop-index-logic` | no | ❌ missed | — | Loop burns addressesToWipe[0] every iteration instead of addressesToWipe[i], so only the first address is wiped. |
 | M-02 | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | Cloning with _minimum equal to the remaining limit reduces the original position's limit to zero, denying the owner further minting. |
-| M-03 | Medium | `share-inflation` | yes | ❌ missed | — | Redeeming below the 1000e18 totalShares floor lets an attacker manipulate the share/asset ratio so later depositors get fewer shares (first-depositor / inflati… |
+| M-03 | Medium | `share-inflation` | yes | ✅ caught | FirstDepositor @ equity.sol:268 | Redeeming below the 1000e18 totalShares floor lets an attacker manipulate the share/asset ratio so later depositors get fewer shares (first-depositor / inflati… |
 | M-04 | Medium | `block-number-as-time` | yes | ✅ caught | BlockNumberTime @ equity.sol:173 | Holding-duration vote-weight timing uses block.number, which ticks irregularly on L2s like Optimism, breaking the 90-day minimum holding gate. |
 | M-05 | Medium | `accounting-logic` | no | ❌ missed | — | deny() sets cooldown = expiration, so the owner of a denied (never-started) position cannot withdraw collateral until the position expires. |
 | M-06 | Medium | `griefing-collusion` | no | 🟡 near (class mismatch) | — | Colluding challenger+bidder repeatedly launch and avert minimal challenges to keep the position under the 1-day minting restriction, griefing the owner. |
 | M-07 | Medium | `dos-on-revert` | no | 🟡 near (class mismatch) | — | The serial ZCHF/collateral transfers in end() can revert (zero-amount transfer or blacklisted recipient), locking all challenge funds; needs a pull / postpone … |
-| M-08 | Medium | `rounding-direction` | yes | 🟡 near (class mismatch) | — | Clone price = _mint*1e18/_coll rounds down; the rounded-down price can fail the collateral invariant and revert valid clone mints (should round up). |
+| M-08 | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ position.sol:80 | Clone price = _mint*1e18/_coll rounds down; the rounded-down price can fail the collateral invariant and revert valid clone mints (should round up). |
 | M-09 | Medium | `rounding-direction` | yes | ❌ missed | — | Rounding/precision loss in the collateral-vs-price check can make legitimate position adjustments revert. |
-| M-10 | Medium | `slippage` | yes | ❌ missed | — | FPS mint (onTokenTransfer) and redeem provide no minimum-out / slippage bound, so users can be sandwiched on the bonding-curve price. |
+| M-10 | Medium | `slippage` | yes | ✅ caught | Slippage @ equity.sol:241 | FPS mint (onTokenTransfer) and redeem provide no minimum-out / slippage bound, so users can be sandwiched on the bonding-curve price. |
 | M-11 | Medium | `frontrunning-ordering` | no | 🟡 near (class mismatch) | — | A later challenger can bid on an earlier challenge to bump its end time, ordering their own challenge to settle first and claim the reward. |
 | M-12 | Medium | `design-economic` | no | 🟡 near (class mismatch) | — | Fixed challenge period ignores network congestion / volatility, so auctions can settle at unfair prices. |
 | M-13 | Medium | `lifecycle-role-revoke-gap` | yes | ✅ caught | LifecycleRoleRevokeGap @ frankencoin.sol:88 | Once a minter passes its application period (isMinter true) there is no path to pause or remove it; denyMinter only works during the window. |
@@ -118,9 +118,9 @@ Repo `code-423n4/2023-07-basin` @ `73f7133b380ea027048f0b9aaa284b14f3ce43b4`.
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
 | H-storeuint128-odd-slot | High | `accounting-logic` | no | ❌ missed | — | storeUint128's odd-reserve branch re-reads the target slot's high 128 bits (shr(128, sload(...))) and re-packs them; with certain reserve counts/layouts this c… |
-| M-pump-twap-manip | Medium | `oracle-manipulation` | yes | ❌ missed | — | The MultiFlow geometric-mean pump derives reserves consumers use as an oracle; a single large swap right before reading (and the first/seeded update) can move … |
-| M-pump-update-timestamp | Medium | `timestamp-dependence` | yes | ❌ missed | — | update() drives the EMA/cumulative reserves off block.timestamp deltas cast to uint40; the weighting depends on the exact timing of updates, so a party control… |
-| M-calcreserve-rounding | Medium | `rounding-direction` | yes | ❌ missed | — | calcReserve recovers a reserve via an integer square root; the rounding direction of the sqrt/division can round in favor of the swapper rather than the pool, … |
+| M-pump-twap-manip | Medium | `oracle-manipulation` | yes | ✅ caught | TwapManipulation @ multiflowpump.sol:171 | The MultiFlow geometric-mean pump derives reserves consumers use as an oracle; a single large swap right before reading (and the first/seeded update) can move … |
+| M-pump-update-timestamp | Medium | `timestamp-dependence` | yes | ✅ caught | TimestampDependence @ multiflowpump.sol:121 | update() drives the EMA/cumulative reserves off block.timestamp deltas cast to uint40; the weighting depends on the exact timing of updates, so a party control… |
+| M-calcreserve-rounding | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ constantproduct2.sol:53 | calcReserve recovers a reserve via an integer square root; the rounding direction of the sqrt/division can round in favor of the swapper rather than the pool, … |
 | M-pump-init-seeding | Medium | `accounting-logic` | no | ❌ missed | — | The pump's first update (_init) seeds lastReserves from whatever the well reserves are at that block; an attacker can set the initial cumulative/last reserves … |
 
 ### `2024-05-loop`

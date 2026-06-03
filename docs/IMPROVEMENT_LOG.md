@@ -859,3 +859,29 @@ each self-gated (target fires + `cargo test -p sluice-engine` green + **0 new Cr
   HELD:** unmatched Crit/High flat at **17** (the +2 Crit/High vs last round are both *matched* legit catches — Stader
   H-01, Frankencoin H-05); zero new candidate FPs. 138 detectors-worth of triggers (still 133 registered detectors).
   Next: Basin (0/3 — AMM/Well twap+timestamp+rounding, fully blind) + remaining Frankencoin/Stader misses + PHASE B2. _done._
+
+### NORTH STAR — in-class recall wave 2 (5 agents, FP-prone classes): 63% → 83% (TARGET CROSSED)
+Same diagnostic-driven method, harder targets: this wave hit mostly *detector-blind* (❌) misses in FP-prone classes
+(rounding / timestamp / twap / slippage / share-inflation). 5 worktree agents, disjoint files, each self-gated; **every
+one held 0 new Crit/High on the 6-repo dogfood set** — the precision discipline survived the FP-prone classes:
+- **rounding.rs → Frankencoin M-08+M-09 (Position.sol price div) + Basin M-calcreserve (ConstantProduct2 sqrt).** Root
+  cause: a name filter only admitted mint/deposit/redeem names + zero sqrt awareness. Added a solvency-gated price-division
+  arm (`price`-named only — tightened from `price|ratio|rate` to kill 3 Comet config-division FPs) + a sqrt-reserve-recovery arm.
+- **slippage.rs → Frankencoin M-10.** Root cause: only matched a *call* to a router swap with a literal-0 minOut. Added a
+  self-priced-mint/redeem arm (mints/burns + value to caller incl. ERC677 `onTokenTransfer` hook + curve-priced + no minOut/deadline).
+- **randomness.rs → Basin M-pump-update-timestamp.** Root cause: only fired on `block.timestamp` equality gates. Added a
+  narrow accumulator-weight trigger: a timestamp DELTA *multiplied* into a value then *accumulated* into a time-weighted-named
+  lvalue (cumulative/ema/twap/rewardPerToken/feeGrowth). Deadlines/cooldowns/vesting and Comet linear interest indices stay silent.
+- **twap_manipulation.rs → Basin M-pump-twap-manip.** Root cause: only recognized Uniswap v2/v3 oracle primitives. Added a
+  pump/oracle-contract reserve-reader arm (`read*reserves`, last/instantaneous not cumulative/twa, no min-window guard).
+  **Severity calibrated to Medium at integration** (the audit's rating — a raw pump reader is a consumer-footgun *surface*,
+  not a standalone Crit/High), which also keeps the 2 sibling instantaneous readers out of the Crit/High FP proxy.
+- **vault.rs → Frankencoin M-03.** Root cause: `is_vault_like` rejected `Equity` (shares in the inherited ERC20 base) + the
+  donation gate only matched standard ERC4626. Added a bypassable-floor-curve arm: `supply < FLOOR ? FLOOR : f(supply,capital)`
+  with a supply-reducing redeem path and no OZ virtual-shares/decimals-offset mitigation. Fires on exactly 1 site across all 7 repos.
+- **Integration:** each worktree changed EXACTLY its one file (verified); copied back; one twap severity-calibration edit;
+  ONE authoritative gate. **973 workspace tests / 0 fail** (engine 889→910), 0 warnings, corpus + real_hacks green.
+- **SCOREBOARD — IN-CLASS TARGET CROSSED:** in-class **63% → 83% (25/30)**; out-of-class held 3% (1/37). Per-contest:
+  Tigris 100%, Reserve 80%, Caviar 67%, **Frankencoin 88% (7/8)**, Stader 50%, **Basin 0% → 100% (3/3)**, LoopFi 100%.
+  **PRECISION FULLY HELD:** unmatched Crit/High back to **17** (Basin 0/0 after the Medium calibration); zero net precision cost.
+  Next: out-of-class is now the frontier (3%) → **PHASE B2 (conservation invariant)** + remaining Stader/Caviar/Reserve in-class. _done._
