@@ -131,6 +131,13 @@ pub enum Category {
     StaleAnchorReset,
     SolverConvergenceTrust,
     RatioDenominatorSignEdge,
+    // ---- Round 14: lending / intent-RFQ / governance / AMM-fee classes (the big blind spots) ----
+    InterestIndexDesync,
+    BadDebtSocialization,
+    RfqFillAccounting,
+    VoteWeightCheckpoint,
+    FeegrowthAccounting,
+    ParamUpdateRetroactive,
     Other,
 }
 
@@ -232,6 +239,12 @@ impl Category {
             StaleAnchorReset => "stale-anchor-reset",
             SolverConvergenceTrust => "solver-convergence-trust",
             RatioDenominatorSignEdge => "ratio-denominator-sign-edge",
+            InterestIndexDesync => "interest-index-desync",
+            BadDebtSocialization => "bad-debt-socialization",
+            RfqFillAccounting => "rfq-fill-accounting",
+            VoteWeightCheckpoint => "vote-weight-checkpoint",
+            FeegrowthAccounting => "feegrowth-accounting",
+            ParamUpdateRetroactive => "param-update-retroactive",
             Other => "other",
         }
     }
@@ -315,6 +328,12 @@ impl Category {
             StaleAnchorReset => &["CWE-672", "CWE-1339"],
             SolverConvergenceTrust => &["CWE-682", "CWE-345"],
             RatioDenominatorSignEdge => &["CWE-682", "CWE-369"],
+            InterestIndexDesync => &["CWE-682", "CWE-672"],
+            BadDebtSocialization => &["CWE-682", "CWE-840"],
+            RfqFillAccounting => &["CWE-682", "CWE-294"],
+            VoteWeightCheckpoint => &["CWE-682", "CWE-345"],
+            FeegrowthAccounting => &["CWE-682"],
+            ParamUpdateRetroactive => &["CWE-362", "CWE-840"],
             _ => &[],
         }
     }
