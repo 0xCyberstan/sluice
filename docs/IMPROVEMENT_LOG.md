@@ -672,3 +672,40 @@ verified the combined state):
   msg.sender guard → residual access-control/centralization FPs (CometProxyAdmin) — a root fix helps several detectors;
   (b) engine output nondeterminism in the parallel flat_map + dedup/cap tie-breaking (full-scan counts wobble run-to-run)
   → needs a deterministic sort before the cap. _done._
+
+### Real-code precision wave 3 — engine-root fixes (guard recognition + determinism) + 3-codebase triage
+2 root fixes (worktree-isolated) + 3 read-only triages (Lido, Uniswap universal-router, a C4 contest for RECALL).
+- **`effects.rs` `_msgSender()` guard recognition** — `mk_guard` now treats OZ `_msgSender()`/`msgSender()` (zero-arg,
+  no-receiver) as `msg.sender`, fixing residual access-control/centralization FPs across every guard-using detector.
+  **Comet access-control 2→0** (CometProxyAdmin); change ONLY reduces findings (Aave/symbiotic byte-identical); Parity
+  + genuine unguarded setters retained. 833 workspace tests.
+- **engine determinism** — the rayon `flat_map` collection order fed severity-score-only tie-breaks in
+  dedup_keep_strongest / cap_per_function / final-sort, so which findings survived dedup/cap (and the output order +
+  `--top N`) wobbled. Added a total `location_key` (file,line,span,detector,category,severity,title,msg) sorted BEFORE
+  dedup/cap + as the final tie-break. Output now byte-identical across thread counts/load (proof: replaying Comet
+  findings in 200 permutations → old = 200 orderings, new = 1). Parallelism untouched. 788 lib tests (+4). Integrated:
+  132 detectors, 0 warnings, gate green, Comet 3×-scan md5-identical.
+
+### Real-code triage findings → WAVE-4 BACKLOG (honest ground truth from 6 untuned codebases)
+- **universal-router (clean): 0 Crit/High** — wave-1/2 fixes GENERALIZE (Permit2 void-transferFrom, balanceOf-delta,
+  encodePacked-fixed-types, guarded-callback all correctly silent). Minor: unchecked-abi-decode should respect a
+  `computePoolAddress==msg.sender` callback auth; unchecked-return on canonical WETH9 → Low not Medium.
+- **Lido (all 5 Highs FP):** reentrancy fired on StETH `_mintShares/_burnShares/_transferShares` which have **no external
+  call**; twap matched the SUBSTRING "observe" in `removeObserver`; access-control missed ECDSA-signature-gated auth;
+  integer-issues over-fired on `uint128(msg.value)` (can't truncate) + BP-bounded casts; unchecked-return on trusted
+  in-protocol tokens (STETH/WSTETH); forced-ether on a defensive `assert(balance==…)` invariant; parser gap on Solidity
+  0.4.24 (`LidoTemplate.sol`).
+- **C4 LoopFi (RECALL):** the contest's headline High (`claimedAmount = address(this).balance` over-mint — an
+  invariant/accounting bug) + all accepted Mediums are OUT-OF-CLASS for a pattern matcher → MISSED by root cause (Sluice
+  flagged the right function `_claim` as reentrancy — right neighborhood, wrong bug); caught 2/3 in-class (QA hygiene);
+  over-rated reentrancy to High on CEI-correct code.
+- **WAVE-4 PRECISION (priority):** #1 **reentrancy** must require a real external call AND downgrade when the state write
+  provably PRECEDES the call (CEI-correct) — the dominant FP source (Lido all-FP, LoopFi over-rated). Then: de-lexicalize
+  twap (require an oracle CALL, not a name substring); integer-issues msg.value/BP/guarded-cast suppression;
+  unchecked-return trusted-immutable-token demote; access-control signature-gated (ECDSA-recover) auth; forced-ether
+  invariant-assert awareness; parser Solidity-0.4.24 recovery; selector/encodepacked de-dup; unchecked-abi-decode
+  callback-auth; WETH9 unchecked-return severity.
+- **WAVE-4 STRATEGIC (recall — the deep frontier):** Sluice is a bug-CLASS pattern matcher, not an invariant prover —
+  it misses protocol-specific invariant/accounting logic bugs (the bulk of real contest Highs). Strengthen the
+  consensus-invariant dimension to catch accounting-invariant violations (hard, high-value; the design's killer feature
+  isn't yet catching balance-accounting invariants like LoopFi H-01). _done._

@@ -16,12 +16,15 @@ recovery; `is_file()` IO guard. (From the first dogfood.)
 > access-control empty-fallback + guarded-init + permissionless-deploy FPs (Comet 10→2), upgradeable guarded-OZ-proxy
 > over-severity (Aave Crit 1→0), unprotected-initializer guarded one-shot (Comet 2→0), `transient`-keyword parser
 > recovery (EntryPoint 0→35 fns). Re-bench: Aave 0 Crit/1 High, Comet 26→9 High (rest defensible), Morpho 0/0.
-> **WAVE 3 OPEN:** (a) `effects.rs::mk_guard` doesn't recognize OZ `_msgSender()` as a msg.sender guard → residual
-> access-control/centralization FPs (e.g. CometProxyAdmin.setMarketAdminPermissionChecker) — root fix helps several
-> detectors; (b) engine output NONDETERMINISM (parallel flat_map + dedup/cap insertion-order tie-break → full-scan
-> counts wobble run-to-run) — needs a deterministic sort before the cap; (c) re-triage the Comet 6 donatable-balance
-> oracle + 3 `absorb` bad-debt Highs (defensible — decide TP vs over-flag); (d) AA `BasePaymaster.getDeposit`
-> oracle-manipulation (balance-getter, newly exposed by the parser fix — likely a balance-read-not-price refinement).
+> **WAVE 3 DONE:** (a) `effects.rs::mk_guard` now recognizes OZ `_msgSender()` (Comet access-control 2→0, only-reduces);
+> (b) engine output determinism fixed (total `location_key` sort before dedup/cap; byte-identical across threads —
+> 200-permutation proof). **WAVE 4 (full backlog in `docs/IMPROVEMENT_LOG.md` "Real-code triage findings"):** #1
+> **reentrancy must require a real external call + CEI-downgrade** (dominant FP — Lido all-5-Highs-FP on no-external-call
+> StETH share fns, LoopFi over-rated on CEI-correct code); de-lexicalize twap (oracle CALL, not "observe" substring);
+> integer-issues msg.value/BP/guarded-cast suppression; unchecked-return trusted-immutable-token; access-control
+> ECDSA-signature-gated auth; forced-ether invariant-assert; parser Solidity-0.4.24; selector/encodepacked de-dup; +
+> the STRATEGIC recall frontier (invariant-prover, not pattern-matcher — misses LoopFi-H-01-class accounting bugs);
+> (c) Comet donatable-balance/absorb + (d) AA getDeposit re-triage still queued.
 
 ## R28 dogfood — original findings (broad scan of 7 corpora with the 132-detector binary, 2026-06-03)
 

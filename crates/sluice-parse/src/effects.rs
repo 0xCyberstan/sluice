@@ -434,22 +434,147 @@ fn is_guard_branch(branch: &[Stmt]) -> bool {
     )
 }
 
+/// True if an expression *is* a reference to the caller — either the `msg.sender`
+/// / `tx.origin` member access, or the OpenZeppelin / ERC-2771 `Context` accessor
+/// `_msgSender()` / `msgSender()` (which returns `msg.sender`). Matched exactly and
+/// only as the zero-argument accessor named `_msgSender`/`msgSender`, never an
+/// arbitrary function, so a guard like `require(_msgSender() == owner())` or
+/// `if (_msgSender() != admin) revert` is recognized as a caller check.
+fn expr_is_caller(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Member { base, member } => {
+            matches!(&base.kind, ExprKind::Ident(b)
+                if (b == "msg" && member == "sender") || (b == "tx" && member == "origin"))
+        }
+        ExprKind::Call(c) => {
+            c.args.is_empty()
+                && c.receiver.is_none()
+                && matches!(c.func_name.as_deref(), Some("_msgSender") | Some("msgSender"))
+        }
+        _ => false,
+    }
+}
+
 /// Build a guard, classifying it as a msg.sender / tx.origin access-control check
 /// when the condition references the caller.
 fn mk_guard(cond: &Expr) -> Guard {
     let mut references_sender = false;
     cond.visit(&mut |e| {
-        if let ExprKind::Member { base, member } = &e.kind {
-            if let ExprKind::Ident(b) = &base.kind {
-                if (b == "msg" && member == "sender") || (b == "tx" && member == "origin") {
-                    references_sender = true;
-                }
-            }
+        if expr_is_caller(e) {
+            references_sender = true;
         }
     });
     Guard {
         kind: if references_sender { GuardKind::MsgSenderCheck } else { GuardKind::Require },
         text: ir_text(cond),
         span: cond.span,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sluice_ir::BinOp;
+
+    fn ident(n: &str) -> Expr {
+        Expr::dummy(ExprKind::Ident(n.into()))
+    }
+
+    /// `msg.sender` (or `tx.origin`) member access.
+    fn member(base: &str, m: &str) -> Expr {
+        Expr::dummy(ExprKind::Member { base: Box::new(ident(base)), member: m.into() })
+    }
+
+    /// A zero-arg, no-receiver internal call `name()` (e.g. `_msgSender()`, `owner()`).
+    fn zero_arg_call(name: &str) -> Expr {
+        Expr::dummy(ExprKind::Call(Call {
+            callee: Box::new(ident(name)),
+            receiver: None,
+            func_name: Some(name.into()),
+            args: vec![],
+            value: None,
+            gas: None,
+            kind: CallKind::Internal,
+        }))
+    }
+
+    fn cmp(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::dummy(ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) })
+    }
+
+    #[test]
+    fn msg_sender_member_is_caller_check() {
+        // `msg.sender == owner` — the existing behavior must be preserved.
+        let g = mk_guard(&cmp(BinOp::Eq, member("msg", "sender"), ident("owner")));
+        assert_eq!(g.kind, GuardKind::MsgSenderCheck, "msg.sender comparison");
+
+        // `tx.origin != owner` — still a caller check.
+        let g = mk_guard(&cmp(BinOp::Ne, member("tx", "origin"), ident("owner")));
+        assert_eq!(g.kind, GuardKind::MsgSenderCheck, "tx.origin comparison");
+    }
+
+    #[test]
+    fn msg_sender_accessor_is_caller_check() {
+        // `_msgSender() != owner()` — the OZ Context accessor must classify as a
+        // MsgSenderCheck (regression: CometProxyAdmin.setMarketAdminPermissionChecker
+        // `if (_msgSender() != owner()) revert Unauthorized();` was seen as unguarded).
+        let g = mk_guard(&cmp(BinOp::Ne, zero_arg_call("_msgSender"), zero_arg_call("owner")));
+        assert_eq!(
+            g.kind,
+            GuardKind::MsgSenderCheck,
+            "_msgSender() != owner() must be a MsgSenderCheck; got {:?}",
+            g.kind
+        );
+
+        // `require(_msgSender() == admin)` — the `== admin` shape too.
+        let g = mk_guard(&cmp(BinOp::Eq, zero_arg_call("_msgSender"), ident("admin")));
+        assert_eq!(g.kind, GuardKind::MsgSenderCheck, "_msgSender() == admin");
+
+        // ERC-2771 spelling without the leading underscore.
+        let g = mk_guard(&cmp(BinOp::Eq, zero_arg_call("msgSender"), ident("admin")));
+        assert_eq!(g.kind, GuardKind::MsgSenderCheck, "msgSender() == admin");
+    }
+
+    #[test]
+    fn non_caller_comparison_is_plain_require() {
+        // `amount >= minAmount` — no caller reference, stays a plain Require.
+        let g = mk_guard(&cmp(BinOp::Ge, ident("amount"), ident("minAmount")));
+        assert_eq!(g.kind, GuardKind::Require, "non-caller guard stays Require");
+    }
+
+    #[test]
+    fn arbitrary_zero_arg_call_is_not_a_caller() {
+        // Precision: an unrelated zero-arg accessor (`owner()`, `paused()`) compared
+        // against a constant must NOT be mistaken for a caller check.
+        let g = mk_guard(&cmp(BinOp::Eq, zero_arg_call("paused"), Expr::dummy(ExprKind::Lit(Lit::Bool(false)))));
+        assert_eq!(g.kind, GuardKind::Require, "paused() is not a caller reference");
+        assert!(!expr_is_caller(&zero_arg_call("owner")), "owner() is not the caller");
+    }
+
+    #[test]
+    fn msg_sender_named_member_call_is_not_accessor() {
+        // Precision: `something.msgSender(...)` (a *member* call with a receiver, or
+        // any call carrying arguments) is not the zero-arg OZ accessor.
+        let with_receiver = Expr::dummy(ExprKind::Call(Call {
+            callee: Box::new(member("ctx", "msgSender")),
+            receiver: Some(Box::new(ident("ctx"))),
+            func_name: Some("msgSender".into()),
+            args: vec![],
+            value: None,
+            gas: None,
+            kind: CallKind::External,
+        }));
+        assert!(!expr_is_caller(&with_receiver), "receiver-qualified msgSender() is not the accessor");
+
+        let with_args = Expr::dummy(ExprKind::Call(Call {
+            callee: Box::new(ident("_msgSender")),
+            receiver: None,
+            func_name: Some("_msgSender".into()),
+            args: vec![ident("x")],
+            value: None,
+            gas: None,
+            kind: CallKind::Internal,
+        }));
+        assert!(!expr_is_caller(&with_args), "_msgSender(x) with an arg is not the zero-arg accessor");
     }
 }
