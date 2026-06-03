@@ -6,6 +6,24 @@
 //!    function (and anything that calls it) is permanently bricked. Emitted as
 //!    [`Category::UnboundedLoop`].
 //!
+//! 1b. **Unbounded loop with a per-iteration external call** — a loop whose bound
+//!    references a state variable that some function in the contract grows
+//!    *without an enforced cap* (a counter incremented `++`/`+=`, or an array
+//!    `.push`ed to), where **each iteration makes an external call**. This is the
+//!    SafEth-`unstake` shape (`for i < derivativeCount { derivatives[i].withdraw(...) }`,
+//!    Asymmetry M-08): the growth path is privileged (owner-only `addDerivative`)
+//!    but uncapped, so the per-element external-call gas multiplied by an
+//!    ever-growing element count eventually exceeds the block gas limit and bricks
+//!    the function — and a single reverting element bricks the whole loop too.
+//!    Unlike pattern (1) the growth need not be *attacker*-reachable: an unbounded
+//!    privileged add plus per-iteration external calls is sufficient. Conservative
+//!    by construction — it requires (a) a genuine external transfer-of-control in
+//!    the loop body (so pure-arithmetic and read-only loops stay silent), (b) the
+//!    bound to be a *state* variable (calldata-array batches stay silent), and
+//!    (c) the growth to be *uncapped* (a `require(count < MAX)` / `if (len >= MAX)`
+//!    guard in the grower suppresses it, as do `.push`es that are length-capped).
+//!    Emitted as [`Category::UnboundedLoop`].
+//!
 //! 2. **External call inside a loop** — a `for`/`while`/`do-while` whose body
 //!    transfers control to an external party (`.transfer`/`.send`/low-level
 //!    `.call`, an interface call). A single reverting / griefing recipient
@@ -39,7 +57,7 @@
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{Builtin, CallKind, ExprKind, Function, Span, Stmt, StmtKind};
+use sluice_ir::{AssignOp, Builtin, CallKind, Expr, ExprKind, Function, Span, Stmt, StmtKind, UnOp};
 
 pub struct DosDetector;
 
@@ -167,23 +185,76 @@ impl Detector for DosDetector {
             if !emitted {
                 let over_growable = loops_in(f).iter().any(|ls| loop_iterates_growable(ls, &growable));
                 if over_growable {
-                let b = FindingBuilder::new(self.id(), Category::UnboundedLoop)
-                    .title("Unbounded loop over an attacker-growable array")
-                    .severity(Severity::Medium)
-                    .confidence(0.5)
-                    .dimension(Dimension::Invariant)
-                    .message(format!(
-                        "`{}` loops up to the length of a storage array that an external function can \
-                         grow without bound. Once the array is large enough, the gas to iterate it \
-                         exceeds the block limit and the function can never complete, freezing any logic \
-                         (and any funds) that depend on it.",
-                        f.name
-                    ))
-                    .recommendation(
-                        "Cap the iteration count, paginate the work across transactions, or restructure \
-                         so the gas cost cannot be driven past the block limit by an attacker.",
-                    );
-                out.push(cx.finish(b, f.id, f.span));
+                    let b = FindingBuilder::new(self.id(), Category::UnboundedLoop)
+                        .title("Unbounded loop over an attacker-growable array")
+                        .severity(Severity::Medium)
+                        .confidence(0.5)
+                        .dimension(Dimension::Invariant)
+                        .message(format!(
+                            "`{}` loops up to the length of a storage array that an external function can \
+                             grow without bound. Once the array is large enough, the gas to iterate it \
+                             exceeds the block limit and the function can never complete, freezing any logic \
+                             (and any funds) that depend on it.",
+                            f.name
+                        ))
+                        .recommendation(
+                            "Cap the iteration count, paginate the work across transactions, or restructure \
+                             so the gas cost cannot be driven past the block limit by an attacker.",
+                        );
+                    out.push(cx.finish(b, f.id, f.span));
+                    emitted = true;
+                }
+            }
+
+            // ---- Pattern 1b: unbounded loop whose bound is an UNCAPPED-GROWABLE
+            // state variable AND whose body makes a per-iteration external call.
+            // This is the SafEth-`unstake` / Asymmetry-M-08 shape: the bound
+            // (`derivativeCount`) is grown by a privileged-but-uncapped path
+            // (`addDerivative` does `derivativeCount++`, no max), and each iteration
+            // calls `derivatives[i].withdraw(...)`. The growth need not be attacker-
+            // reachable (so it is NOT covered by `growable_arrays`, which requires an
+            // unguarded external push), but the per-element external-call gas times an
+            // ever-growing count still bricks the function at the block gas limit.
+            //
+            // Three conservative gates keep this quiet on real protocols:
+            //   * the loop body must contain a genuine external transfer-of-control
+            //     call (reusing `external_call_in_loop`, which already skips
+            //     `try`-wrapped calls) — pure-arithmetic weight sums and read-only
+            //     accumulators have none, so they stay silent;
+            //   * the loop bound must read a STATE variable (a calldata/memory array
+            //     length is a caller's own concern, not a protocol DoS); and
+            //   * that state variable must be grown WITHOUT an enforced cap — a
+            //     `require(count < MAX)` / `if (len >= MAX) revert` guard in the
+            //     grower, or a length-capped `.push`, suppresses it.
+            if !emitted && f.is_state_mutating() {
+                let uncapped = uncapped_growable_state(cx, f);
+                if !uncapped.is_empty() {
+                    let hit = loops_in(f).into_iter().find(|ls| {
+                        external_call_in_loop(loop_body(ls)).is_some()
+                            && loop_bound_reads_state(ls, &uncapped)
+                    });
+                    if let Some(ls) = hit {
+                        let b = FindingBuilder::new(self.id(), Category::UnboundedLoop)
+                            .title("Unbounded loop with a per-iteration external call over an uncapped-growable bound")
+                            .severity(Severity::Medium)
+                            .confidence(0.5)
+                            .dimension(Dimension::Invariant)
+                            .message(format!(
+                                "`{}` loops up to a state variable that another function grows without an \
+                                 enforced cap, and performs an external call on every iteration. As the bound \
+                                 grows, the per-element external-call gas multiplied by the element count \
+                                 eventually exceeds the block gas limit, so the function can never complete — \
+                                 permanently freezing the logic (and any funds) that depend on it. A single \
+                                 element whose external call reverts likewise bricks the entire loop.",
+                                f.name
+                            ))
+                            .recommendation(
+                                "Enforce a maximum on the growable bound, paginate the per-element work across \
+                                 transactions, or remove the per-iteration external call (e.g. let each party \
+                                 settle its own entry) so the gas cost cannot be driven past the block limit.",
+                            );
+                        out.push(cx.finish(b, f.id, ls.span));
+                    }
                 }
             }
         }
@@ -520,6 +591,227 @@ fn root_in(e: &sluice_ir::Expr, set: &std::collections::HashSet<String>) -> bool
     root(e).map(|r| set.contains(r)).unwrap_or(false)
 }
 
+/// State variables that some function in `f`'s contract grows **without an
+/// enforced cap** — either a counter incremented (`++` / `+= k`) or an array
+/// `.push`ed to — and where the growing function does NOT bound that variable
+/// with an ordering comparison (a `require(count < MAX)` / `if (len >= MAX)`
+/// guard). Iterating such a variable while doing per-element external calls is the
+/// SafEth-`unstake` / Asymmetry-M-08 DoS shape.
+///
+/// Distinct from [`growable_arrays`]: that requires an *unguarded external* push
+/// (attacker-growable). Here the grower may be privileged (owner-only) — an
+/// uncapped privileged add is still an unbounded loop. We deliberately do NOT
+/// exclude on access control, but we DO require the growth to be uncapped, which
+/// is what keeps admin lists with an explicit `MAX` (e.g. a capped registry)
+/// silent.
+fn uncapped_growable_state(
+    cx: &crate::context::AnalysisContext,
+    f: &Function,
+) -> std::collections::HashSet<String> {
+    let mut g = std::collections::HashSet::new();
+    let Some(c) = cx.contract_of(f.id) else {
+        return g;
+    };
+    for fun in cx.scir.functions_of(c.id) {
+        if !fun.has_body {
+            continue;
+        }
+        // Vars this function grows (counter increment or array push).
+        let grown = vars_grown_in(fun);
+        if grown.is_empty() {
+            continue;
+        }
+        // Vars this function bounds with an ordering comparison anywhere in its
+        // body (the cap). A grower that compares the var against a limit before
+        // growing it (`require(count < MAX)`, `if (len >= MAX) revert`) is capped.
+        let capped = vars_ordering_compared_in(fun);
+        for v in grown {
+            if !capped.contains(&v) {
+                g.insert(v);
+            }
+        }
+    }
+    g
+}
+
+/// State variables grown inside `fun`: a state counter incremented (`++`/`--`/
+/// `+= k`) or a state array `.push`ed to. Returns the base state-variable names.
+fn vars_grown_in(fun: &Function) -> std::collections::HashSet<String> {
+    // `.push`/`.pop` array growth is pre-recorded by the parser as a storage write
+    // whose path contains "push" (see `growable_arrays`).
+    let mut grown: std::collections::HashSet<String> = fun
+        .effects
+        .storage_writes
+        .iter()
+        .filter(|w| w.path.contains("push"))
+        .map(|w| w.var.clone())
+        .collect();
+
+    // Counter increments: `x++` / `++x` (UnOp) or `x += k` (AssignOp::Add) where
+    // `x`'s root identifier is a state variable written by this function. We
+    // intersect against the recorded storage-write roots so a purely-local loop
+    // counter (`i++`) is not mistaken for state growth.
+    let state_write_roots: std::collections::HashSet<&str> =
+        fun.effects.storage_writes.iter().map(|w| w.var.as_str()).collect();
+    for s in &fun.body {
+        s.visit_exprs(&mut |e| match &e.kind {
+            ExprKind::Unary { op, operand }
+                if matches!(op, UnOp::PostInc | UnOp::PreInc) =>
+            {
+                if let Some(r) = ident_root(operand) {
+                    if state_write_roots.contains(r) {
+                        grown.insert(r.to_string());
+                    }
+                }
+            }
+            ExprKind::Assign { op: AssignOp::Add, target, .. } => {
+                if let Some(r) = ident_root(target) {
+                    if state_write_roots.contains(r) {
+                        grown.insert(r.to_string());
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+    grown
+}
+
+/// State/identifier roots a *guard* in `fun` bounds with an ordering comparison —
+/// the syntactic signature of an enforced cap. A cap is an ordering comparison
+/// (`<`,`<=`,`>`,`>=`) appearing in a guard context: a `require(...)`/`assert(...)`
+/// argument, or an `if (...)` condition (whose branch typically reverts). Loop
+/// **headers** (`for (...; i < count; ...)`, `while (i < count)`) are deliberately
+/// excluded — a loop's own iteration bound is NOT a cap on the bound's growth, so
+/// counting it would falsely mark a freely-growable counter (e.g. `derivativeCount`,
+/// which appears in `for i < derivativeCount` weight-sum loops in its own grower)
+/// as capped and suppress the finding. Conservatively over-approximates the capped
+/// set within guard contexts, which only ever *suppresses* a finding.
+fn vars_ordering_compared_in(fun: &Function) -> std::collections::HashSet<String> {
+    let mut capped = std::collections::HashSet::new();
+    // Collect ordering-comparison roots from an expression tree (used for guard
+    // conditions and require/assert arguments).
+    fn ordering_roots(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        e.visit(&mut |x| {
+            if let ExprKind::Binary { op, lhs, rhs } = &x.kind {
+                if op.is_ordering() {
+                    if let Some(r) = ident_root(lhs) {
+                        out.insert(r.to_string());
+                    }
+                    if let Some(r) = ident_root(rhs) {
+                        out.insert(r.to_string());
+                    }
+                }
+            }
+        });
+    }
+    fn walk(s: &Stmt, capped: &mut std::collections::HashSet<String>) {
+        match &s.kind {
+            // `if (cond) { ... }` — `cond` is a guard context (cap check).
+            StmtKind::If { cond, then_branch, else_branch } => {
+                ordering_roots(cond, capped);
+                for st in then_branch.iter().chain(else_branch.iter()) {
+                    walk(st, capped);
+                }
+            }
+            // `require(cond, ...)` / `assert(cond)` arguments are guard contexts.
+            StmtKind::Expr(e) => {
+                e.visit(&mut |x| {
+                    if let ExprKind::Call(c) = &x.kind {
+                        if matches!(
+                            c.kind,
+                            CallKind::Builtin(Builtin::Require) | CallKind::Builtin(Builtin::Assert)
+                        ) {
+                            if let Some(arg) = c.args.first() {
+                                ordering_roots(arg, capped);
+                            }
+                        }
+                    }
+                });
+            }
+            // Descend into nested blocks/loops/try, but do NOT treat the loop
+            // headers themselves as cap checks (we never inspect For/While `cond`).
+            StmtKind::Block { stmts, .. } => {
+                for st in stmts {
+                    walk(st, capped);
+                }
+            }
+            StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+                for st in body {
+                    walk(st, capped);
+                }
+            }
+            StmtKind::For { body, .. } => {
+                for st in body {
+                    walk(st, capped);
+                }
+            }
+            StmtKind::Try { body, catches, .. } => {
+                for st in body {
+                    walk(st, capped);
+                }
+                for cl in catches {
+                    for st in &cl.body {
+                        walk(st, capped);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in &fun.body {
+        walk(s, &mut capped);
+    }
+    capped
+}
+
+/// The root identifier of an lvalue/expression chain (`a` for `a`, `a.b`,
+/// `a[i]`, `a.b[i].c`), if any.
+fn ident_root(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some(n),
+        ExprKind::Member { base, .. } | ExprKind::Index { base, .. } => ident_root(base),
+        _ => None,
+    }
+}
+
+/// True if `loop_stmt`'s bound — its `for` condition/step (or `while`/`do-while`
+/// condition) — reads a state variable in `state`. Only the loop's *header*
+/// expressions are inspected (not the body): the bound is what governs the
+/// iteration count. For-loop bodies are excluded so an in-body read of an
+/// unrelated growable var does not count as the bound.
+fn loop_bound_reads_state(loop_stmt: &Stmt, state: &std::collections::HashSet<String>) -> bool {
+    if state.is_empty() {
+        return false;
+    }
+    let mut hit = false;
+    let mut check = |e: &Expr| {
+        e.visit(&mut |x| {
+            if !hit {
+                if let Some(r) = ident_root(x) {
+                    // `length` of a state array, or a bare state counter.
+                    if state.contains(r) {
+                        hit = true;
+                    }
+                }
+            }
+        });
+    };
+    match &loop_stmt.kind {
+        StmtKind::For { cond, step, .. } => {
+            if let Some(c) = cond {
+                check(c);
+            }
+            if let Some(st) = step {
+                check(st);
+            }
+        }
+        StmtKind::While { cond, .. } | StmtKind::DoWhile { cond, .. } => check(cond),
+        _ => {}
+    }
+    hit
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -747,6 +1039,159 @@ mod tests {
         assert!(
             fs.iter().any(|f| f.detector == "denial-of-service"),
             "unconditional require(success) loop must still flag: {:?}",
+            fs
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 1b: unbounded loop whose bound is an UNCAPPED-GROWABLE state var,
+    // with a per-iteration external call (Asymmetry-M-08 / SafEth `unstake`).
+    // ------------------------------------------------------------------
+
+    // POSITIVE: the SafEth-`unstake` shape — bound is a state counter
+    // (`derivativeCount`) grown by a privileged-but-uncapped `addDerivative`
+    // (`derivativeCount++`, no max), each iteration calls into `derivatives[i]`.
+    // The growth is owner-gated (so NOT attacker-growable), yet the loop is still
+    // an unbounded-gas / one-reverting-element DoS. Must FIRE as UnboundedLoop.
+    #[test]
+    fn fires_on_uncapped_counter_loop_with_external_call() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            interface IDerivative {
+                function balance() external view returns (uint256);
+                function withdraw(uint256 amount) external;
+            }
+            contract Vault {
+                address public owner;
+                uint256 public derivativeCount;
+                mapping(uint256 => IDerivative) public derivatives;
+                modifier onlyOwner() { require(msg.sender == owner, "auth"); _; }
+
+                function addDerivative(address d) external onlyOwner {
+                    derivatives[derivativeCount] = IDerivative(d);
+                    derivativeCount++;
+                }
+
+                function unstake(uint256 amt) external {
+                    for (uint256 i = 0; i < derivativeCount; i++) {
+                        uint256 bal = derivatives[i].balance();
+                        if (bal == 0) continue;
+                        derivatives[i].withdraw((bal * amt) / 1e18);
+                    }
+                }
+            }
+        "#);
+        assert!(
+            fs.iter().any(|f| {
+                f.detector == "denial-of-service" && f.category == sluice_findings::Category::UnboundedLoop
+            }),
+            "uncapped-counter loop with per-iteration external call must fire as UnboundedLoop: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: identical loop shape, but `addDerivative` enforces a cap
+    // (`require(derivativeCount < MAX)`). The bound can no longer grow without
+    // limit, so Pattern 1b must stay SILENT.
+    #[test]
+    fn silent_on_capped_counter_loop() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            interface IDerivative {
+                function balance() external view returns (uint256);
+                function withdraw(uint256 amount) external;
+            }
+            contract CappedVault {
+                address public owner;
+                uint256 public derivativeCount;
+                uint256 constant MAX = 10;
+                mapping(uint256 => IDerivative) public derivatives;
+                modifier onlyOwner() { require(msg.sender == owner, "auth"); _; }
+
+                function addDerivative(address d) external onlyOwner {
+                    require(derivativeCount < MAX, "too many");
+                    derivatives[derivativeCount] = IDerivative(d);
+                    derivativeCount++;
+                }
+
+                function unstake(uint256 amt) external {
+                    for (uint256 i = 0; i < derivativeCount; i++) {
+                        uint256 bal = derivatives[i].balance();
+                        derivatives[i].withdraw((bal * amt) / 1e18);
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service" && f.category == sluice_findings::Category::UnboundedLoop
+            }),
+            "capped-counter loop must not fire as UnboundedLoop: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: a loop bounded by an uncapped-growable state counter but with a
+    // PURE-COMPUTATION body (no external call) — the SafEth `adjustWeight` /
+    // weight-sum shape. The per-element gas is tiny, so this is not the gas-DoS
+    // class. Must stay SILENT (the per-iteration external call is the load-bearing
+    // discriminator).
+    #[test]
+    fn silent_on_uncapped_counter_pure_loop() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract Weights {
+                address public owner;
+                uint256 public count;
+                uint256 public total;
+                mapping(uint256 => uint256) public weights;
+                modifier onlyOwner() { require(msg.sender == owner, "auth"); _; }
+
+                function add(uint256 w) external onlyOwner {
+                    weights[count] = w;
+                    count++;
+                }
+
+                function recompute() external {
+                    uint256 t = 0;
+                    for (uint256 i = 0; i < count; i++) {
+                        t += weights[i];
+                    }
+                    total = t;
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service" && f.category == sluice_findings::Category::UnboundedLoop
+            }),
+            "pure-computation loop over a counter must not fire as UnboundedLoop: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: a small FIXED-bound loop with a per-iteration external call. The
+    // bound is a literal, no growable state var is involved, so Pattern 1b must
+    // stay SILENT (and the calldata/value gates keep pattern 2 silent too).
+    #[test]
+    fn silent_on_fixed_bound_external_loop() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            interface IOracle { function poke() external; }
+            contract Fixed {
+                IOracle[3] public oracles;
+                function refresh() external {
+                    for (uint256 i = 0; i < 3; i++) {
+                        oracles[i].poke();
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service" && f.category == sluice_findings::Category::UnboundedLoop
+            }),
+            "fixed-bound external-call loop must not fire as UnboundedLoop: {:?}",
             fs
         );
     }

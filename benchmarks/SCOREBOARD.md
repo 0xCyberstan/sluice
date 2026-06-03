@@ -9,14 +9,14 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 | Contest | In-class recall | Out-of-class recall | Crit/High | Unmatched C/H | Total findings |
 |---|---|---|---|---|---|
 | `2022-12-tigris` | 100% (4/4) | 0% (0/2) | 3 | 3 | 155 |
-| `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 86 |
-| `2023-03-asymmetry` | 0% (0/5) | 0% (0/4) | 1 | 1 | 18 |
+| `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 87 |
+| `2023-03-asymmetry` | 80% (4/5) | 0% (0/4) | 3 | 1 | 22 |
 | `2023-04-caviar` | 100% (1/1) | 0% (0/4) | 0 | 0 | 41 |
 | `2023-04-frankencoin` | 88% (7/8) | 0% (0/13) | 2 | 1 | 66 |
-| `2023-06-stader` | 67% (2/3) | 8% (1/12) | 3 | 2 | 30 |
-| `2023-07-basin` | 67% (2/3) | 0% (0/2) | 0 | 0 | 42 |
+| `2023-06-stader` | 67% (2/3) | 8% (1/12) | 3 | 2 | 31 |
+| `2023-07-basin` | 100% (3/3) | 0% (0/2) | 2 | 1 | 44 |
 | `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 4 |
-| **AGGREGATE** | **71% (22/31)** | **5% (2/41)** | **23** | **18** | **442** |
+| **AGGREGATE** | **87% (27/31)** | **5% (2/41)** | **27** | **19** | **450** |
 
 ## Per-finding detail
 
@@ -53,14 +53,14 @@ Repo `code-423n4/2023-03-asymmetry` @ `1fa78d2116405a9e186bafabd24080c52bc32875`
 
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
-| H-01 | High | `first-depositor` | yes | 🟡 near (class mismatch) | — | stake() derives preDepositPrice = 10**18 * underlyingValue / totalSupply from live derivative balances; an early/sole staker can unstake down to a tiny supply … |
+| H-01 | High | `first-depositor` | yes | ✅ caught | FirstDepositor @ safeth.sol:79 | stake() derives preDepositPrice = 10**18 * underlyingValue / totalSupply from live derivative balances; an early/sole staker can unstake down to a tiny supply … |
 | H-03 | High | `dos-on-revert` | no | 🟡 near (class mismatch) | — | unstake() loops every derivative and calls derivatives[i].withdraw(); there is no way to remove a broken/untrusted derivative, so if one withdraw reverts (e.g.… |
 | H-04 | High | `accounting-logic` | no | ❌ missed | — | SfrxEth.ethPerDerivative returns (10**18 * frxAmount) / price_oracle() — the price_oracle multiplication is inverted (should be frxAmount * price_oracle / 10**… |
-| H-05 | High | `integer-overflow` | yes | ❌ missed | — | Reth.poolPrice computes (sqrtPriceX96 * sqrtPriceX96 * 1e18) >> 192 with no overflow guard (unlike Uniswap's OracleLibrary); for large sqrtPriceX96 the multipl… |
+| H-05 | High | `integer-overflow` | yes | ✅ caught | IntegerOverflow @ reth.sol:241 | Reth.poolPrice computes (sqrtPriceX96 * sqrtPriceX96 * 1e18) >> 192 with no overflow guard (unlike Uniswap's OracleLibrary); for large sqrtPriceX96 the multipl… |
 | H-06 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | WstEth.withdraw computes minOut = stEthBal * (1e18 - maxSlippage) / 1e18, implicitly assuming 1 stETH = 1 ETH; during a stETH de-peg the Curve exchange returns… |
-| M-04 | Medium | `missing-deadline` | yes | 🟡 near (class mismatch) | — | Reth.deposit performs a Uniswap V3 swapExactInputSingleHop with no deadline parameter, so a pending stake transaction can be held by validators and executed la… |
+| M-04 | Medium | `missing-deadline` | yes | ✅ caught | MissingDeadline @ reth.sol:156 | Reth.deposit performs a Uniswap V3 swapExactInputSingleHop with no deadline parameter, so a pending stake transaction can be held by validators and executed la… |
 | M-06 | Medium | `dos-on-revert` | no | 🟡 near (class mismatch) | — | unstake() sends the withdrawn ETH with a single address(msg.sender).call{value:...} and requires success; a contract caller whose receive reverts (or a push-pa… |
-| M-08 | Medium | `unbounded-loop` | yes | 🟡 near (class mismatch) | — | unstake() loops over all derivatives (for i < derivativeCount), each doing external balance/withdraw calls; as derivativeCount grows the loop can exceed the bl… |
+| M-08 | Medium | `unbounded-loop` | yes | ✅ caught | UnboundedLoop @ safeth.sol:113 | unstake() loops over all derivatives (for i < derivativeCount), each doing external balance/withdraw calls; as derivativeCount grows the loop can exceed the bl… |
 | M-12 | Medium | `slippage` | yes | 🟡 near (class mismatch) | — | stake() accepts no user-supplied minimum-output (min safETH) parameter; the per-derivative deposits swap on AMMs and the final mintAmount has no slippage bound… |
 
 ### `2023-04-caviar`
@@ -131,7 +131,7 @@ Repo `code-423n4/2023-07-basin` @ `73f7133b380ea027048f0b9aaa284b14f3ce43b4`.
 
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
-| H-01 | High | `oracle-manipulation` | yes | ❌ missed | — | Well.sync() (and shift()) call _setReserves directly without first pushing the previous-block reserves into the attached pump (unlike swapFrom), so the pump's … |
+| H-01 | High | `oracle-manipulation` | yes | ✅ caught | OracleManipulation @ well.sol:596 | Well.sync() (and shift()) call _setReserves directly without first pushing the previous-block reserves into the attached pump (unlike swapFrom), so the pump's … |
 | M-02 | Medium | `accounting-logic` | no | ❌ missed | — | storeUint128's odd-reserve branch re-reads the target slot's high 128 bits via shl(128, shr(128, sload(...))) and re-packs them; the slot/bit arithmetic mis-pr… |
 | M-01 | Medium | `accounting-logic` | no | ❌ missed | — | getBytes32FromBytes bounds-checks with `index > data.length` instead of `>=`, allowing an out-of-bounds memory read of the last word, which can return corrupte… |
 | M-06 | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ constantproduct2.sol:53 | calcLpTokenSupply computes the LP supply as sqrt(reserves[0]*reserves[1]*EXP_PRECISION); the integer sqrt loses precision asymmetrically versus the division us… |

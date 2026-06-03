@@ -4,6 +4,7 @@
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
+use sluice_ir::Function;
 
 pub struct SignatureDetector;
 
@@ -343,6 +344,128 @@ impl Detector for SignatureDetector {
             }
         }
 
+        // ---------------------------------------------------------------------
+        // Broadening C — public entry point invokes a deadline-less AMM *router*
+        // swap.
+        //
+        // Broadening B only recognizes a contract that *is itself* an AMM pool
+        // (it holds a `reserves` pricing var). It structurally misses the far more
+        // common liquid-staking / vault shape (Asymmetry `Reth.deposit`): a public
+        // entry point that swaps on an *external* Uniswap-style router
+        // (`ISwapRouter(..).exactInputSingle(params)`) without passing any
+        // `deadline`. The Uniswap V3 `SwapRouter02` `ExactInput*`/`ExactOutput*`
+        // structs carry no `deadline` field at all, so such a stake/deposit tx can
+        // sit in the mempool and execute much later at a stale price. The contract
+        // holds no `reserves` var, so arm B never sees it.
+        //
+        // We key on the *router method name* (resolved `func_name`, original case)
+        // rather than on pool state, and we look one internal-call hop deep because
+        // the swap is usually delegated to a private helper
+        // (`deposit` -> `swapExactInputSingleHop` -> `exactInputSingle`). To stay
+        // conservative we fire ONLY when no deadline is plumbed anywhere on the
+        // path: neither the entry point nor the swap-bearing function carries a
+        // `deadline`/`expiry` parameter or even mentions `deadline`/`expiry`/
+        // `block.timestamp` (a V2 router's trailing deadline arg and a V3 struct's
+        // `deadline:` field both show up as one of those tokens). This keeps every
+        // dogfood router caller silent — comet's `OnChainLiquidator` passes
+        // `deadline: block.timestamp` / `block.timestamp` into each swap helper,
+        // and universal-router's swap primitives are named `v3SwapExactInput` /
+        // `_swap` (not the canonical router entry names), so neither matches.
+        fn is_router_swap_method(name: &str) -> bool {
+            let n = name.to_ascii_lowercase();
+            // Uniswap V3 SwapRouter (no deadline field on V2-era *02* structs):
+            n == "exactinputsingle"
+                || n == "exactinput"
+                || n == "exactoutputsingle"
+                || n == "exactoutput"
+                // Uniswap V2 / Sushi router family (deadline is a trailing arg):
+                || n == "swapexacttokensfortokens"
+                || n == "swaptokensforexacttokens"
+                || n == "swapexactethfortokens"
+                || n == "swapethforexacttokens"
+                || n == "swapexacttokensforeth"
+                || n == "swaptokensforexacteth"
+                // Common project wrapper names for a single-hop router swap:
+                || n == "swapexactinputsinglehop"
+                || n == "swapexactinput"
+                || n == "swapexactoutput"
+        }
+        // Does a function's source plumb *any* deadline/timestamp bound? Used as
+        // the conservative "already protected" gate for both the entry point and
+        // the swap-bearing helper.
+        let plumbs_deadline = |g: &Function| -> bool {
+            if g.params.iter().any(|p| {
+                let n = p.name.as_deref().unwrap_or("").to_ascii_lowercase();
+                n.contains("deadline") || n.contains("expiry") || n == "validuntil" || n.contains("expiration")
+            }) {
+                return true;
+            }
+            let s = cx.source_text(g.span);
+            s.contains("deadline") || s.contains("expiry") || s.contains("block.timestamp")
+        };
+        for f in cx.functions() {
+            if !f.has_body || !f.is_externally_reachable() || !f.is_state_mutating() {
+                continue;
+            }
+            // The entry point must not itself plumb a deadline.
+            if plumbs_deadline(f) {
+                continue;
+            }
+            // Find a router-swap call site: either directly in `f`, or one hop
+            // into a same-contract internal helper (the usual delegation shape).
+            // The swap-bearing function must itself not plumb a deadline.
+            let direct = f
+                .effects
+                .call_sites
+                .iter()
+                .any(|cs| cs.func_name.as_deref().map(is_router_swap_method).unwrap_or(false));
+            let swap_site = if direct {
+                Some(f)
+            } else {
+                f.callees
+                    .iter()
+                    .filter_map(|cid| cx.scir.function(*cid))
+                    .filter(|g| g.contract == f.contract)
+                    .find(|g| {
+                        g.effects
+                            .call_sites
+                            .iter()
+                            .any(|cs| cs.func_name.as_deref().map(is_router_swap_method).unwrap_or(false))
+                            && !plumbs_deadline(g)
+                    })
+            };
+            let Some(_swap_fn) = swap_site else { continue };
+            // Don't double-report if arm B already flagged this function.
+            if out
+                .iter()
+                .any(|fnd| fnd.category == Category::MissingDeadline && fnd.function == f.name)
+            {
+                continue;
+            }
+            out.push(cx.finish(
+                FindingBuilder::new("signature", Category::MissingDeadline)
+                    .title("Swap on an AMM router takes no deadline (stale-price execution)")
+                    .severity(Severity::Medium)
+                    .confidence(0.5)
+                    .dimension(Dimension::ValueFlow)
+                    .message(format!(
+                        "`{}` swaps on a Uniswap-style router (e.g. `exactInputSingle`/`swapExactTokensForTokens`) \
+                         without supplying any `deadline`, and enforces no `block.timestamp` bound. The submitted \
+                         transaction can linger in the mempool and be executed much later at a stale, unfavorable \
+                         price (e.g. after the pool has moved), with only the slippage `amountOutMinimum` — computed \
+                         at submission time — as protection.",
+                        f.name
+                    ))
+                    .recommendation(
+                        "Pass a caller-supplied `deadline` to the router swap (Uniswap V3 `SwapRouter`'s params, or \
+                         the V2 router's trailing `deadline` argument) so a delayed transaction reverts instead of \
+                         executing at a stale price.",
+                    ),
+                f.id,
+                f.span,
+            ));
+        }
+
         out
     }
 }
@@ -533,5 +656,83 @@ mod tests {
     fn deadline_silent_on_owner_only_setter() {
         let fs = run(DEADLINE_SAFE_ADMIN);
         assert!(!has(&fs, Category::MissingDeadline, "setVirtualReserves"), "{:#?}", fs);
+    }
+
+    // --- Broadening C: AMM *router* swap with no deadline ----------------------
+
+    // Vulnerable (Asymmetry `Reth.deposit` shape): a public entry point delegates
+    // to a private helper that swaps on a Uniswap V3 router via `exactInputSingle`
+    // (whose params struct has no `deadline` field). Neither the entry nor the
+    // helper plumbs a deadline → the stake tx can execute at a stale price. The
+    // contract holds no `reserves` var, so arm B never sees it; arm C must.
+    const ROUTER_DEADLINE_VULN: &str = r#"
+        interface IERC20 { function approve(address s, uint256 a) external returns (bool); }
+        interface ISwapRouter {
+            struct ExactInputSingleParams {
+                address tokenIn; address tokenOut; uint24 fee; address recipient;
+                uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96;
+            }
+            function exactInputSingle(ExactInputSingleParams calldata params)
+                external payable returns (uint256 amountOut);
+        }
+        contract Reth {
+            address constant ROUTER = address(0x1234);
+            function swapExactInputSingleHop(
+                address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint256 minOut
+            ) private returns (uint256 amountOut) {
+                IERC20(tokenIn).approve(ROUTER, amountIn);
+                ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+                    tokenIn: tokenIn, tokenOut: tokenOut, fee: fee, recipient: address(this),
+                    amountIn: amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0
+                });
+                amountOut = ISwapRouter(ROUTER).exactInputSingle(params);
+            }
+            function deposit(uint256 minOut) external payable returns (uint256) {
+                return swapExactInputSingleHop(address(1), address(2), 500, msg.value, minOut);
+            }
+        }
+    "#;
+
+    // Safe: identical router swap, but the helper passes a real `deadline` into
+    // the router params and the entry takes a `deadline` parameter → protected,
+    // must stay silent.
+    const ROUTER_DEADLINE_SAFE: &str = r#"
+        interface IERC20 { function approve(address s, uint256 a) external returns (bool); }
+        interface ISwapRouter {
+            struct ExactInputSingleParams {
+                address tokenIn; address tokenOut; uint24 fee; address recipient;
+                uint256 deadline; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96;
+            }
+            function exactInputSingle(ExactInputSingleParams calldata params)
+                external payable returns (uint256 amountOut);
+        }
+        contract Reth {
+            address constant ROUTER = address(0x1234);
+            function swapExactInputSingleHop(
+                address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint256 minOut, uint256 deadline
+            ) private returns (uint256 amountOut) {
+                IERC20(tokenIn).approve(ROUTER, amountIn);
+                ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+                    tokenIn: tokenIn, tokenOut: tokenOut, fee: fee, recipient: address(this),
+                    deadline: deadline, amountIn: amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0
+                });
+                amountOut = ISwapRouter(ROUTER).exactInputSingle(params);
+            }
+            function deposit(uint256 minOut, uint256 deadline) external payable returns (uint256) {
+                return swapExactInputSingleHop(address(1), address(2), 500, msg.value, minOut, deadline);
+            }
+        }
+    "#;
+
+    #[test]
+    fn deadline_fires_on_router_swap_without_deadline() {
+        let fs = run(ROUTER_DEADLINE_VULN);
+        assert!(has(&fs, Category::MissingDeadline, "deposit"), "{:#?}", fs);
+    }
+
+    #[test]
+    fn deadline_silent_on_router_swap_with_deadline() {
+        let fs = run(ROUTER_DEADLINE_SAFE);
+        assert!(!has(&fs, Category::MissingDeadline, "deposit"), "{:#?}", fs);
     }
 }

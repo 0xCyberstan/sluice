@@ -1,12 +1,36 @@
 //! Spot-price oracle manipulation: a manipulable price (`balanceOf`,
 //! `getReserves`, `pricePerShare`, ...) feeds protocol accounting with no robust
 //! oracle / TWAP. The Cream / Harvest / bZx class.
+//!
+//! ## Second shape — the **oracle-update-before-mutation** co-update gap (Basin H-01)
+//!
+//! A complementary oracle-manipulation surface lives on the *write* side. When a
+//! contract attaches a manipulation-resistant oracle (a Beanstalk/Basin **Pump**, a
+//! TWAP accumulator) whose security depends on capturing the *previous*-block
+//! reserves *before* they are mutated, the protocol must **update the oracle BEFORE
+//! writing new reserves** on every reserve-mutating path. Basin's `Well` honours
+//! this on `swapFrom`/`swapTo`/`addLiquidity`/`removeLiquidity*`: each calls
+//! `_updatePumps(...)` — which feeds the pre-move reserves into the attached pump
+//! via `IPump(...).update(...)` — *before* `_setReserves(...)`.
+//!
+//! Two functions break the rule: **`sync`** and **`shift`** call `_setReserves(...)`
+//! WITHOUT a preceding pump update (Basin H-01). An attacker can therefore move the
+//! reserves through `sync`/`shift` without the pump ever capturing the pre-move
+//! state, corrupting the pump's manipulation-resistant oracle history (the very
+//! signal downstream protocols rely on as a "safe" alternative to a spot read).
+//!
+//! This is a **cross-function consensus** signal: most reserve-mutating siblings in
+//! the same contract update the oracle first; the detector flags the *outlier* that
+//! does not — and ONLY when a clear sibling demonstrates the disciplined ordering,
+//! so it never fires on a contract that simply has no pump. It is distinct from
+//! `twap-manipulation` (which covers the *read* side — a fake/short-window TWAP):
+//! this is the write side failing to feed the oracle before mutating reserves.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::detectors::is_accounting_name;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{Call, CallKind, Expr, ExprKind, Function, Span};
+use sluice_ir::{Call, CallKind, Expr, ExprKind, Function, FunctionId, Span};
 
 pub struct OracleDetector;
 
@@ -101,8 +125,284 @@ impl Detector for OracleDetector {
                 );
             out.push(cx.finish(b, f.id, price_span));
         }
+        // Second shape: a reserve-mutating function that skips the oracle/pump
+        // update its sibling reserve-mutators all perform first (Basin H-01). This
+        // is the write-side co-update gap, orthogonal to the spot-read logic above.
+        out.extend(find_pump_update_before_mutation_gaps(self, cx));
         out
     }
+}
+
+// ============================================================================
+// Oracle-update-before-mutation co-update gap (Basin H-01)
+// ============================================================================
+//
+// The invariant: on a contract that attaches a manipulation-resistant oracle/pump
+// whose security depends on capturing pre-move reserves, EVERY reserve-mutating
+// path must update the oracle BEFORE writing new reserves. The detector mines the
+// cross-function consensus — most reserve-mutators update first — and flags the
+// outlier that mutates without updating, but only when a sibling proves the
+// disciplined ordering exists (so a no-pump contract never trips it).
+
+/// Internal-call / helper-name markers that a path **mutates the stored reserves**.
+/// Basin writes reserves through `_setReserves(...)` (which persists to a constant
+/// byte slot rather than a named state var, so a structural `reserves` state-var
+/// write does not surface); a generic `*setreserves*` / `*storereserves*` /
+/// `*writereserves*` helper name is the portable marker.
+const RESERVE_MUTATE_MARKERS: &[&str] = &["setreserves", "storereserves", "writereserves"];
+
+/// Internal-call / helper-name markers that a path **updates the attached
+/// oracle/pump** — Basin's `_updatePumps(...)`, or a generic pump/oracle/TWAP
+/// update/sync/accumulate helper. The pre-move reserves are fed to the oracle here.
+const PUMP_UPDATE_MARKERS: &[&str] =
+    &["updatepump", "updatepumps", "updateoracle", "updatetwap", "_updatepump"];
+
+/// Find every externally-reachable, state-mutating function that writes reserves
+/// WITHOUT first updating the attached oracle/pump, when a sibling reserve-mutator
+/// in the same contract DOES update first. Returns one finding per outlier.
+fn find_pump_update_before_mutation_gaps(det: &OracleDetector, cx: &AnalysisContext) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for f in cx.functions() {
+        if !f.has_body || !f.is_externally_reachable() || !f.is_state_mutating() {
+            continue;
+        }
+        let Some(contract) = cx.contract_of(f.id) else { continue };
+        if contract.is_interface() {
+            continue;
+        }
+        // (1) This function mutates reserves on its (transitive same-contract) path.
+        if !path_mutates_reserves(cx, f) {
+            continue;
+        }
+        // (2) ... and does NOT update the oracle/pump anywhere on that path.
+        if path_updates_pump(cx, f) {
+            continue;
+        }
+        // (3) Consensus gate: a *sibling* reserve-mutator in the same contract DOES
+        //     update the oracle/pump before writing reserves. Without a disciplined
+        //     sibling there is no agreed-upon ordering to be the outlier of (a
+        //     contract with no pump, or where nobody updates, is not in scope), so
+        //     this is the conservative anchor that keeps the detector quiet unless
+        //     the contract demonstrably maintains the invariant elsewhere.
+        if !has_pump_updating_reserve_sibling(cx, f) {
+            continue;
+        }
+
+        // Anchor at the reserve-mutating call site if we can place it, else the fn.
+        let span = reserve_mutation_span(f).unwrap_or(f.span);
+
+        let b = FindingBuilder::new(det.id(), Category::OracleManipulation)
+            .title("Reserves mutated without first updating the manipulation-resistant oracle (pump)")
+            .severity(Severity::High)
+            .confidence(0.5)
+            .dimension(Dimension::Invariant)
+            .dimension(Dimension::ValueFlow)
+            .message(format!(
+                "`{}` writes the Well's stored reserves (`_setReserves`-style) WITHOUT first \
+                 updating the attached manipulation-resistant oracle (the Pump, via \
+                 `_updatePumps`/`IPump(...).update`). Its sibling reserve-mutating functions in the \
+                 same contract (the swap / add-liquidity / remove-liquidity paths) update the pump \
+                 FIRST, so the contract's own consensus is `update-the-oracle-then-mutate` — and `{}` \
+                 is the outlier that breaks it. Because the pump captures the *previous*-block \
+                 reserves only when `update` runs before the write, an attacker who moves the \
+                 reserves through this path (e.g. by donating tokens then calling it) does so without \
+                 the pump ever recording the pre-move state, corrupting the oracle's \
+                 manipulation-resistant history — the very signal downstream protocols trust in place \
+                 of a raw spot read. This is the Basin H-01 (`sync`/`shift`) write-side oracle \
+                 corruption, complementary to the spot-read manipulation class.",
+                f.name, f.name
+            ))
+            .recommendation(
+                "Update the attached oracle/pump BEFORE mutating reserves on EVERY reserve-changing \
+                 path, exactly as the swap / liquidity paths do: call `_updatePumps(...)` (which \
+                 feeds the pre-move reserves into `IPump(...).update`) before `_setReserves(...)` in \
+                 `sync`/`shift`. The oracle must observe the pre-move reserves on every mutation, or \
+                 its manipulation-resistance is bypassable through the un-instrumented path.",
+            );
+        out.push(cx.finish(b, f.id, span));
+    }
+    out
+}
+
+/// The `Function`s on `f`'s path: `f` plus every **transitively** resolved
+/// same-contract internal callee with a body (bounded, cycle-safe BFS over
+/// `Function::callees`). Basin's `swapFrom` reaches `_updatePumps`/`_setReserves`
+/// only through `_swapFrom`, so a one-level fold is insufficient for the SIBLING
+/// scan; `sync`/`shift` call both helpers directly. Mirrors the bounded walk used
+/// by `funding_index_settle_ordering`.
+fn pump_path_bodies<'a>(cx: &'a AnalysisContext, f: &'a Function) -> Vec<&'a Function> {
+    use std::collections::HashSet;
+    const MAX_NODES: usize = 64;
+    const MAX_DEPTH: u32 = 6;
+    let own = cx.contract_of(f.id).map(|c| c.id);
+    let mut seen: HashSet<FunctionId> = HashSet::new();
+    let mut out: Vec<&Function> = Vec::new();
+    let mut stack: Vec<(FunctionId, u32)> = vec![(f.id, 0)];
+    seen.insert(f.id);
+    while let Some((id, depth)) = stack.pop() {
+        let Some(g) = cx.scir.function(id) else { continue };
+        out.push(g);
+        if out.len() >= MAX_NODES || depth >= MAX_DEPTH {
+            continue;
+        }
+        for &c in &g.callees {
+            // Stay within the same contract: a cross-contract callee is a trust
+            // frontier, not part of this contract's own ordering discipline.
+            if cx.scir.function(c).map(|h| Some(h.contract) == own).unwrap_or(false)
+                && seen.insert(c)
+            {
+                stack.push((c, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Does any helper-call name on `g`'s body match one of `markers`? Matched against
+/// resolved internal-call names AND the (cast-peeled) callee names of every call,
+/// so both `_updatePumps()` (internal) and `_setReserves(...)` surface regardless
+/// of how the parser classified the call.
+fn body_calls_named(g: &Function, markers: &[&str]) -> bool {
+    if g
+        .effects
+        .internal_calls
+        .iter()
+        .any(|n| { let l = n.to_ascii_lowercase(); markers.iter().any(|m| l.contains(m)) })
+    {
+        return true;
+    }
+    let mut hit = false;
+    for s in &g.body {
+        s.visit_exprs(&mut |e| {
+            if hit {
+                return;
+            }
+            if let ExprKind::Call(c) = &e.kind {
+                if let Some(name) = c.func_name.as_deref() {
+                    let l = name.to_ascii_lowercase();
+                    if markers.iter().any(|m| l.contains(m)) {
+                        hit = true;
+                    }
+                }
+            }
+        });
+        if hit {
+            break;
+        }
+    }
+    hit
+}
+
+/// Does `f`'s path mutate the stored reserves (call a `_setReserves`-style helper)?
+fn path_mutates_reserves(cx: &AnalysisContext, f: &Function) -> bool {
+    pump_path_bodies(cx, f).iter().any(|g| body_calls_named(g, RESERVE_MUTATE_MARKERS))
+}
+
+/// Does `f`'s path update the attached oracle/pump? True when a `_updatePumps`-style
+/// helper is called, OR when an external `update`/`sync` call lands on an
+/// `IPump`/`*pump*`/`*oracle*`-typed-or-named receiver (the call the pump-update
+/// helper itself makes — `IPump(target).update(reserves, data)`).
+fn path_updates_pump(cx: &AnalysisContext, f: &Function) -> bool {
+    pump_path_bodies(cx, f).iter().any(|g| {
+        body_calls_named(g, PUMP_UPDATE_MARKERS) || body_calls_pump_update(cx, g)
+    })
+}
+
+/// Does `g`'s body make an `update`/`sync`/`accumulate`-style call on a pump/oracle
+/// receiver — `IPump(target).update(...)`, `oracle.update(...)`? This catches the
+/// pump update even when the named `_updatePumps` wrapper is inlined / absent.
+fn body_calls_pump_update(cx: &AnalysisContext, g: &Function) -> bool {
+    let mut hit = false;
+    for s in &g.body {
+        s.visit_exprs(&mut |e| {
+            if hit {
+                return;
+            }
+            let ExprKind::Call(c) = &e.kind else { return };
+            let Some(method) = c.func_name.as_deref() else { return };
+            let ml = method.to_ascii_lowercase();
+            if !(ml == "update" || ml == "sync" || ml.contains("accumulate")) {
+                return;
+            }
+            let Some(recv) = c.receiver.as_deref() else { return };
+            // Receiver type (`IPump(target)` cast) or name reads like a pump/oracle.
+            let ty_pump = receiver_type(cx, g, recv).map(|t| is_pump_typename(&t)).unwrap_or(false);
+            let name_pump = receiver_name(recv).map(|n| is_pump_name(&n)).unwrap_or(false);
+            if ty_pump || name_pump {
+                hit = true;
+            }
+        });
+        if hit {
+            break;
+        }
+    }
+    hit
+}
+
+/// Does a sibling function of the SAME contract both mutate reserves AND update the
+/// oracle/pump? This is the cross-function consensus anchor: it proves the contract
+/// maintains the `update-then-mutate` discipline on some other path, making the
+/// non-updating function a genuine outlier (not merely a pump-less contract).
+fn has_pump_updating_reserve_sibling(cx: &AnalysisContext, f: &Function) -> bool {
+    let Some(c) = cx.contract_of(f.id) else { return false };
+    for g in cx.functions() {
+        if g.id == f.id || !g.has_body {
+            continue;
+        }
+        if cx.contract_of(g.id).map(|gc| gc.id) != Some(c.id) {
+            continue;
+        }
+        if !g.is_externally_reachable() {
+            continue;
+        }
+        if path_mutates_reserves(cx, g) && path_updates_pump(cx, g) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Span of the first reserve-mutating call (`_setReserves`-style) in `f`'s own
+/// body, so the finding points at the un-instrumented write rather than the whole
+/// function. Falls back to `None`.
+fn reserve_mutation_span(f: &Function) -> Option<Span> {
+    let mut hit: Option<Span> = None;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if hit.is_some() {
+                return;
+            }
+            if let ExprKind::Call(c) = &e.kind {
+                if let Some(name) = c.func_name.as_deref() {
+                    let l = name.to_ascii_lowercase();
+                    if RESERVE_MUTATE_MARKERS.iter().any(|m| l.contains(m)) {
+                        hit = Some(e.span);
+                    }
+                }
+            }
+        });
+        if hit.is_some() {
+            break;
+        }
+    }
+    hit
+}
+
+/// Does a receiver *type* name denote a pump / oracle / TWAP handle the protocol
+/// updates with pre-move reserves? (`IPump`, `IMultiFlowPump`, `*Pump`, `*Oracle`,
+/// `*Twap`.) Reuses the oracle/feed vocabulary plus the pump-specific tokens.
+fn is_pump_typename(ty: &str) -> bool {
+    let l = first_token(ty).to_ascii_lowercase();
+    let l = l.trim_start_matches('_');
+    l.contains("pump") || l.contains("oracle") || l.contains("twap") || is_oracle_feed_typename(ty)
+}
+
+/// Does a receiver *name* read like a pump / oracle / TWAP handle? (`pump`,
+/// `pumps`, `oracle`, `twap`.)
+fn is_pump_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    let l = l.trim_start_matches('_');
+    l.contains("pump") || l.contains("oracle") || l.contains("twap") || is_oracle_feed_name(name)
 }
 
 /// Find the first spot-price read in `f` that is genuinely manipulable *as a
@@ -707,6 +1007,157 @@ mod tests {
         assert!(
             fired(GETRESERVES_SPOT_PRICE),
             "getReserves() used as a price IS a flash-manipulable spot read (Cream/bZx class)"
+        );
+    }
+
+    // -------- oracle-update-before-mutation co-update gap (Basin H-01) --------
+
+    fn fired_in(src: &str, func: &str) -> bool {
+        analyze_sources(vec![("t.sol".into(), src.into())], &Config::default())
+            .findings
+            .iter()
+            .any(|f| f.detector == "oracle-manipulation" && f.function == func)
+    }
+
+    // VULN — the Basin `Well` shape distilled. `_swapFrom` updates the pump
+    // (`_updatePumps`) BEFORE writing reserves (`_setReserves`); `sync` and `shift`
+    // write reserves WITHOUT a preceding pump update. The disciplined sibling
+    // (`swapFrom` → `_swapFrom`) proves the `update-then-mutate` consensus, so the
+    // two outliers must fire.
+    const BASIN_WELL: &str = r#"
+        interface IERC20 { function balanceOf(address a) external view returns (uint256); }
+        interface IPump { function update(uint256[] memory reserves, bytes memory data) external; }
+        contract Well {
+            address pump;
+            bytes pumpData;
+            function _setReserves(uint256[] memory reserves) internal {
+                // persists to a byte slot (modeled abstractly here)
+            }
+            function _updatePumps(uint256 n) internal returns (uint256[] memory reserves) {
+                reserves = new uint256[](n);
+                IPump(pump).update(reserves, pumpData);
+            }
+            // DISCIPLINED sibling: update pump first, then mutate.
+            function _swapFrom(uint256 amountIn) internal returns (uint256) {
+                uint256[] memory reserves = _updatePumps(2);
+                reserves[0] += amountIn;
+                _setReserves(reserves);
+                return reserves[0];
+            }
+            function swapFrom(uint256 amountIn) external returns (uint256) {
+                return _swapFrom(amountIn);
+            }
+            // OUTLIER 1: sync writes reserves with NO pump update.
+            function sync() external {
+                IERC20 t;
+                uint256[] memory reserves = new uint256[](2);
+                reserves[0] = t.balanceOf(address(this));
+                _setReserves(reserves);
+            }
+            // OUTLIER 2: shift writes reserves with NO pump update.
+            function shift(uint256 minOut) external returns (uint256 amountOut) {
+                IERC20 t;
+                uint256[] memory reserves = new uint256[](2);
+                reserves[0] = t.balanceOf(address(this));
+                amountOut = reserves[0];
+                if (amountOut >= minOut) {
+                    reserves[0] -= amountOut;
+                    _setReserves(reserves);
+                }
+            }
+        }
+    "#;
+
+    // SAFE — every reserve-mutating path updates the pump first (sync/shift are
+    // corrected to call `_updatePumps` before `_setReserves`). No outlier, so the
+    // detector must stay silent on this contract for the co-update class.
+    const BASIN_WELL_FIXED: &str = r#"
+        interface IERC20 { function balanceOf(address a) external view returns (uint256); }
+        interface IPump { function update(uint256[] memory reserves, bytes memory data) external; }
+        contract Well {
+            address pump;
+            bytes pumpData;
+            function _setReserves(uint256[] memory reserves) internal {}
+            function _updatePumps(uint256 n) internal returns (uint256[] memory reserves) {
+                reserves = new uint256[](n);
+                IPump(pump).update(reserves, pumpData);
+            }
+            function _swapFrom(uint256 amountIn) internal returns (uint256) {
+                uint256[] memory reserves = _updatePumps(2);
+                reserves[0] += amountIn;
+                _setReserves(reserves);
+                return reserves[0];
+            }
+            function swapFrom(uint256 amountIn) external returns (uint256) {
+                return _swapFrom(amountIn);
+            }
+            // sync now updates the pump first.
+            function sync() external {
+                uint256[] memory reserves = _updatePumps(2);
+                _setReserves(reserves);
+            }
+        }
+    "#;
+
+    // NEGATIVE — a Well-like contract with NO pump/oracle at all: every path just
+    // mutates reserves, none updates a pump. There is no `update-then-mutate`
+    // consensus to be an outlier of, so the consensus gate keeps it silent (a
+    // pump-less AMM is out of scope for this class).
+    const NO_PUMP: &str = r#"
+        interface IERC20 { function balanceOf(address a) external view returns (uint256); }
+        contract Pool {
+            function _setReserves(uint256[] memory reserves) internal {}
+            function swap(uint256 amountIn) external {
+                uint256[] memory reserves = new uint256[](2);
+                reserves[0] += amountIn;
+                _setReserves(reserves);
+            }
+            function sync() external {
+                IERC20 t;
+                uint256[] memory reserves = new uint256[](2);
+                reserves[0] = t.balanceOf(address(this));
+                _setReserves(reserves);
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_sync_and_shift_without_pump_update() {
+        assert!(
+            fired_in(BASIN_WELL, "sync"),
+            "sync writes reserves without updating the pump while swapFrom does — must fire (Basin H-01)"
+        );
+        assert!(
+            fired_in(BASIN_WELL, "shift"),
+            "shift writes reserves without updating the pump while swapFrom does — must fire (Basin H-01)"
+        );
+        // The disciplined sibling must NOT fire for this class.
+        assert!(
+            !fired_in(BASIN_WELL, "swapFrom") && !fired_in(BASIN_WELL, "_swapFrom"),
+            "the pump-updating swap path is the disciplined sibling, not an outlier"
+        );
+    }
+
+    #[test]
+    fn silent_when_all_paths_update_pump_first() {
+        let fs = analyze_sources(vec![("t.sol".into(), BASIN_WELL_FIXED.into())], &Config::default())
+            .findings;
+        assert!(
+            !fs.iter().any(|f| f.detector == "oracle-manipulation"
+                && f.title.contains("without first updating")),
+            "every reserve-mutator updates the pump first — the co-update gap must stay silent; got {:?}",
+            fs.iter().map(|f| (&f.detector, &f.function, &f.title)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn silent_on_pumpless_pool() {
+        let fs = analyze_sources(vec![("t.sol".into(), NO_PUMP.into())], &Config::default()).findings;
+        assert!(
+            !fs.iter().any(|f| f.detector == "oracle-manipulation"
+                && f.title.contains("without first updating")),
+            "a pump-less pool has no update-then-mutate consensus to violate — must stay silent; got {:?}",
+            fs.iter().map(|f| (&f.detector, &f.function, &f.title)).collect::<Vec<_>>()
         );
     }
 }

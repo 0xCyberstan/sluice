@@ -518,6 +518,111 @@ impl Detector for IntegerIssuesDetector {
                     }
                 }
             }
+
+            // ---- (5) squared oracle spot-price value with no overflow guard ----
+            // The Frankencoin arm (4) catches `price * amount` where `price` is an
+            // unbounded *settable storage var*. A different, equally guaranteed
+            // overflow is the SELF-MULTIPLICATION (square) of an unbounded
+            // *oracle-derived* value — canonically a Uniswap V3 `sqrtPriceX96` spot
+            // read squared to recover a price: `(sqrtPriceX96 * sqrtPriceX96 * 1e18)
+            // >> 192`. Uniswap's own `OracleLibrary` performs this with
+            // `FullMath.mulDiv`, which cannot overflow; code that squares the 160-bit
+            // `sqrtPriceX96` with a bare checked `*` instead overflows for a large
+            // spot price (a fully attacker-/LP-movable value, up to
+            // ~`type(uint160).max`, whose square needs up to ~320 bits) and REVERTS
+            // under >=0.8 — bricking the price path (here stake/unstake). This is the
+            // Asymmetry H-05 shape (`Reth.poolPrice`).
+            //
+            // The signal is structural and deliberately narrow: a `Mul` whose two
+            // operands are the *same* identifier (a square), where that identifier
+            // reads as an oracle spot-price `sqrtPrice`-style quantity (by name) or is
+            // proven oracle-`PriceLike` by the dataflow, AND the enclosing function
+            // does NOT use a `FullMath`/`mulDiv`-style wide multiply or an
+            // `unchecked`-with-bound escape hatch. Squares of ordinary (non-oracle)
+            // locals are NOT flagged — multiplications are ubiquitous, so the
+            // oracle-square gate is what keeps this off normal `a * a` math. It does
+            // NOT depend on the >=0.8 pragma: the overflow is a revert-DoS on >=0.8
+            // and a silent wrap on <0.8 (both a real hazard), and the bug contract is
+            // ^0.8.13.
+            {
+                // Functions that route the square through a checked-wide multiply
+                // (`FullMath.mulDiv` / `Math.mulDiv` / a `mulDiv(`) or opt out with
+                // an `unchecked` block are doing the safe/intentional thing — the
+                // Uniswap OracleLibrary idiom — so we stay silent. Read once.
+                let fsrc = cx.source_text(f.span);
+                let uses_safe_wide_mul = fsrc.contains("fullmath")
+                    || fsrc.contains("muldiv")
+                    || fsrc.contains("unchecked");
+                if !uses_safe_wide_mul {
+                    // One finding per (function, squared-base name): a function that
+                    // squares the same spot price in several places is one review item.
+                    let mut reported: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for s in &f.body {
+                        s.visit_exprs(&mut |e| {
+                            let ExprKind::Binary { op: BinOp::Mul, lhs, rhs } = &e.kind else {
+                                return;
+                            };
+                            // A square: both sides peel (parens + widening casts) to
+                            // the *same* identifier (`x * x`, `x * uint256(x)`).
+                            let (Some(ln), Some(rn)) =
+                                (squared_base_name(lhs), squared_base_name(rhs))
+                            else {
+                                return;
+                            };
+                            if ln != rn {
+                                return;
+                            }
+                            // Gate to an oracle spot-price value: a `sqrtPrice`-style
+                            // name (the canonical Uniswap V3 read) OR a value the
+                            // dataflow proves is oracle-`PriceLike`. Either alone is a
+                            // narrow, principled trigger; together they keep ordinary
+                            // `a * a` squares silent.
+                            let oracle_derived = is_sqrt_price_name(ln)
+                                || cx.is_price_like(f.id, lhs)
+                                || cx.is_price_like(f.id, rhs);
+                            if !oracle_derived {
+                                return;
+                            }
+                            if !reported.insert(ln.to_string()) {
+                                return;
+                            }
+                            let b = FindingBuilder::new(self.id(), Category::IntegerOverflow)
+                                .title(
+                                    "Squared oracle spot price overflows with no FullMath/mulDiv guard",
+                                )
+                                // High structural confidence: the trigger requires a
+                                // self-multiplication (square) of an oracle spot-price
+                                // value with no FullMath/mulDiv/unchecked protection — a
+                                // narrow conjunction, not a bare `*`. Set high enough
+                                // that the corroboration score clears the High label
+                                // threshold, since H-05 is a genuine High-severity
+                                // griefing DoS that bricks the price path.
+                                .severity(Severity::High)
+                                .confidence(0.9)
+                                .dimension(Dimension::ValueFlow)
+                                .message(format!(
+                                    "`{}` squares `{ln}`, an oracle spot-price value (e.g. a Uniswap V3 \
+                                     `sqrtPriceX96`), with a bare multiplication and no `FullMath`/`mulDiv` \
+                                     wide-multiply guard. `sqrtPriceX96` spans the full `uint160` range, so its \
+                                     square needs up to ~320 bits and overflows a `uint256`: under Solidity \
+                                     >=0.8 the checked multiply REVERTS (pre-0.8 it silently wraps). Because a \
+                                     large spot price is freely reachable (LPs/attackers can push the pool), the \
+                                     price read can be made to revert permanently — bricking every path that \
+                                     prices through it (here stake/unstake). Uniswap's own `OracleLibrary` avoids \
+                                     this by computing the square with `FullMath.mulDiv`.",
+                                    f.name
+                                ))
+                                .recommendation(
+                                    "Compute the squared-price ratio with `FullMath.mulDiv` (as Uniswap's \
+                                     `OracleLibrary.getQuoteAtTick` does) so the intermediate product cannot \
+                                     overflow, or scale `sqrtPriceX96` down before squaring.",
+                                );
+                            out.push(cx.finish(b, f.id, e.span));
+                        });
+                    }
+                }
+            }
         }
 
         out
@@ -1444,6 +1549,45 @@ fn price_factor<'a>(
 /// `price * collateral` shapes.
 fn is_unbounded_amount_factor(e: &Expr) -> bool {
     !is_constant_expr(e)
+}
+
+// --------------- section (5): squared oracle spot-price overflow ------------
+
+/// If `e` is (after peeling redundant parens and *widening* numeric type-casts) a
+/// bare identifier, return its name. Used by arm (5) to recognize a square
+/// `x * x` written either directly or with one side widened
+/// (`sqrtPriceX96 * uint256(sqrtPriceX96)`): both sides peel to `sqrtPriceX96`.
+///
+/// Only a *single-argument numeric type-cast* (`uintN(..)` / `intN(..)`) is
+/// peeled — a widening to recover the squared product's range is the canonical
+/// shape, and peeling it does not change which value is being squared. Any other
+/// wrapping (a call, arithmetic, a member/index) returns `None`, so we never
+/// mistake a derived expression for a bare squared base.
+fn squared_base_name(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some(n.as_str()),
+        // A numeric cast `uintN(x)` / `intN(x)`: peel to its single argument.
+        ExprKind::Call(c) if c.kind == CallKind::TypeCast && c.args.len() == 1 => {
+            let ty = cast_target_type(c)?;
+            let t = ty.trim();
+            if t.starts_with("uint") || t.starts_with("int") {
+                squared_base_name(c.args.first()?)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// True if `name` reads as a Uniswap-V3-style square-root spot price — the
+/// canonical oracle value that is squared (without `FullMath`) to recover a
+/// price, overflowing for a large spot. Matches `sqrtPriceX96`, `sqrtPrice`,
+/// `_sqrtPriceX96`, ... on a `sqrtprice` substring (case-insensitive), so the
+/// gate stays tight to the spot-price-square bug class and does not fire on
+/// ordinary `a * a` squares of unrelated locals.
+fn is_sqrt_price_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("sqrtprice")
 }
 
 /// Names that an upper-bound guard pins in *this* function: a `require(x <= n)` /
@@ -2544,5 +2688,104 @@ contract C {
 }
 "#;
         assert!(!fires_unbounded_price(src), "non-price settable factor must be silent (scoped to price)");
+    }
+
+    // ------------------------------------------------------------------
+    // (5) SQUARED ORACLE SPOT-PRICE OVERFLOW regressions (Asymmetry H-05).
+    // `Reth.poolPrice` computes `(sqrtPriceX96 * sqrtPriceX96 * 1e18) >> 192`
+    // with no FullMath/mulDiv guard, so for a large spot price the square
+    // overflows and reverts under >=0.8 — bricking the price path. The arm must
+    // fire on the bare-square shape (as High) and stay SILENT when the square is
+    // computed via FullMath/mulDiv (the Uniswap OracleLibrary idiom), and on
+    // ordinary `a * a` squares of non-oracle values.
+    // ------------------------------------------------------------------
+
+    // True if the squared-oracle-price finding is present.
+    fn fires_sqrt_price_square(src: &str) -> bool {
+        run(src).iter().any(|f| {
+            f.detector == "integer-issues" && f.title.contains("Squared oracle spot price")
+        })
+    }
+
+    // POSITIVE: the exact Asymmetry H-05 shape. The Uniswap V3 `sqrtPriceX96`
+    // spot read is squared (one side widened via `uint(..)`) and scaled, with no
+    // FullMath/mulDiv — a guaranteed-overflow revert-DoS on the price path.
+    #[test]
+    fn fires_on_squared_sqrt_price_no_guard() {
+        let src = r#"
+pragma solidity ^0.8.13;
+interface IUniswapV3Pool { function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool); }
+contract Reth {
+    function poolPrice() private view returns (uint256) {
+        IUniswapV3Pool pool = IUniswapV3Pool(address(0));
+        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        return (sqrtPriceX96 * (uint(sqrtPriceX96)) * (1e18)) >> (96 * 2);
+    }
+}
+"#;
+        let fs: Vec<_> = run(src)
+            .into_iter()
+            .filter(|f| f.detector == "integer-issues" && f.title.contains("Squared oracle spot price"))
+            .collect();
+        assert_eq!(fs.len(), 1, "must flag the squared sqrtPriceX96 exactly once: {:?}", fs);
+        assert_eq!(
+            fs[0].severity,
+            sluice_findings::Severity::High,
+            "squared-oracle-price overflow DoS must surface as High"
+        );
+    }
+
+    // POSITIVE: the direct `sqrtPriceX96 * sqrtPriceX96` square (no widening
+    // cast on either side) must also fire.
+    #[test]
+    fn fires_on_direct_squared_sqrt_price() {
+        let src = r#"
+pragma solidity ^0.8.13;
+interface IPool { function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool); }
+contract C {
+    function price() external view returns (uint256) {
+        IPool pool = IPool(address(0));
+        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        return (sqrtPriceX96 * sqrtPriceX96) >> 192;
+    }
+}
+"#;
+        assert!(fires_sqrt_price_square(src), "bare sqrtPriceX96 * sqrtPriceX96 square must fire");
+    }
+
+    // SAFE (FullMath/mulDiv): the Uniswap `OracleLibrary` idiom squares the price
+    // with `FullMath.mulDiv`, which cannot overflow. The arm must stay SILENT.
+    #[test]
+    fn silent_on_sqrt_price_square_via_muldiv() {
+        let src = r#"
+pragma solidity ^0.8.13;
+interface IPool { function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool); }
+library FullMath { function mulDiv(uint256 a, uint256 b, uint256 d) internal pure returns (uint256) { return a; } }
+contract C {
+    function price() external view returns (uint256) {
+        IPool pool = IPool(address(0));
+        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        uint256 ratioX192 = FullMath.mulDiv(uint256(sqrtPriceX96), uint256(sqrtPriceX96), 1 << 64);
+        return ratioX192;
+    }
+}
+"#;
+        assert!(!fires_sqrt_price_square(src), "FullMath.mulDiv square must be silent");
+    }
+
+    // SAFE (scoped to oracle prices): an ordinary `a * a` square of a non-oracle
+    // local must NOT fire — the gate is the spot-price provenance, not every
+    // self-multiply.
+    #[test]
+    fn silent_on_square_of_nonoracle_value() {
+        let src = r#"
+pragma solidity ^0.8.13;
+contract C {
+    function sq(uint256 a) external pure returns (uint256) {
+        return a * a;
+    }
+}
+"#;
+        assert!(!fires_sqrt_price_square(src), "square of an ordinary local must be silent (scoped to oracle prices)");
     }
 }

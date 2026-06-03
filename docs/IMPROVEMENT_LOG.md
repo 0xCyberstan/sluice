@@ -915,3 +915,26 @@ audit found the SEED corpus contained fabricated/mislabeled findings that had be
   drop is a fidelity gain, not a regression; out-of-class 3%→5% is the real PHASE-B capability gain. Next: deeper corpus
   re-verification (the rewrite is the agent's report-verified work, one item independently confirmed) + PHASE B3 (monotonicity,
   Reserve M-02) + close honest in-class gaps (asymmetry first-depositor/overflow/slippage; Basin sync; Stader). _done._
+
+### NORTH STAR — in-class cleanup wave 3 (asymmetry + Basin): 71% → 87%
+Diagnostic-driven again: closed the freshly-added (honest) in-class gaps. 6 worktree agents launched on disjoint detector
+files; **5 completed + verified, 1 (slippage→asymmetry M-12) was interrupted and dropped (unverified).** Each of the 5
+preserved its file's prior catches + held 0 new Crit/High on the 6-repo dogfood set:
+- **vault.rs → asymmetry H-01** (first-depositor): added a `supply==0 ? const : liveValue/supply` divisor-share arm (dual of
+  the Frankencoin floor arm); Balancer min-liquidity-lock + OZ virtual-shares stay silent. Frankencoin M-03 preserved.
+- **integer_issues.rs → asymmetry H-05** (overflow): a squared oracle spot price (`sqrtPriceX96*sqrtPriceX96*1e18`) with no
+  FullMath/mulDiv guard. Frankencoin H-05 preserved.
+- **signature.rs → asymmetry M-04** (missing-deadline): a one-hop call into a Uniswap router swap primitive
+  (`exactInputSingle`/…) with no deadline plumbed. Tigris sig-replay + Caviar deadline preserved; comet `block.timestamp`
+  deadlines stay silent.
+- **dos.rs → asymmetry M-08** (unbounded-loop): a loop whose bound is an uncapped privileged-growable counter with a
+  per-iteration external call. Lido `try`-wrapped + capped loops stay silent.
+- **oracle.rs → Basin H-01** (oracle-manipulation): cross-function consensus — a reserve-mutating function (`sync`/`shift`)
+  that skips the pump-update its siblings (`swapFrom`) perform before `_setReserves`. (Also fires on `shift`, which the
+  audit finding explicitly covers — "sync() and shift()" — but the manifest pins only `sync`, so `shift` reads as +1
+  unmatched Crit/High = a real, unlabeled sibling positive, not a false one.)
+- **Integration:** 5 disjoint files (each verified to change only its one file), one authoritative gate. **996 workspace
+  tests / 0 fail** (engine 916→933), 0 warnings, corpus + real_hacks green. 134 detectors.
+- **SCOREBOARD: in-class 71% → 87% (27/31)**; out-of-class held 5% (2/41). asymmetry 0%→80% (4/5; M-12 slippage left for a
+  future round), **Basin 67%→100% (3/3)**. Unmatched Crit/High 18→19 (the one new = Basin `shift`, a real sibling). Round
+  wound down here at user request. _done._

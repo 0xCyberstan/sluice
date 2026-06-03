@@ -164,6 +164,84 @@ impl Detector for VaultDetector {
             out.push(cx.finish(b, fid, floor_span));
         }
 
+        // Share-price-from-live-supply with only a genesis zero-guard (no
+        // first-deposit floor) — the Asymmetry-SafEth H-01 class.
+        //
+        // The bespoke-curve pass above keys on `supply <ord> FLOOR ? FLOOR :
+        // mul(supply, …)` — an *ordering* guard against a constant floor whose
+        // non-genesis branch *multiplies* by the supply (the Frankencoin cubic
+        // curve). A second, distinct first-depositor shape prices a share/redeem
+        // ratio by *dividing* a live/underlying value by the running supply and
+        // special-cases only the *empty* pool with a constant:
+        //
+        //   price = totalSupply == 0 ? 1e18 : (1e18 * underlyingValue) / totalSupply;
+        //   ...
+        //   mintAmount = totalDepositValue * 1e18 / price;   // _mint(...)
+        //
+        // `underlyingValue` is the *live* sum of external derivative balances, not a
+        // tracked accounting variable, so it is donatable. The only protection is
+        // the `== 0` branch, which guards the very first mint and nothing after it:
+        // because the contract also lets holders unstake/burn (driving the supply
+        // back toward 1 wei), an early/sole staker can shrink the supply and inflate
+        // `underlyingValue/totalSupply`, making every later staker's `mintAmount`
+        // round toward zero — the first-depositor / share-inflation class on a
+        // non-ERC4626 staking-share token.
+        //
+        // This is gated on a *very specific* structural conjunction, kept disjoint
+        // from (and far narrower than) the donation gate so share-pricing FPs stay
+        // out:
+        //   1. a `supply == 0` / `supply != 0` *equality* genesis guard, whose
+        //   2. non-genesis branch *divides by the running supply* (`x / supply`, or
+        //      a `*div*` helper with the supply as divisor) — the share-price-from-
+        //      live-balance shape, the dual of the curve pass's multiply-by-supply;
+        //   3. inside a function that mints (`_mint`/`mint`);
+        //   4. the contract has a supply reducer (so the guard is bypassable); and
+        //   5. the genesis branch does NOT mint a minimum/dead-share amount to a
+        //      burn address (Balancer-style `_mint(address(0), MINIMUM)` is exactly
+        //      the lock that closes this channel — never flag it).
+        // Suppressed, as elsewhere, when the contract already uses OZ virtual-shares
+        // / decimals-offset / dead-shares.
+        for c in cx.scir.iter_contracts() {
+            if !c.is_concrete() {
+                continue;
+            }
+            if contract_uses_inflation_mitigation(cx, c) {
+                continue;
+            }
+            if !contract_has_supply_reducer(cx, c) {
+                continue; // zero-guard is a one-way genesis guard, not bypassable
+            }
+            let Some((price_fn, price_span)) = find_unfloored_supply_divisor_mint(cx, c) else {
+                continue;
+            };
+            let Some(fid) = floor_fn_id(cx, c, price_span) else {
+                continue;
+            };
+            let b = FindingBuilder::new(self.id(), Category::FirstDepositor)
+                .title("Share price divided by live supply with no first-deposit floor")
+                .severity(Severity::High)
+                .confidence(0.5)
+                .dimension(Dimension::ValueFlow)
+                .message(format!(
+                    "`{}` prices minted shares from a ratio that divides a live/underlying value by the \
+                     current total supply (`price ∝ value / totalSupply`) and special-cases only the empty \
+                     pool with a constant (`totalSupply == 0 ? CONST : value / totalSupply`). That `== 0` \
+                     branch protects only the genesis mint and adds no virtual-shares / dead-shares / \
+                     minimum-liquidity floor. Because `{}` also lets holders unstake/burn (reducing the \
+                     supply), an early or sole staker can shrink the supply back toward 1 wei and inflate the \
+                     value/supply ratio, so every later staker's minted amount rounds toward zero — the \
+                     first-depositor / share-inflation class on a bespoke (non-ERC4626) staking-share token.",
+                    price_fn, c.name
+                ))
+                .recommendation(
+                    "Do not gate share pricing on `totalSupply == 0` alone. Permanently lock a bootstrap \
+                     amount of shares on first deposit (mint dead shares to a burn address), add a \
+                     virtual-shares / decimals-offset term so the ratio cannot be manipulated near an empty \
+                     pool, or track underlying value internally instead of summing live external balances.",
+                );
+            out.push(cx.finish(b, fid, price_span));
+        }
+
         out
     }
 }
@@ -438,6 +516,279 @@ fn contract_has_supply_reducer(cx: &AnalysisContext, c: &Contract) -> bool {
     false
 }
 
+// ----- unfloored share-price-from-live-supply detection (Asymmetry H-01) -----
+
+/// Local variable names that are assigned *directly* from a supply read inside a
+/// function (`uint256 ts = totalSupply();`, `supply = totalSupply()`). Real share-
+/// pricing code reads the supply once into a local and divides by the local, so to
+/// recognize `value / ts` we must treat such aliases as the supply. Scoped to this
+/// pass (the floor-curve pass keeps the stricter name-only `reads_supply`), so no
+/// existing behavior changes.
+fn supply_aliases(f: &Function) -> Vec<String> {
+    let mut names = Vec::new();
+    for s in &f.body {
+        s.visit(&mut |st| match &st.kind {
+            sluice_ir::StmtKind::VarDecl { name: Some(n), init: Some(init), .. }
+                if reads_supply(init) && !is_supply_name(n) =>
+            {
+                names.push(n.clone());
+            }
+            sluice_ir::StmtKind::Expr(e) => {
+                if let ExprKind::Assign { target, value, .. } = &e.kind {
+                    if let ExprKind::Ident(n) = &target.kind {
+                        if reads_supply(value) && !is_supply_name(n) {
+                            names.push(n.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+    names
+}
+
+/// `reads_supply`, plus: an identifier that is a known local alias of the supply
+/// (assigned `= totalSupply()` earlier in the same function).
+fn reads_supply_or_alias(e: &Expr, aliases: &[String]) -> bool {
+    if reads_supply(e) {
+        return true;
+    }
+    matches!(&e.kind, ExprKind::Ident(n) if aliases.iter().any(|a| a == n))
+}
+
+/// True if `cond` is an *equality* genesis guard on the running supply (or a supply
+/// alias) against a numeric zero: `supply == 0`, `0 == supply`, `supply != 0`, or
+/// `0 != supply`. Returns `Some(eq)` with `eq == true` for `==` (genesis branch is
+/// `then`) and `eq == false` for `!=` (genesis branch is `else`). This is
+/// deliberately *only* the `== 0` empty-pool case — not the `< FLOOR` ordering
+/// guard the bespoke-curve pass already owns.
+fn supply_zero_guard(cond: &Expr, aliases: &[String]) -> Option<bool> {
+    if let ExprKind::Binary { op, lhs, rhs } = &cond.kind {
+        let eq = match op {
+            BinOp::Eq => true,
+            BinOp::Ne => false,
+            _ => return None,
+        };
+        let supply_vs_zero = (reads_supply_or_alias(lhs, aliases) && is_literal_zero(rhs))
+            || (reads_supply_or_alias(rhs, aliases) && is_literal_zero(lhs));
+        if supply_vs_zero {
+            return Some(eq);
+        }
+    }
+    None
+}
+
+/// True if `e` is the numeric literal `0` (decimal or `0x0`).
+fn is_literal_zero(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Lit(Lit::Number(n)) | ExprKind::Lit(Lit::HexNumber(n)) => {
+            let t = n.trim().trim_start_matches("0x").trim_start_matches("0X");
+            !t.is_empty() && t.chars().all(|ch| ch == '0')
+        }
+        _ => false,
+    }
+}
+
+/// True if `e` (transitively) divides by the running supply: a `Div` whose
+/// right-hand side reads the supply (`x / totalSupply`), or a `*div*` helper call
+/// whose *second* argument reads the supply (`_divD18(value, totalSupply)`). This
+/// is the share-price-from-live-value shape and the dual of `scales_by_supply`
+/// (which multiplies by the supply). `aliases` lets a local bound to `totalSupply()`
+/// count as the supply.
+fn divides_by_supply(e: &Expr, aliases: &[String]) -> bool {
+    let mut found = false;
+    e.visit(&mut |n| {
+        if found {
+            return;
+        }
+        match &n.kind {
+            ExprKind::Binary { op: BinOp::Div, rhs, .. } if reads_supply_or_alias(rhs, aliases) => {
+                found = true;
+            }
+            ExprKind::Call(call) => {
+                let is_div_helper = call
+                    .func_name
+                    .as_deref()
+                    .map(|nm| nm.to_ascii_lowercase().contains("div"))
+                    .unwrap_or(false);
+                // Divisor is the 2nd arg of a `div(a, b)` helper.
+                if is_div_helper {
+                    if let Some(divisor) = call.args.get(1) {
+                        if reads_supply_or_alias(divisor, aliases) {
+                            found = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    found
+}
+
+/// True if a statement list mints a fixed minimum/bootstrap amount to a burn
+/// address (`_mint(address(0), …)`, `_mintPoolTokens(address(0), …)`, or to a
+/// `0xdead`-style sink). This is the dead-shares / minimum-liquidity lock that
+/// *closes* the first-depositor channel (Balancer locks `_getMinimumBpt()` to
+/// `address(0)` in its genesis branch), so its presence must suppress the finding.
+fn stmts_mint_to_burn_address(stmts: &[sluice_ir::Stmt]) -> bool {
+    let mut found = false;
+    for s in stmts {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            if let ExprKind::Call(call) = &e.kind {
+                let is_mint = call
+                    .func_name
+                    .as_deref()
+                    .map(|nm| nm.to_ascii_lowercase().contains("mint"))
+                    .unwrap_or(false);
+                if is_mint {
+                    if let Some(first) = call.args.first() {
+                        if is_burn_address(first) {
+                            found = true;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    found
+}
+
+/// True if `e` is a burn/zero address recipient: `address(0)`, `address(0x0)`,
+/// a bare `0`, or a `0x..dead`-style constant.
+fn is_burn_address(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Lit(Lit::Number(_)) | ExprKind::Lit(Lit::HexNumber(_)) => {
+            is_literal_zero(e) || is_dead_hex(e)
+        }
+        ExprKind::Lit(Lit::Address(a)) => {
+            let l = a.to_ascii_lowercase();
+            l.trim_start_matches("0x").chars().all(|ch| ch == '0') || l.contains("dead")
+        }
+        // `address(0)` / `address(0xdead)` cast.
+        ExprKind::Call(call) if matches!(call.kind, sluice_ir::CallKind::TypeCast) => {
+            call.args.first().map(is_burn_address).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn is_dead_hex(e: &Expr) -> bool {
+    if let ExprKind::Lit(Lit::HexNumber(n)) = &e.kind {
+        return n.to_ascii_lowercase().contains("dead");
+    }
+    false
+}
+
+/// True if the function mints share tokens: an internal/own `_mint`/`mint*` call
+/// (recorded in `internal_calls`) or a `*mint*` call site. Pure helpers named
+/// `mint…` are not state-mutating, but this runs only on the share-pricing
+/// function that also carries the zero-guard divisor, so the conjunction is tight.
+fn function_mints(f: &Function) -> bool {
+    if f
+        .effects
+        .internal_calls
+        .iter()
+        .any(|ic| ic.to_ascii_lowercase().contains("mint"))
+    {
+        return true;
+    }
+    f.effects
+        .call_sites
+        .iter()
+        .any(|cs| cs.func_name.as_deref().map(|n| n.to_ascii_lowercase().contains("mint")).unwrap_or(false))
+}
+
+/// Scan a function body for the unfloored `supply == 0 ? CONST : value/supply`
+/// share-price shape, in either the `if/else`-statement form or the ternary form.
+/// Returns the span of the guard/ternary on a match — but only if the genesis
+/// (empty-pool) branch does NOT lock dead shares to a burn address.
+fn find_unfloored_divisor_in_fn(f: &Function) -> Option<sluice_ir::Span> {
+    let aliases = supply_aliases(f);
+    let mut hit = None;
+    for s in &f.body {
+        // `if (supply == 0) { genesis } else { value/supply }` statement form.
+        s.visit(&mut |st| {
+            if hit.is_some() {
+                return;
+            }
+            if let sluice_ir::StmtKind::If { cond, then_branch, else_branch } = &st.kind {
+                if let Some(eq) = supply_zero_guard(cond, &aliases) {
+                    // genesis branch = the one taken when supply IS zero.
+                    let (genesis, nongenesis) =
+                        if eq { (then_branch, else_branch) } else { (else_branch, then_branch) };
+                    if stmts_mint_to_burn_address(genesis) {
+                        return; // minimum-liquidity lock present — channel closed.
+                    }
+                    if branch_divides_by_supply(nongenesis, &aliases) {
+                        hit = Some(st.span);
+                    }
+                }
+            }
+        });
+        if hit.is_some() {
+            break;
+        }
+        // `supply == 0 ? CONST : value/supply` ternary form.
+        s.visit_exprs(&mut |e| {
+            if hit.is_some() {
+                return;
+            }
+            if let ExprKind::Ternary { cond, then_e, else_e } = &e.kind {
+                if let Some(eq) = supply_zero_guard(cond, &aliases) {
+                    let (_genesis, nongenesis) =
+                        if eq { (then_e, else_e) } else { (else_e, then_e) };
+                    if divides_by_supply(nongenesis, &aliases) {
+                        hit = Some(e.span);
+                    }
+                }
+            }
+        });
+        if hit.is_some() {
+            break;
+        }
+    }
+    hit
+}
+
+/// True if any statement in `stmts` evaluates an expression that divides by the
+/// running supply (or a supply alias).
+fn branch_divides_by_supply(stmts: &[sluice_ir::Stmt], aliases: &[String]) -> bool {
+    let mut found = false;
+    for s in stmts {
+        s.visit_exprs(&mut |e| {
+            if !found && divides_by_supply(e, aliases) {
+                found = true;
+            }
+        });
+        if found {
+            break;
+        }
+    }
+    found
+}
+
+/// Find a minting function in `c` that carries the unfloored supply-divisor
+/// share-price shape. Returns `(function_name, guard_span)`.
+fn find_unfloored_supply_divisor_mint(
+    cx: &AnalysisContext,
+    c: &Contract,
+) -> Option<(String, sluice_ir::Span)> {
+    for f in cx.scir.functions_of(c.id) {
+        if !f.has_body || !function_mints(f) {
+            continue;
+        }
+        if let Some(span) = find_unfloored_divisor_in_fn(f) {
+            return Some((f.name.clone(), span));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -572,5 +923,138 @@ mod tests {
     fn silent_on_supply_cap_without_curve() {
         let fs = run(SUPPLY_CAP_NO_CURVE);
         assert!(!fires_floor(&fs), "supply cap with no curve scaling must stay silent; got {:?}", fs);
+    }
+
+    // Asymmetry-SafEth H-01 shape: a non-ERC4626 staking-share token prices new
+    // shares from `preDepositPrice = totalSupply == 0 ? 1e18 : (1e18 *
+    // underlyingValue) / totalSupply`, where `underlyingValue` is the live sum of
+    // external derivative balances. The `== 0` branch guards only the genesis mint
+    // (no virtual/dead shares); because `unstake` burns supply, a sole staker can
+    // shrink the supply and inflate the value/supply ratio so later stakers' mint
+    // rounds toward zero — the first-depositor / share-inflation class.
+    const ASYMMETRY_PRICE: &str = r#"
+        interface IDerivative { function balance() external view returns (uint256); function ethPerDerivative(uint256) external view returns (uint256); function withdraw(uint256) external; }
+        contract SafEth {
+            mapping(uint256 => IDerivative) public derivatives;
+            uint256 public derivativeCount;
+            function totalSupply() public view returns (uint256) { return 0; }
+            function _mint(address to, uint256 amount) internal {}
+            function _burn(address from, uint256 amount) internal {}
+            function stake() external payable {
+                uint256 underlyingValue = 0;
+                for (uint i = 0; i < derivativeCount; i++)
+                    underlyingValue += (derivatives[i].ethPerDerivative(derivatives[i].balance()) * derivatives[i].balance()) / 10 ** 18;
+                uint256 totalSupply = totalSupply();
+                uint256 preDepositPrice;
+                if (totalSupply == 0) preDepositPrice = 10 ** 18;
+                else preDepositPrice = (10 ** 18 * underlyingValue) / totalSupply;
+                uint256 mintAmount = (underlyingValue * 10 ** 18) / preDepositPrice;
+                _mint(msg.sender, mintAmount);
+            }
+            function unstake(uint256 amount) external {
+                _burn(msg.sender, amount);
+            }
+        }
+    "#;
+
+    // The ternary form of the same shape: `price = supply == 0 ? 1e18 :
+    // value / supply` written as a `? :` expression rather than an `if/else`,
+    // AND with the supply read into a short local `ts` (not named like the
+    // supply) — exercises both the ternary arm and the `ts = totalSupply()`
+    // alias-tracking. Must fire.
+    const ASYMMETRY_PRICE_TERNARY: &str = r#"
+        contract StakeT {
+            uint256 liveValue;
+            function totalSupply() public view returns (uint256) { return 0; }
+            function _mint(address to, uint256 amount) internal {}
+            function _burn(address from, uint256 amount) internal {}
+            function stake(uint256 deposited) external {
+                uint256 ts = totalSupply();
+                uint256 price = ts == 0 ? 10 ** 18 : (10 ** 18 * liveValue) / ts;
+                uint256 minted = deposited * 10 ** 18 / price;
+                _mint(msg.sender, minted);
+            }
+            function withdraw(uint256 amount) external { _burn(msg.sender, amount); }
+        }
+    "#;
+
+    // Balancer-style genesis lock: `if (totalSupply() == 0) { _mintPoolTokens(
+    // address(0), MINIMUM); _mintPoolTokens(recipient, out - MINIMUM); } else {
+    // _mintPoolTokens(recipient, out); }`. The empty-pool branch mints a minimum
+    // amount to the zero address (dead shares), which closes the first-depositor
+    // channel, and the non-genesis branch does NOT divide by the supply — must
+    // stay silent even though there is a burn path.
+    const BALANCER_MIN_LOCK: &str = r#"
+        contract Pool {
+            uint256 internal constant MINIMUM_BPT = 1e6;
+            function totalSupply() public view returns (uint256) { return 0; }
+            function _mintPoolTokens(address to, uint256 amount) internal {}
+            function _burnPoolTokens(address from, uint256 amount) internal {}
+            function _onJoin(bytes memory d) internal returns (uint256) { return 1; }
+            function _onInit(bytes memory d) internal returns (uint256) { return 1; }
+            function onJoinPool(address recipient, bytes memory userData) external returns (uint256 out) {
+                if (totalSupply() == 0) {
+                    out = _onInit(userData);
+                    _mintPoolTokens(address(0), MINIMUM_BPT);
+                    _mintPoolTokens(recipient, out - MINIMUM_BPT);
+                } else {
+                    out = _onJoin(userData);
+                    _mintPoolTokens(recipient, out);
+                }
+            }
+            function exitPool(uint256 amount) external { _burnPoolTokens(msg.sender, amount); }
+        }
+    "#;
+
+    // The asymmetry divisor shape but with NO supply reducer (no unstake/burn):
+    // the `== 0` genesis guard can never be re-entered, so the price cannot be
+    // manipulated back down — must stay silent (mirrors silent_without_redeem_path).
+    const DIVISOR_NO_REDEEM: &str = r#"
+        contract MintOnlyPrice {
+            uint256 liveValue;
+            function totalSupply() public view returns (uint256) { return 0; }
+            function _mint(address to, uint256 amount) internal {}
+            function stake(uint256 deposited) external {
+                uint256 ts = totalSupply();
+                uint256 price = ts == 0 ? 10 ** 18 : (10 ** 18 * liveValue) / ts;
+                _mint(msg.sender, deposited * 10 ** 18 / price);
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_asymmetry_unfloored_divisor() {
+        let fs = run(ASYMMETRY_PRICE);
+        assert!(
+            fires_floor(&fs),
+            "expected FirstDepositor on supply-divisor share price (Asymmetry H-01), got {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn fires_on_asymmetry_divisor_ternary() {
+        let fs = run(ASYMMETRY_PRICE_TERNARY);
+        assert!(fires_floor(&fs), "expected FirstDepositor on ternary supply-divisor price, got {:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_balancer_minimum_liquidity_lock() {
+        let fs = run(BALANCER_MIN_LOCK);
+        assert!(
+            !fires_floor(&fs),
+            "genesis mint of dead shares to address(0) closes the channel; must stay silent; got {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_divisor_without_redeem() {
+        let fs = run(DIVISOR_NO_REDEEM);
+        assert!(
+            !fires_floor(&fs),
+            "no supply reducer => zero-guard not bypassable; must stay silent; got {:?}",
+            fs
+        );
     }
 }
