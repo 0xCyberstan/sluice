@@ -247,12 +247,22 @@ fn find_call_at(f: &Function, span: Span) -> Option<&Call> {
 /// unresolved local — is treated as untrusted, so genuine relayer/loop griefing
 /// (`target.call(...)` with a caller-supplied `target`) keeps firing.
 fn callee_is_untrusted(cx: &AnalysisContext, f: &Function, call: &Call) -> bool {
-    // No resolvable receiver (e.g. `address(this).call`, an odd shape): be
-    // conservative and keep the existing behaviour (treat as a candidate).
+    // No resolvable receiver (an odd shape): be conservative and keep the
+    // existing behaviour (treat as a candidate).
     let Some(recv) = call.receiver.as_deref() else {
         return true;
     };
     let recv = unwrap_casts(recv);
+
+    // A *self-call* — `address(this).call(...)` or `this.foo(...)` — is the
+    // contract calling itself, not an externally-controlled party. The callee is
+    // this very contract, whose gas the protocol already owns, so it cannot be an
+    // attacker's griefing lever. This is the Balancer `Swaps.queryBatchSwap` shape
+    // (the Gnosis query-revert trick: `address(this).call(msg.data)` in a
+    // view-only `eth_call` helper), which must not be flagged.
+    if receiver_is_self(recv) {
+        return false;
+    }
 
     // A bare address / hex-number literal target is a fixed predeploy-style
     // address, never attacker-controlled.
@@ -282,6 +292,16 @@ fn unwrap_casts(e: &Expr) -> &Expr {
             _ => return cur,
         }
     }
+}
+
+/// True if the receiver expression is `this` (the current contract), so the call
+/// is a self-call. Casts have already been peeled by `unwrap_casts`, so
+/// `address(this)` arrives here as the bare identifier `this`; `this.foo()`
+/// arrives the same way. `solang_parser` lowers the `this` keyword to a plain
+/// `Variable`/`Ident` named `"this"` (it is not modeled as a distinct node), so a
+/// case-sensitive identifier match is exact.
+fn receiver_is_self(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Ident(n) if n == "this")
 }
 
 /// True if the expression is a literal address (`0x...`). Solidity lexes a
@@ -511,6 +531,84 @@ mod tests {
         assert!(
             fs.iter().any(|f| f.detector == "gas-griefing"),
             "mutable storage target should still be gas-griefing: {:?}",
+            fs
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: a *self-call* (`address(this).call(...)` / `this.foo()`) is the
+    // contract calling itself, not an untrusted external party, so it must not be
+    // flagged — even though the function name (`query`...) is irrelevant and the
+    // call forwards all gas. This is the Balancer `Swaps.queryBatchSwap` FP: the
+    // Gnosis query-revert trick re-enters the Vault via `address(this).call(msg.data)`
+    // inside an `eth_call`-only helper. The relayer-name gate is deliberately
+    // satisfied (the variants below use `execute`/`batch`/`forward`) so what keeps
+    // it silent is the self-call exclusion, not the context gate.
+
+    // The literal Balancer shape: `address(this).call(msg.data)` re-dispatching the
+    // same calldata in a non-view query helper. Name `queryBatchSwap` is not a
+    // relayer name; this stays silent because the callee is self.
+    const SELF_CALL_QUERY: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Vault {
+            function queryBatchSwap(bytes calldata) external returns (int256[] memory deltas) {
+                if (msg.sender != address(this)) {
+                    (bool success, ) = address(this).call(msg.data);
+                    success;
+                }
+            }
+        }
+    "#;
+
+    // Self-call under a *relayer name* (`execute`): the context gate fires, so the
+    // self-call exclusion is what must keep it silent.
+    const SELF_CALL_RELAYER: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Reentrant {
+            function execute(bytes calldata data) external payable {
+                (bool ok, ) = address(this).call{value: msg.value}(data);
+                require(ok, "self call failed");
+            }
+        }
+    "#;
+
+    // `this.foo()`-style self-call (no `address(...)` cast) in a relayer — also self.
+    const SELF_CALL_BARE_THIS: &str = r#"
+        pragma solidity ^0.8.0;
+        contract Forwarder {
+            function forwardSelf(bytes calldata data) external {
+                (bool ok, ) = this.call(data);
+                require(ok, "self forward failed");
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_self_call_query_helper() {
+        let fs = run(SELF_CALL_QUERY);
+        assert!(
+            !fs.iter().any(|f| f.detector == "gas-griefing"),
+            "address(this).call self-call in a query helper must not be gas-griefing: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_self_call_in_relayer() {
+        let fs = run(SELF_CALL_RELAYER);
+        assert!(
+            !fs.iter().any(|f| f.detector == "gas-griefing"),
+            "address(this).call self-call must not be gas-griefing even under a relayer name: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_bare_this_self_call() {
+        let fs = run(SELF_CALL_BARE_THIS);
+        assert!(
+            !fs.iter().any(|f| f.detector == "gas-griefing"),
+            "`this.call(...)` self-call must not be gas-griefing: {:?}",
             fs
         );
     }

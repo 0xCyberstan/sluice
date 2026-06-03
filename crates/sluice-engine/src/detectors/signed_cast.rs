@@ -11,6 +11,15 @@
 //!   * `intN(x)` where `x` is a large *unsigned* value can flip **positive ->
 //!     negative** (any `uint256` with the top bit set becomes a negative
 //!     `int256`), defeating downstream `> 0` / signed-comparison checks.
+//!   * The narrow-width special case of that direction: `int8(decimals())`. An
+//!     ERC-20 `decimals()` returns a `uint8`, so a (malicious or misconfigured)
+//!     token reporting `>= 128` decimals makes the `int8` reinterpret *negative*.
+//!     The narrowed value is then typically used as a base-10 shift exponent, so
+//!     the sign flip silently inverts the scaling direction (Reserve M-14). This
+//!     fires even when the value is held in an `immutable` (one initialized from
+//!     an *external* `decimals()` is not an author-fixed constant) and even when
+//!     the cast is negated (`-int8(d)`: the wrap happens *inside* the `int8`,
+//!     before the negate, so the negation cannot excuse it).
 //!
 //! Both directions corrupt accounting while passing the compiler's >=0.8
 //! overflow checks (which do not look at casts at all). This is distinct from
@@ -96,6 +105,44 @@ impl Detector for SignedCastDetector {
                 if uses_safe_cast(cx, span) {
                     return;
                 }
+
+                // --- narrow signed reinterpret of a `decimals()` value (M-14) ---
+                // `int8(decimals())` is the sharpest instance of the uint->int flip
+                // and the one the generic gates below wrongly excuse: an ERC-20
+                // `decimals()` is a `uint8`, so a token reporting `>= 128` decimals
+                // wraps the `int8` *negative*, silently inverting the base-10 shift
+                // exponent it feeds. We detect it up front — before the
+                // `immutable`/negation/bound suppressions — because none of those
+                // make it safe:
+                //   * an `immutable` initialized from an *external* `decimals()` is
+                //     not an author-fixed constant (the value comes from the token);
+                //   * `-int8(d)` negates an *already-wrapped* `int8`, compounding the
+                //     corruption rather than intending it.
+                // It still respects `uses_safe_cast` above (a `SafeCast.toInt8`
+                // reverts on the overflow) and is itself width-gated: it fires only
+                // when the signed target is narrow enough that the unsigned source
+                // can reach the sign bit (`int8(uint8 decimals)`: 8 <= 8), never on a
+                // genuinely widening `int256(decimals())`.
+                if target_signed {
+                    if let Some(src_bits) = decimals_operand_width(f, contract, arg) {
+                        if let Some(tgt_bits) = bit_width(&target) {
+                            // Fire only when the narrowed signed target is small
+                            // enough for the unsigned decimals value to reach the
+                            // sign bit, and only when the operand is not already
+                            // bounded by a `require`/`if` ordering guard or a
+                            // `min`/`max` clamp that names it (`require(d < 128)`
+                            // makes the flip unreachable). The immutable/negation
+                            // suppressions are deliberately *not* consulted here —
+                            // they are exactly what wrongly excuses M-14.
+                            if tgt_bits <= src_bits && !operand_is_bounded(cx, f, arg) {
+                                let b = self.decimals_finding(f, &target);
+                                out.push(cx.finish(b, f.id, span));
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 // Provably non-negative arguments cannot flip sign: a numeric/hex
                 // literal, a `.length`, a `type(...)` expression, or a
                 // constant/immutable state variable (a compile-time-fixed value the
@@ -218,6 +265,35 @@ impl Detector for SignedCastDetector {
         }
 
         out
+    }
+}
+
+impl SignedCastDetector {
+    /// Build the finding for a narrow signed reinterpret of a `decimals()` value
+    /// (`int8(decimals())`, the Reserve M-14 shape). Kept separate from the
+    /// generic shapes because it intentionally fires through the `immutable` /
+    /// negation / bound suppressions that those rely on.
+    fn decimals_finding(&self, f: &Function, target: &str) -> FindingBuilder {
+        FindingBuilder::new(self.id(), Category::SignedCast)
+            .title("decimals() cast to a narrow signed type can flip positive to negative")
+            .severity(Severity::Medium)
+            .confidence(0.5)
+            .dimension(Dimension::ValueFlow)
+            .message(format!(
+                "`{}` casts a token `decimals()` value to `{target}`. `decimals()` is a `uint8`, so a \
+                 token reporting `>= 128` decimals is reinterpreted as a *negative* `{target}` — Solidity \
+                 integer casts never revert, they reinterpret the two's-complement bits. The narrowed value \
+                 is typically used as a base-10 shift exponent, so the silent sign flip inverts the scaling \
+                 direction (e.g. shifting left instead of right). Holding the value in an `immutable` does \
+                 not help when it was initialized from an external `decimals()`, and negating the result \
+                 (`-int8(d)`) does not help because the wrap happens inside the cast.",
+                f.name
+            ))
+            .recommendation(
+                "Validate the decimals in range before narrowing — `require(d <= uint8(type(int8).max))` \
+                 (i.e. `d < 128`) — or use OpenZeppelin `SafeCast.toInt8`, which reverts when the `uint8` \
+                 exceeds the signed range. Reserve fixed M-14 by bounding `referenceERC20Decimals`.",
+            )
     }
 }
 
@@ -593,6 +669,68 @@ fn operand_unsigned_width(f: &Function, contract: Option<&Contract>, arg: &Expr)
     } else {
         None
     }
+}
+
+/// If `arg` is a token-`decimals()` value, the unsigned bit-width that bounds it;
+/// otherwise `None`. A "decimals operand" is the externally-influenced value at
+/// the heart of Reserve M-14:
+///   * a `.decimals()` **call** (`func_name == "decimals"`) — by the ERC-20
+///     interface this returns a `uint8`, so the value spans `[0, 2**8)` and the
+///     bounding width is 8. The token chooses the value, so it can be `>= 128`;
+///   * a `uintM`-typed identifier / parameter / state variable whose **name**
+///     looks like a decimals field (`decimals`, `erc20Decimals`,
+///     `referenceERC20Decimals`, …) — the width is its declared `M`. The name
+///     gate keeps this from matching arbitrary `uintM` values (those remain the
+///     job of the generic `UintIdentToInt` shape, which the width/negation/bound
+///     gates still constrain).
+///
+/// Casts are peeled first so `int8(uint8(erc20.decimals()))` and a bare
+/// `int8(erc20Decimals)` both resolve. A signed (`intM`) source is never a
+/// decimals operand (it has already been given a sign).
+fn decimals_operand_width(f: &Function, contract: Option<&Contract>, arg: &Expr) -> Option<u32> {
+    let inner = peel_int_casts(arg);
+    // A `decimals()` call: width is the ERC-20 `uint8`.
+    if let ExprKind::Call(c) = &inner.kind {
+        if c.func_name.as_deref() == Some("decimals") {
+            return Some(8);
+        }
+    }
+    // A decimals-named identifier of unsigned type: width is its declared width.
+    if let ExprKind::Ident(name) = &inner.kind {
+        if name_is_decimals(name) {
+            let ty = resolve_decl_type(f, contract, inner)?;
+            if is_uint_type(&ty) {
+                return bit_width(&ty);
+            }
+        }
+    }
+    None
+}
+
+/// True if an identifier name reads as a token-decimals field: it contains the
+/// whole word fragment `decimals` (case-insensitive). Matches `decimals`,
+/// `erc20Decimals`, `referenceERC20Decimals`, `tokenDecimals`; does not match an
+/// unrelated `decimal` typo or `decimalsRatio`-style derived values (we require
+/// the fragment to end the name or be followed by a non-letter, so a value that
+/// has already been *combined* with something else is not treated as the raw
+/// decimals count).
+fn name_is_decimals(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let frag = "decimals";
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(frag) {
+        let start = from + rel;
+        let end = start + frag.len();
+        // The fragment must end the name or be followed by a non-letter, so
+        // `decimals` / `erc20Decimals` match but `decimalsdelta` does not.
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphabetic();
+        if after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// `uint -> int` widening that cannot flip sign: the operand is bounded to an
@@ -990,6 +1128,82 @@ mod tests {
         }
     "#;
 
+    // --- Reserve M-14: unsafe `int8(decimals())` reinterpret -----------------
+
+    // M-14 (Reserve OracleLib.price): `-int8(chainlinkFeed.decimals())`. A
+    // `decimals()` call returns a `uint8`; a feed reporting `>= 128` decimals
+    // wraps the `int8` negative, inverting the shift exponent. The cast is
+    // *negated*, so the old `Negated` suppression silenced it — it must now FIRE
+    // because the wrap happens inside the cast, before the negate.
+    const M14_DECIMALS_CALL_NEGATED: &str = r#"
+        pragma solidity 0.8.9;
+        interface IFeed { function decimals() external view returns (uint8); }
+        contract Oracle {
+            function price(IFeed feed) external view returns (uint256) {
+                return shiftl(uint256(1e18), -int8(feed.decimals()));
+            }
+            function shiftl(uint256 x, int8 d) internal pure returns (uint256) { return x; }
+        }
+    "#;
+
+    // M-14 (Reserve CTokenFiatCollateral.refPerTok): `int8(referenceERC20Decimals)`
+    // where `referenceERC20Decimals` is a `uint8 immutable` initialized from the
+    // underlying token's `decimals()`. The old `immutable`-is-non-negative
+    // suppression silenced it; an immutable set from an *external* `decimals()` is
+    // not author-fixed, so it must now FIRE.
+    const M14_DECIMALS_IMMUTABLE_SUB: &str = r#"
+        pragma solidity 0.8.9;
+        contract CToken {
+            uint8 public immutable referenceERC20Decimals;
+            constructor(uint8 d) { referenceERC20Decimals = d; }
+            function refPerTok() public view returns (uint256) {
+                int8 shiftLeft = 8 - int8(referenceERC20Decimals) - 18;
+                return shiftl(1, shiftLeft);
+            }
+            function shiftl(uint256 x, int8 d) internal pure returns (uint256) { return x; }
+        }
+    "#;
+
+    // SAFE counterpart 1: widening a `decimals()` value into `int256` is sign-stable
+    // — a `uint8` (0..255) is far inside `int256`'s positive range, so no flip is
+    // possible. Must STAY SILENT (the rule is width-gated).
+    const M14_DECIMALS_WIDENING_SAFE: &str = r#"
+        pragma solidity 0.8.9;
+        interface IFeed { function decimals() external view returns (uint8); }
+        contract Oracle {
+            function f(IFeed feed) external view returns (int256) {
+                return int256(feed.decimals());
+            }
+        }
+    "#;
+
+    // SAFE counterpart 2: the decimals value is range-checked before narrowing —
+    // `require(d < 128)` makes the sign flip unreachable. The operand-named bound
+    // must suppress the cast. Must STAY SILENT.
+    const M14_DECIMALS_BOUNDED_SAFE: &str = r#"
+        pragma solidity 0.8.9;
+        contract C {
+            function f(uint8 erc20Decimals) external pure returns (int8) {
+                require(erc20Decimals < 128, "too many decimals");
+                return -int8(erc20Decimals);
+            }
+        }
+    "#;
+
+    // SAFE counterpart 3: `SafeCast.toInt8` reverts on a `uint8 >= 128`, so the
+    // conversion can never silently flip. Must STAY SILENT.
+    const M14_DECIMALS_SAFECAST: &str = r#"
+        pragma solidity 0.8.9;
+        import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+        contract C {
+            using SafeCast for uint256;
+            uint8 public immutable erc20Decimals;
+            function f() external view returns (int8) {
+                return SafeCast.toInt8(int256(uint256(erc20Decimals)));
+            }
+        }
+    "#;
+
     #[test]
     fn fires_on_vuln() {
         let fs = run(VULN);
@@ -1091,6 +1305,38 @@ mod tests {
     #[test]
     fn silent_on_constant_in_arithmetic() {
         let fs = run(FP_CONSTANT_IN_ARITH);
+        assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    // --- Reserve M-14 regressions ---------------------------------------
+
+    #[test]
+    fn fires_on_m14_decimals_call_negated() {
+        let fs = run(M14_DECIMALS_CALL_NEGATED);
+        assert!(fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn fires_on_m14_decimals_immutable_subtraction() {
+        let fs = run(M14_DECIMALS_IMMUTABLE_SUB);
+        assert!(fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_m14_decimals_widening() {
+        let fs = run(M14_DECIMALS_WIDENING_SAFE);
+        assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_m14_decimals_bounded() {
+        let fs = run(M14_DECIMALS_BOUNDED_SAFE);
+        assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
+    }
+
+    #[test]
+    fn silent_on_m14_decimals_safecast() {
+        let fs = run(M14_DECIMALS_SAFECAST);
         assert!(!fs.iter().any(|f| f.detector == "signed-cast"), "{:?}", fs);
     }
 }

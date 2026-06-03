@@ -33,8 +33,20 @@
 //!     header). The guard may be written directly (`require(a.length ==
 //!     b.length)`, `if (a.length != b.length) revert`) OR through a
 //!     *length-alias* local (`uint256 len = a.length; require(len == b.length)`,
-//!     the `LimitRouterBase.setLnFeeRateRoots` shape). A `LengthMismatch`-style
-//!     custom error/revert is also treated as a guard.
+//!     the `LimitRouterBase.setLnFeeRateRoots` shape) OR through a **named
+//!     length-validation helper** call (`InputHelpers.ensureInputLengthMatch(
+//!     tokens.length, amounts.length)`, `_validateEqualArrayLengths(a.length,
+//!     b.length)`). The helper's arguments — each resolving to an array length
+//!     (`arr.length`), a length-alias local, or the array itself — are taken to
+//!     be forced equal, exactly as an inline `require(==)` over the same operands
+//!     would: a 2- or 3-arg call connects all of its argument arrays into one
+//!     equal-length component (so `ensureInputLengthMatch(a, b, c)` covers the
+//!     `a/b/c` triple, and two calls sharing an arg chain transitively). The
+//!     recognized helper names are the validation idioms `ensureInputLengthMatch`
+//!     / `_validateEqualArrayLengths` / `requireSameLength` / `checkLength*`, plus
+//!     anything containing `EqualLength` / `LengthMatch` / `SameLength` (case-
+//!     insensitive). A `LengthMismatch`-style custom error/revert is also treated
+//!     as a guard.
 //!   * Suppress when only one array parameter is actually indexed in a loop
 //!     (single-array iteration cannot mismatch).
 //!
@@ -246,9 +258,14 @@ fn coindexed_group_is_length_guarded(f: &Function, group: &HashSet<&str>) -> boo
 
     // (b) guarded length-equality pairs harvested from guard positions only
     //     (`require`/`assert` args and `if`/loop conditions) so an incidental
-    //     `a.length == b.length` *value* expression is not mistaken for a guard.
+    //     `a.length == b.length` *value* expression is not mistaken for a guard,
+    //     PLUS pairs from named length-validation *helper* calls
+    //     (`InputHelpers.ensureInputLengthMatch(a.length, b.length)`,
+    //     `_validateEqualArrayLengths(a.length, b.length)`): the helper asserts
+    //     equality just as an inline `require(==)` over the same operands would.
     let mut pairs: Vec<(String, String)> = Vec::new();
     collect_guard_length_pairs(&f.body, &alias, &mut pairs);
+    collect_helper_length_pairs(&f.body, &alias, &mut pairs);
     if pairs.is_empty() {
         return false;
     }
@@ -353,6 +370,88 @@ fn harvest_eq_pairs(e: &Expr, alias: &HashMap<String, String>, out: &mut Vec<(St
             }
         }
     });
+}
+
+/// Harvest equal-length pairs from named length-validation *helper* calls
+/// anywhere in `body` (the `InputHelpers.ensureInputLengthMatch(tokens.length,
+/// amounts.length)` / `_validateEqualArrayLengths(a.length, b.length)` shape).
+///
+/// A call counts when its resolved name ([`is_length_validation_helper`])
+/// matches a validation idiom AND two or more of its arguments resolve to an
+/// array name (each argument being `arr.length`, a length-alias local, or the
+/// array `arr` itself). Such a call asserts all of those arrays are the same
+/// length, so we connect every pair of its resolved arrays — a single
+/// `ensureInputLengthMatch(a, b, c)` therefore covers the whole `a/b/c` triple,
+/// and two calls sharing an argument (e.g. `(tokens, a)` and `(tokens, b)`)
+/// connect `a`–`tokens`–`b` transitively in the caller's union-find.
+fn collect_helper_length_pairs(body: &[Stmt], alias: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
+    for s in body {
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Call(c) = &e.kind {
+                let Some(name) = c.func_name.as_deref() else { return };
+                if !is_length_validation_helper(name) {
+                    return;
+                }
+                // Resolve each argument to an array name (`arr.length`, alias
+                // local, or the bare array). De-dup so `f(a.length, a.length)`
+                // does not produce a spurious self-pair.
+                let mut arrays: Vec<String> = Vec::new();
+                for arg in &c.args {
+                    if let Some(arr) = helper_arg_array_name(arg, alias) {
+                        if !arrays.contains(&arr) {
+                            arrays.push(arr);
+                        }
+                    }
+                }
+                // Connect every pair among this single call's resolved arrays.
+                for i in 0..arrays.len() {
+                    for j in (i + 1)..arrays.len() {
+                        out.push((arrays[i].clone(), arrays[j].clone()));
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Resolve a length-validation-helper *argument* to the underlying array name:
+/// `arr.length` -> `arr`, a length-alias local (`len` where `len = arr.length`)
+/// -> `arr`, or a bare array identifier `arr` -> `arr`. Returns `None` for
+/// anything else (a literal, an arithmetic expression, `_getTotalTokens()`, …),
+/// so a helper arg that is not an array length never forges a connection. The
+/// caller's union-find is restricted to the co-indexed group, so a bare ident
+/// that is not one of the group's arrays simply drops out.
+fn helper_arg_array_name(e: &Expr, alias: &HashMap<String, String>) -> Option<String> {
+    if let Some(arr) = length_base(e) {
+        return Some(arr.to_string());
+    }
+    if let ExprKind::Ident(name) = &e.kind {
+        if let Some(arr) = alias.get(name) {
+            return Some(arr.clone());
+        }
+        return Some(name.clone());
+    }
+    None
+}
+
+/// Does `name` name a length-equality validation helper? These are the common
+/// "the arrays must be the same length" idioms, matched case-insensitively:
+///   * exact: `ensureInputLengthMatch`, `_validateEqualArrayLengths`,
+///     `requireSameLength`;
+///   * prefix: `checkLength…`;
+///   * substring: `…EqualLength…`, `…LengthMatch…`, `…SameLength…`.
+/// Deliberately narrow: a generic `require`/`assert` (already handled by the
+/// inline path) or an unrelated helper must NOT match, or genuine no-guard
+/// mismatches would be silently suppressed.
+fn is_length_validation_helper(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "ensureinputlengthmatch" | "_validateequalarraylengths" | "requiresamelength"
+    ) || lower.starts_with("checklength")
+        || lower.contains("equallength")
+        || lower.contains("lengthmatch")
+        || lower.contains("samelength")
 }
 
 /// If `e` is `arr.length`, return `arr`.
@@ -546,5 +645,182 @@ contract ActionMiscV3 {
     #[test]
     fn fires_on_coindexed_no_guard_swaptokens() {
         assert!(fired(&run(TP_SWAPTOKENS)), "allocation `new[](a.length)` is not an equal-length guard");
+    }
+
+    // --- Fix 2a: length validation done through a NAMED HELPER call rather than
+    //     an inline `require`. The detector's whole-body scan must treat the
+    //     helper's `.length` arguments as forced-equal. (Balancer V2
+    //     `FlashLoans.flashLoan:44` / `ProtocolFeesCollector.withdrawCollectedFees:65`
+    //     via `InputHelpers.ensureInputLengthMatch(tokens.length, amounts.length)`.)
+    const GUARDED_VIA_HELPER_LIB: &str = r#"
+library InputHelpers {
+    function ensureInputLengthMatch(uint256 a, uint256 b) internal pure {
+        require(a == b, "len");
+    }
+}
+contract FlashLoans {
+    function flashLoan(address[] memory tokens, uint256[] memory amounts) external {
+        InputHelpers.ensureInputLengthMatch(tokens.length, amounts.length);
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            _pay(tokens[i], amounts[i]);
+        }
+    }
+    function _pay(address t, uint256 a) internal {}
+}
+"#;
+
+    #[test]
+    fn silent_on_helper_lib_length_match() {
+        assert!(
+            !fired(&run(GUARDED_VIA_HELPER_LIB)),
+            "named length-validation helper (lib.ensureInputLengthMatch) must suppress"
+        );
+    }
+
+    // Same body, helper call REMOVED — now genuinely unguarded, so it must fire
+    // (proves the suppression is the helper validation, not the airdrop shape).
+    const HELPER_LIB_NO_GUARD: &str = r#"
+library InputHelpers {
+    function ensureInputLengthMatch(uint256 a, uint256 b) internal pure {
+        require(a == b, "len");
+    }
+}
+contract FlashLoans {
+    function flashLoan(address[] memory tokens, uint256[] memory amounts) external {
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            _pay(tokens[i], amounts[i]);
+        }
+    }
+    function _pay(address t, uint256 a) internal {}
+}
+"#;
+
+    #[test]
+    fn fires_when_helper_guard_absent() {
+        assert!(
+            fired(&run(HELPER_LIB_NO_GUARD)),
+            "co-indexed arrays with the helper removed must fire"
+        );
+    }
+
+    // --- Fix 2b: a BARE internal helper call (not lib-qualified), and the loop
+    //     uses an unsigned `i; i < n` counter. (Lido
+    //     `StakingRouter.updateExitedValidatorsCountByStakingModule:440` via
+    //     `_validateEqualArrayLengths(_a.length, _b.length)`.) ---
+    const GUARDED_VIA_BARE_HELPER: &str = r#"
+contract StakingRouter {
+    function _validateEqualArrayLengths(uint256 a, uint256 b) internal pure {
+        require(a == b, "len");
+    }
+    function updateExitedValidatorsCountByStakingModule(
+        uint256[] calldata _stakingModuleIds,
+        uint256[] calldata _exitedValidatorsCounts
+    ) external returns (uint256) {
+        _validateEqualArrayLengths(_stakingModuleIds.length, _exitedValidatorsCounts.length);
+        uint256 c;
+        for (uint256 i = 0; i < _stakingModuleIds.length; ) {
+            c += _exitedValidatorsCounts[i];
+            unchecked { ++i; }
+        }
+        return c;
+    }
+}
+"#;
+
+    #[test]
+    fn silent_on_bare_helper_length_match() {
+        assert!(
+            !fired(&run(GUARDED_VIA_BARE_HELPER)),
+            "bare `_validateEqualArrayLengths` helper must suppress"
+        );
+    }
+
+    // --- Fix 2c: THREE-arg helper covering a co-indexed triple in one call, plus
+    //     a second helper call sharing the `tokens` argument — the two calls must
+    //     connect all four arrays transitively. (Balancer V2
+    //     `ManagedPoolSettings.setCircuitBreakers:838`.) ---
+    const GUARDED_VIA_MULTI_HELPER: &str = r#"
+library InputHelpers {
+    function ensureInputLengthMatch(uint256 a, uint256 b) internal pure { require(a == b, "len"); }
+    function ensureInputLengthMatch(uint256 a, uint256 b, uint256 c) internal pure {
+        require(a == b && b == c, "len");
+    }
+}
+contract ManagedPoolSettings {
+    function _set(address t, uint256 p, uint256 l, uint256 u) private {}
+    function setCircuitBreakers(
+        address[] memory tokens,
+        uint256[] memory bptPrices,
+        uint256[] memory lowerBoundPercentages,
+        uint256[] memory upperBoundPercentages
+    ) external {
+        InputHelpers.ensureInputLengthMatch(tokens.length, lowerBoundPercentages.length, upperBoundPercentages.length);
+        InputHelpers.ensureInputLengthMatch(tokens.length, bptPrices.length);
+        for (uint256 i = 0; i < tokens.length; i++) {
+            _set(tokens[i], bptPrices[i], lowerBoundPercentages[i], upperBoundPercentages[i]);
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn silent_on_multi_helper_full_cover() {
+        assert!(
+            !fired(&run(GUARDED_VIA_MULTI_HELPER)),
+            "two helper calls sharing an arg must connect all four co-indexed arrays"
+        );
+    }
+
+    // --- Recall guard: a helper that covers only TWO of THREE co-indexed arrays
+    //     leaves the third unguarded, so the function must STILL fire. Proves the
+    //     helper path does not blanket-suppress on the mere presence of a helper. ---
+    const HELPER_PARTIAL_COVER: &str = r#"
+library InputHelpers {
+    function ensureInputLengthMatch(uint256 a, uint256 b) internal pure { require(a == b, "len"); }
+}
+contract Partial {
+    function _use(address a, uint256 b, uint256 c) internal {}
+    function batch(
+        address[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory extras
+    ) external {
+        InputHelpers.ensureInputLengthMatch(tokens.length, amounts.length);
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            _use(tokens[i], amounts[i], extras[i]);
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn fires_when_helper_covers_only_subset() {
+        assert!(
+            fired(&run(HELPER_PARTIAL_COVER)),
+            "helper covering 2 of 3 co-indexed arrays must leave the 3rd unguarded -> fire"
+        );
+    }
+
+    // --- Recall guard: an unrelated helper whose name is NOT a length-validation
+    //     idiom must not suppress (e.g. `_process(a.length, b.length)`). ---
+    const UNRELATED_HELPER_NO_GUARD: &str = r#"
+contract X {
+    function _process(uint256 a, uint256 b) internal {}
+    function _pay(address t, uint256 a) internal {}
+    function batch(address[] memory tokens, uint256[] memory amounts) external {
+        _process(tokens.length, amounts.length);
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            _pay(tokens[i], amounts[i]);
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn fires_on_unrelated_helper_name() {
+        assert!(
+            fired(&run(UNRELATED_HELPER_NO_GUARD)),
+            "a non-validation helper name must not be treated as a length guard"
+        );
     }
 }

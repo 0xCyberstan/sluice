@@ -56,6 +56,44 @@ fn is_value_state_var(name: &str) -> bool {
     VALUE_KEYS.iter().any(|k| l.contains(k))
 }
 
+/// External *view* calls that read a live token balance / share supply — the kind
+/// of read a redemption / withdrawal uses to size or PRORATE the amount it is
+/// about to pay out (`token.balanceOf(pool)`, `totalSupply()`, `totalAssets()`).
+/// When such a read precedes an unguarded hook-bearing transfer that pays the
+/// caller inside a loop, the read is a stale collateral/solvency snapshot the hook
+/// can invalidate by re-entering (the Reserve-RToken `redeem` shape, C4 M-07): the
+/// remaining loop iterations keep paying out against the pre-hook balance even
+/// after a re-entrant redeem has already drawn it down. Kept deliberately narrow
+/// (balance/supply/asset reads only) so it does not fire on every external view.
+fn is_balance_supply_view(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "balanceOf"
+                | "totalSupply"
+                | "totalAssets"
+                | "getReserves"
+                | "convertToAssets"
+                | "convertToShares"
+        )
+    )
+}
+
+/// True iff the function pays its CALLER (the redeemer / withdrawer) — the
+/// recipient of the hook-bearing transfer is attacker-controllable. The contest
+/// code reaches `msg.sender` through OpenZeppelin's `_msgSender()` (an internal
+/// call), so the literal `msg.sender` env flag is not enough; also accept a
+/// `_msgSender()` internal call. (`tx.origin` likewise resolves to the caller.)
+fn pays_the_caller(f: &sluice_ir::Function) -> bool {
+    f.effects.reads_msg_sender
+        || f.effects.reads_tx_origin
+        || f
+            .effects
+            .internal_calls
+            .iter()
+            .any(|n| n == "_msgSender" || n == "msgSender")
+}
+
 impl Detector for Erc777Detector {
     fn id(&self) -> &'static str {
         "erc777-reentrancy"
@@ -133,41 +171,108 @@ impl Detector for Erc777Detector {
                     && is_value_state_var(&w.var)
                     && !settled_before.contains(w.var.as_str())
             });
-            let write_after = match write_after {
-                Some(w) => w,
-                None => continue,
-            };
 
             let op_name = token_op.func_name.as_deref().unwrap_or("transfer");
-            let mut b = FindingBuilder::new(self.id(), Category::Erc777Reentrancy)
-                .title("Token-hook reentrancy: external token op before state update")
-                .severity(Severity::High)
-                // Heuristic, and it overlaps the generic reentrancy detector
-                // (the engine de-duplicates by location), so keep confidence
-                // modest rather than asserting structural certainty.
-                .confidence(0.5)
-                // Frontier: the hazard is a trust frontier crossed unsafely —
-                // an external token call hands control to a counterparty before
-                // `{}` is written.
-                .dimension(Dimension::Frontier)
-                .message(format!(
-                    "`{}` calls `{}` on an external token and only afterwards writes `{}`. If that token \
-                     implements a receive hook (ERC777 `tokensReceived`/`tokensToSend`, or ERC721 \
-                     `onERC721Received`), the recipient regains control *before* the state update and can \
-                     re-enter. A path the developer assumed was a vanilla, non-reentrant ERC20 transfer is \
-                     actually reentrant — the dForce/Lendf.me ($25M) class.",
-                    f.name, op_name, write_after.var
-                ))
-                .recommendation(
-                    "Apply checks-effects-interactions (update storage before the token call) and add a \
-                     `nonReentrant` guard. Do not assume an external token is hook-free; treat ERC777/ERC721 \
-                     transfers as control-transferring external calls.",
-                );
+            let b = match write_after {
+                // ---- Direct CEI violation: a value/balance slot is written in
+                // SOURCE after the hook-bearing transfer (Lendf.me/Grim shape). ----
+                Some(write_after) => FindingBuilder::new(self.id(), Category::Erc777Reentrancy)
+                    .title("Token-hook reentrancy: external token op before state update")
+                    .severity(Severity::High)
+                    // Heuristic, and it overlaps the generic reentrancy detector
+                    // (the engine de-duplicates by location), so keep confidence
+                    // modest rather than asserting structural certainty.
+                    .confidence(0.5)
+                    // Frontier: the hazard is a trust frontier crossed unsafely —
+                    // an external token call hands control to a counterparty before
+                    // the value slot is written.
+                    .dimension(Dimension::Frontier)
+                    .message(format!(
+                        "`{}` calls `{}` on an external token and only afterwards writes `{}`. If that token \
+                         implements a receive hook (ERC777 `tokensReceived`/`tokensToSend`, or ERC721 \
+                         `onERC721Received`), the recipient regains control *before* the state update and can \
+                         re-enter. A path the developer assumed was a vanilla, non-reentrant ERC20 transfer is \
+                         actually reentrant — the dForce/Lendf.me ($25M) class.",
+                        f.name, op_name, write_after.var
+                    ))
+                    .recommendation(
+                        "Apply checks-effects-interactions (update storage before the token call) and add a \
+                         `nonReentrant` guard. Do not assume an external token is hook-free; treat ERC777/ERC721 \
+                         transfers as control-transferring external calls.",
+                    ),
+
+                // ---- Stale-balance-read-before-hook (Reserve RToken `redeem`,
+                // C4 M-07). No value/balance STORAGE slot trails the transfer —
+                // the contract settles its supply via an internal `_burn`/`_mint`
+                // (no ordered storage-write proxy), so the direct-CEI rule above
+                // sees nothing and the wave-5 CEI-downgrade suppresses it. But the
+                // payout AMOUNT is bounded by a live external balance / supply read
+                // (`balanceOf(backingManager)` / `totalSupply()`) taken BEFORE an
+                // unguarded loop of hook-bearing transfers to the CALLER. The first
+                // transfer's hook re-enters and redeems again; the remaining loop
+                // iterations keep paying out against that now-stale snapshot,
+                // bypassing the under-collateralization (prorata) bound. ----
+                None => {
+                    // Earliest external balance/supply view read must precede the
+                    // hook transfer (the prorata snapshot the hook can invalidate).
+                    let stale_read_before = f.effects.call_sites.iter().any(|c| {
+                        c.kind == CallKind::External
+                            && c.order < token_op.order
+                            && is_balance_supply_view(c.func_name.as_deref())
+                    });
+                    // Require the hazardous loop AND that the payout goes to the
+                    // caller (attacker-controllable hook recipient). The
+                    // reentrancy-guard suppression at the top of the loop is the
+                    // safe-out: a guarded redeem never reaches here.
+                    //
+                    // ALSO require the path be permissionless. The hook recipient
+                    // is `msg.sender`; if the function is access-controlled to a
+                    // single trusted caller (`require(_msgSender() == backingManager)`)
+                    // the recipient is that trusted contract, not an attacker, so the
+                    // re-entry is not reachable. (Reserve `StRSR.seizeRSR` is exactly
+                    // this — backingManager-only, transferring the protocol's own
+                    // non-hook RSR — and must NOT fire; `redeem` is permissionless.)
+                    if !(stale_read_before
+                        && f.effects.has_loop
+                        && pays_the_caller(f)
+                        && !cx.has_access_control(f))
+                    {
+                        continue;
+                    }
+                    FindingBuilder::new(self.id(), Category::Erc777Reentrancy)
+                        .title("Token-hook reentrancy: stale balance snapshot before a hook-bearing payout loop")
+                        .severity(Severity::High)
+                        // Subtler than the direct-CEI shape (the corrupted state is
+                        // a re-read external balance, not a trailing storage write),
+                        // so report a notch lower in confidence.
+                        .confidence(0.45)
+                        .dimension(Dimension::Frontier)
+                        .message(format!(
+                            "`{}` bounds each payout by a live external balance/supply read (e.g. \
+                             `balanceOf(...)` / `totalSupply()`) and then sends collateral to the caller via \
+                             `{}` inside an unguarded loop. If a basket/collateral token implements a receive \
+                             hook (ERC777 `tokensReceived`, or ERC721 `onERC721Received`), the first transfer \
+                             hands control back to the redeemer, who re-enters and redeems again; the remaining \
+                             loop iterations keep paying out against the now-stale snapshot, bypassing the \
+                             under-collateralization (prorata) bound. This is the Reserve RToken `redeem` shape \
+                             (Code4rena M-07): the supply is retired by an internal `_burn`/`_mint` (no \
+                             trailing storage write), so a plain checks-effects-interactions scan misses it.",
+                            f.name, op_name
+                        ))
+                        .recommendation(
+                            "Add a `nonReentrant` guard to the redemption/withdrawal path, and treat \
+                             ERC777/ERC721 collateral transfers as control-transferring external calls. Do not \
+                             rely on a pre-loop balance/supply snapshot to bound payouts that are sent before \
+                             the loop completes; re-validate solvency after each interaction or settle all \
+                             accounting before any transfer.",
+                        )
+                }
+            };
 
             // Value-flow corroboration: a hook-bearing transfer is itself a
-            // value movement, and the post-call write is what the re-entrant
-            // path manipulates.
-            b = b.dimension(Dimension::ValueFlow);
+            // value movement, and the post-call write / stale snapshot is what the
+            // re-entrant path manipulates.
+            let b = b.dimension(Dimension::ValueFlow);
 
             out.push(cx.finish(b, f.id, token_op.span));
         }
@@ -309,6 +414,172 @@ mod tests {
         assert!(
             !fs.iter().any(|f| f.detector == "erc777-reentrancy"),
             "CEI-correct claim (balance settled before the hook transfer) must stay silent: {:?}",
+            fs
+        );
+    }
+
+    // Reserve RToken `redeem` shape (Code4rena M-07). The supply is retired by an
+    // internal `_burn` (no trailing storage write) and the only direct storage
+    // write (`basketsNeeded`) is settled BEFORE the transfer, so the direct-CEI
+    // rule sees nothing. The hazard: each payout is bounded by a live external
+    // `balanceOf(backingManager)` / `totalSupply()` snapshot taken before an
+    // unguarded loop of hook-bearing `safeTransferFrom`s to the redeemer. A token
+    // hook re-enters and the remaining iterations pay against the stale snapshot.
+    const RESERVE_REDEEM: &str = r#"
+        interface IERC20U {
+            function safeTransferFrom(address f, address t, uint256 a) external;
+            function balanceOf(address a) external view returns (uint256);
+        }
+        contract RTokenP1 {
+            uint192 public basketsNeeded;
+            IERC20U backingManager;
+            function totalSupply() public view returns (uint256) { return 1; }
+            function _msgSender() internal view returns (address) { return msg.sender; }
+            function _burn(address a, uint256 x) internal {}
+            function redeem(uint256 amount) external {
+                require(amount > 0, "Cannot redeem zero");
+                address redeemer = _msgSender();
+                uint192 basketsNeeded_ = basketsNeeded;
+                uint256 supply = totalSupply();
+                uint192 baskets = uint192((basketsNeeded_ * amount) / supply);
+                address[] memory erc20s; uint256[] memory amounts;
+                uint256 erc20length = erc20s.length;
+                for (uint256 i = 0; i < erc20length; ++i) {
+                    uint256 bal = backingManager.balanceOf(address(backingManager));
+                    uint256 prorata = (bal * amount) / supply;
+                    if (prorata < amounts[i]) amounts[i] = prorata;
+                }
+                basketsNeeded = basketsNeeded_ - baskets;   // settled BEFORE transfer
+                _burn(redeemer, amount);                    // supply retired (no storage write)
+                for (uint256 i = 0; i < erc20length; ++i) {
+                    if (amounts[i] == 0) continue;
+                    backingManager.safeTransferFrom(address(backingManager), redeemer, amounts[i]);
+                }
+            }
+        }
+    "#;
+
+    // Same `redeem` but with a `nonReentrant` guard: the guard is the safe-out, so
+    // the stale-snapshot fallback must stay silent.
+    const RESERVE_REDEEM_GUARDED: &str = r#"
+        interface IERC20U {
+            function safeTransferFrom(address f, address t, uint256 a) external;
+            function balanceOf(address a) external view returns (uint256);
+        }
+        contract ReentrancyGuard { modifier nonReentrant() { _; } }
+        contract RTokenP1 is ReentrancyGuard {
+            uint192 public basketsNeeded;
+            IERC20U backingManager;
+            function totalSupply() public view returns (uint256) { return 1; }
+            function _msgSender() internal view returns (address) { return msg.sender; }
+            function _burn(address a, uint256 x) internal {}
+            function redeem(uint256 amount) external nonReentrant {
+                address redeemer = _msgSender();
+                uint192 basketsNeeded_ = basketsNeeded;
+                uint256 supply = totalSupply();
+                address[] memory erc20s; uint256[] memory amounts;
+                for (uint256 i = 0; i < erc20s.length; ++i) {
+                    uint256 bal = backingManager.balanceOf(address(backingManager));
+                    if ((bal * amount) / supply < amounts[i]) amounts[i] = (bal * amount) / supply;
+                }
+                basketsNeeded = basketsNeeded_ - 1;
+                _burn(redeemer, amount);
+                for (uint256 i = 0; i < erc20s.length; ++i) {
+                    backingManager.safeTransferFrom(address(backingManager), redeemer, amounts[i]);
+                }
+            }
+        }
+    "#;
+
+    // A hook-bearing transfer in a loop that pays the caller but does NOT read any
+    // external balance/supply before it (no stale solvency snapshot) — e.g. a plain
+    // batch airdrop of fixed per-recipient amounts. The fallback must NOT fire (it
+    // is not the prorata-redeem hazard), and there is no trailing value write, so
+    // the direct-CEI rule is silent too.
+    const LOOP_NO_BALANCE_READ: &str = r#"
+        interface IERC20U { function safeTransfer(address t, uint256 a) external; }
+        contract Airdrop {
+            IERC20U token;
+            uint256[] amounts;
+            function claimAll() external {
+                address to = msg.sender;
+                for (uint256 i = 0; i < amounts.length; ++i) {
+                    token.safeTransfer(to, amounts[i]);
+                }
+            }
+        }
+    "#;
+
+    // HARD recall guard (the missed real bug): the Reserve `redeem` shape must fire.
+    #[test]
+    fn fires_on_reserve_redeem_stale_balance_loop() {
+        let fs = run(RESERVE_REDEEM);
+        assert!(
+            fs.iter().any(|f| f.detector == "erc777-reentrancy"),
+            "Reserve RToken `redeem` (stale balance snapshot before unguarded hook-payout loop) must fire: {:?}",
+            fs
+        );
+    }
+
+    // Precision: the guarded `redeem` must stay silent (the reentrancy guard is the
+    // documented safe-out for this whole detector).
+    #[test]
+    fn silent_on_reserve_redeem_with_guard() {
+        let fs = run(RESERVE_REDEEM_GUARDED);
+        assert!(
+            !fs.iter().any(|f| f.detector == "erc777-reentrancy"),
+            "Guarded redeem must stay silent: {:?}",
+            fs
+        );
+    }
+
+    // Precision: a hook-payout loop with NO pre-transfer external balance/supply
+    // read is not the prorata-redeem hazard and must stay silent.
+    #[test]
+    fn silent_on_hook_loop_without_balance_read() {
+        let fs = run(LOOP_NO_BALANCE_READ);
+        assert!(
+            !fs.iter().any(|f| f.detector == "erc777-reentrancy"),
+            "Hook-payout loop without a stale balance snapshot must stay silent: {:?}",
+            fs
+        );
+    }
+
+    // Precision: the structural twin of `redeem` but access-controlled to a single
+    // trusted caller (`require(_msgSender() == ...)`). The hook recipient is that
+    // trusted contract, not an attacker, so the re-entry is unreachable. Real site:
+    // Reserve `StRSR.seizeRSR` (backingManager-only, transferring the non-hook RSR).
+    const PRIVILEGED_SEIZE: &str = r#"
+        interface IERC20U {
+            function safeTransfer(address t, uint256 a) external;
+            function balanceOf(address a) external view returns (uint256);
+        }
+        contract StRSR {
+            IERC20U rsr;
+            address backingManager;
+            uint256 rsrBacking;
+            uint256[] queue;
+            function _msgSender() internal view returns (address) { return msg.sender; }
+            function seizeRSR(uint256 rsrAmount) external {
+                require(_msgSender() == backingManager, "not backing manager");
+                uint256 rsrBalance = rsr.balanceOf(address(this));
+                uint256 seized;
+                for (uint256 i = 0; i < queue.length; i++) {
+                    uint256 take = (queue[i] * rsrAmount) / rsrBalance;
+                    queue[i] -= take;
+                    seized += take;
+                }
+                rsr.safeTransfer(_msgSender(), seized);
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_privileged_seize_to_trusted_caller() {
+        let fs = run(PRIVILEGED_SEIZE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "erc777-reentrancy"),
+            "Access-controlled seize (trusted-only caller) must stay silent: {:?}",
             fs
         );
     }

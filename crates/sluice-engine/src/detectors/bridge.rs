@@ -102,7 +102,20 @@ impl Detector for BridgeDetector {
             }
 
             // ---- (c) Trusts cross-chain sender for auth without binding the source chain.
-            if uses_cross_chain_sender(&src) && !binds_source_chain(&src) && !has_guardian_sig_set(&src) {
+            // Gate on hard evidence of a real *inbound cross-chain message* first.
+            // `uses_cross_chain_sender` alone matches any `require(msg.sender == ...)`
+            // (every access-controlled function reads `msg.sender`), so on its own it
+            // fires on local ops like a timelock `execute(uint256 id)` whose only
+            // "sender" is the ordinary caller — there is no cross-chain message to
+            // forge. Require either a cross-chain message parameter/field
+            // (`srcChainId`/`sourceChain*`/`origin*`/`payload`/`nonce`+`emitter`) or a
+            // known inbound bridge endpoint signature before treating the sender as a
+            // forgeable cross-chain origin.
+            if has_inbound_crosschain_primitive(f, &src)
+                && uses_cross_chain_sender(&src)
+                && !binds_source_chain(&src)
+                && !has_guardian_sig_set(&src)
+            {
                 let b = FindingBuilder::new(self.id(), Category::BridgeVerification)
                     .title("Cross-chain sender trusted without binding the source chain")
                     .severity(Severity::High)
@@ -228,6 +241,70 @@ fn has_target_allowlist(src: &str) -> bool {
         "allowedselector",
     ];
     ALLOW.iter().any(|k| src.contains(k))
+}
+
+/// Evidence that this handler actually processes an *inbound cross-chain
+/// message* — the precondition for the unbound-source-chain (arm c) bug. Without
+/// it, a cross-chain sender cannot be forged because there is no cross-chain
+/// message in the first place; the "sender" is just the ordinary `msg.sender` of
+/// a local call (e.g. a timelock `execute(uint256 id)`), which arm (c) must not
+/// flag.
+///
+/// Qualifies when EITHER:
+///   * the function is a known inbound bridge endpoint by name
+///     (`lzReceive` / `_nonblockingLzReceive` / `ccipReceive` / `_receiveMessage`
+///     / `receiveWormholeMessages`), OR
+///   * a parameter or a field/local accessed in the body is named like an inbound
+///     cross-chain message component: `srcChainId` / `sourceChain*` / `origin*` /
+///     `payload` / a `nonce` paired with an `emitter`.
+fn has_inbound_crosschain_primitive(f: &Function, src: &str) -> bool {
+    // Known inbound bridge-endpoint signatures (LayerZero / CCIP / Hyperlane /
+    // Wormhole relayer). Substring-matched against the (lowercased) function name.
+    const ENDPOINTS: &[&str] = &[
+        "lzreceive",
+        "_nonblockinglzreceive",
+        "nonblockinglzreceive",
+        "ccipreceive",
+        "_receivemessage",
+        "receivemessage",
+        "receivewormholemessages",
+    ];
+    let fname = f.name.to_ascii_lowercase();
+    if ENDPOINTS.iter().any(|e| fname.contains(e)) {
+        return true;
+    }
+
+    // A parameter named like an inbound cross-chain message component is strong
+    // evidence the handler decodes a real cross-chain message.
+    let param_hit = f.params.iter().any(|p| {
+        p.name
+            .as_deref()
+            .map(|n| name_is_crosschain_component(&n.to_ascii_lowercase()))
+            .unwrap_or(false)
+    });
+    if param_hit {
+        return true;
+    }
+
+    // Otherwise look for the same component names used as fields/locals in the
+    // body (e.g. `message.srcChainId`, `_origin.sender`, `payload`). `src` is the
+    // comment-stripped, lowercased body text.
+    const FIELD_TOKENS: &[&str] = &["srcchainid", "sourcechain", "origin", "payload"];
+    if FIELD_TOKENS.iter().any(|t| src.contains(t)) {
+        return true;
+    }
+    // A `nonce` paired with an `emitter` is the Wormhole-style message identity.
+    src.contains("nonce") && src.contains("emitter")
+}
+
+/// True if a (lowercased) identifier names an inbound cross-chain message
+/// component. Used for parameter names.
+fn name_is_crosschain_component(n: &str) -> bool {
+    n.contains("srcchainid")
+        || n.contains("sourcechain")
+        || n.contains("origin")
+        || n.contains("payload")
+        || n.contains("emitter")
 }
 
 /// Authorization uses a cross-chain sender/origin field.
@@ -369,5 +446,85 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "bridge-verification"));
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: arm (c) must not fire on a *local* timelock executor whose only
+    // "sender" is the ordinary caller. This is the Balancer
+    // `TimelockAuthorizerManagement.execute` FP: a function named `execute` makes
+    // an external call and checks `msg.sender`, but there is NO inbound cross-chain
+    // message (no `srcChainId`/`origin`/`payload`/`nonce`+`emitter` and the
+    // function is not a bridge endpoint). The contract is mislabeled bridge-like
+    // only because it has a `_root`/`_pendingRoot` state var ("root" substring), so
+    // what keeps arm (c) silent is the inbound-cross-chain-primitive gate.
+    const LOCAL_TIMELOCK_EXECUTE: &str = r#"
+        pragma solidity ^0.8.0;
+        interface IExecutionHelper { function execute(address where, bytes memory data) external returns (bytes memory); }
+        contract TimelockAuthorizer {
+            struct ScheduledExecution { address where; bytes data; bool executed; bool protected; uint256 executableAt; }
+            ScheduledExecution[] private _scheduledExecutions;
+            address private _root;
+            address private _pendingRoot;
+            IExecutionHelper private _executionHelper;
+            mapping(uint256 => mapping(address => bool)) private _isExecutor;
+
+            function isExecutor(uint256 id, address account) public view returns (bool) {
+                return _isExecutor[id][account];
+            }
+
+            function execute(uint256 scheduledExecutionId) external returns (bytes memory result) {
+                require(scheduledExecutionId < _scheduledExecutions.length, "EXECUTION_DOES_NOT_EXIST");
+                ScheduledExecution storage scheduledExecution = _scheduledExecutions[scheduledExecutionId];
+                require(!scheduledExecution.executed, "EXECUTION_ALREADY_EXECUTED");
+                require(block.timestamp >= scheduledExecution.executableAt, "EXECUTION_NOT_YET_EXECUTABLE");
+                if (scheduledExecution.protected) {
+                    require(isExecutor(scheduledExecutionId, msg.sender), "SENDER_IS_NOT_EXECUTOR");
+                }
+                scheduledExecution.executed = true;
+                result = _executionHelper.execute(scheduledExecution.where, scheduledExecution.data);
+            }
+        }
+    "#;
+
+    // Positive control: a GENUINE unbound-source-chain handler still fires arm (c).
+    // A LayerZero `lzReceive` endpoint trusts the remote *sender* (`srcAddress`)
+    // for auth but never checks the source chain id (`srcChainId`), so a message
+    // forged on another chain with the same trusted-remote address passes. The
+    // inbound-cross-chain-primitive gate is satisfied here by the `lzReceive`
+    // endpoint name (and the `payload` param), on purpose — this MUST stay a
+    // finding so the FP gate is precise, not a blanket silencer.
+    const UNBOUND_LZ_RECEIVE: &str = r#"
+        pragma solidity ^0.8.0;
+        contract LzApp {
+            bytes public trustedRemote;
+            mapping(bytes32 => bool) public seen;
+            function _credit(address to, uint256 amount) internal {}
+            function lzReceive(bytes calldata srcAddress, bytes calldata payload) external {
+                require(keccak256(srcAddress) == keccak256(trustedRemote), "!remote");
+                (address to, uint256 amount) = abi.decode(payload, (address, uint256));
+                _credit(to, amount);
+            }
+        }
+    "#;
+
+    #[test]
+    fn silent_on_local_timelock_execute() {
+        let fs = run(LOCAL_TIMELOCK_EXECUTE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "bridge-verification"),
+            "a local timelock execute(uint256 id) must not be a cross-chain finding: {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn fires_on_unbound_source_chain_lz_receive() {
+        let fs = run(UNBOUND_LZ_RECEIVE);
+        assert!(
+            fs.iter().any(|f| f.detector == "bridge-verification"),
+            "a genuine lzReceive that trusts the remote sender without binding the source chain \
+             must still fire arm (c): {:?}",
+            fs
+        );
     }
 }

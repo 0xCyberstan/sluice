@@ -764,3 +764,22 @@ verified the combined state):
   RECALL (trigger-tightening of EXISTING detectors — NOT the hard invariant frontier) — `signed-cast` on
   `int8(decimals())`; `cached-domain-separator` on `EIP712Upgradeable`+mutator; `erc777-reentrancy` on `redeem`;
   `internal-share-pricing-rounding` on stake-rate. _done._
+
+### Real-code precision wave 6 — precision residuals + RECALL trigger-tightening (first north-star recall gains)
+2 precision residuals + 3 recall fixes (worktree-isolated, disjoint, each dual-guarded recall+precision):
+- **PRECISION — array-length-mismatch:** recognize validation-HELPER calls (`ensureInputLengthMatch`/
+  `_validateEqualArrayLengths`) into the union-find. Balancer 3→0, Lido 1→0. **bridge-verification** (require a real
+  inbound cross-chain primitive, not a fn named `execute`) + **gas-griefing** (exclude `address(this)` self-calls).
+  Balancer 2→0. (Balancer array+bridge+gas: **5→0**.)
+- **RECALL (north-star track — existing detectors that UNDER-FIRED, now fire on the real bug with 0 new FPs):**
+  - **signed-cast** → fires on `int8(decimals())` unsafe reinterpret (was blocked by immutable-nonneg/negation/
+    unresolvable-type gates). **Reserve M-14 fires** (17 sites).
+  - **cached-domain-separator** → fires on OZ `EIP712Upgradeable` + a post-deploy `setName` that doesn't re-cache
+    (was chainId-only + EIP712-suppressed + concrete-gated). **Reserve M-18 fires** (`StRSRP1.setName`).
+  - **erc777-reentrancy** → fires on the stale-balance-snapshot-in-unguarded-loop payout-to-caller shape (`redeem`'s
+    effect is an internal `_burn` the storage-write gate can't see). **Reserve M-07 fires** (P0+P1 `redeem`);
+    `seizeRSR` suppressed (access-controlled).
+- **Result:** 132 detectors, 0 warnings, gate green. **Reserve in-class recall 1/5 → 4/5** (M-10+M-14+M-18+M-07;
+  only M-02 share-rate left — a PHASE-B invariant/monotonicity target). 6 benchmarks: **no new Crit/High FPs**
+  (Aave/Lido/Morpho/UR/LoopFi 0, Comet 9 defensible). Recall preserved (corpus 20/20+8/8 + all real-hacks); each
+  recall fix verified 0-new-FP across all 6 benchmarks + the broad dogfood corpora. _done._
