@@ -182,6 +182,10 @@ pub enum Category {
     V4CallbackMissingPoolManagerAuth,
     HookReturnDeltaPermissionGap,
     HookPermissionBodyBitmapMismatch,
+    // ---- Round 26: ERC-4337 / EIP-7702 account-abstraction classes ----
+    ValidationPhaseEnvOpcode,
+    ValidationUntrustedCallout,
+    MissingEntryPointGuard,
     Other,
 }
 
@@ -326,6 +330,9 @@ impl Category {
             V4CallbackMissingPoolManagerAuth => "v4-callback-missing-pool-manager-auth",
             HookReturnDeltaPermissionGap => "hook-return-delta-permission-gap",
             HookPermissionBodyBitmapMismatch => "hook-permission-body-bitmap-mismatch",
+            ValidationPhaseEnvOpcode => "validation-phase-env-opcode",
+            ValidationUntrustedCallout => "validation-untrusted-callout",
+            MissingEntryPointGuard => "missing-entrypoint-guard",
             Other => "other",
         }
     }
@@ -452,6 +459,9 @@ impl Category {
             V4CallbackMissingPoolManagerAuth => &["CWE-862", "CWE-284"],
             HookReturnDeltaPermissionGap => &["CWE-682", "CWE-840"],
             HookPermissionBodyBitmapMismatch => &["CWE-684"],
+            ValidationPhaseEnvOpcode => &["CWE-400", "SWC-116"],
+            ValidationUntrustedCallout => &["CWE-829", "CWE-691"],
+            MissingEntryPointGuard => &["CWE-862", "CWE-284"],
             _ => &[],
         }
     }
