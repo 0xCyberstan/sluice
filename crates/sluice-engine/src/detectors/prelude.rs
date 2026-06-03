@@ -305,6 +305,197 @@ pub fn is_require_or_assert(c: &Call) -> bool {
     matches!(c.kind, CallKind::Builtin(Builtin::Require) | CallKind::Builtin(Builtin::Assert))
 }
 
+// =========================================================== ERC-4337 / EIP-7702
+//
+// The account-abstraction (R26) detectors all hinge on one question: "is this
+// function an ERC-4337 validation / postOp entry point?". Sluice has no AA-specific
+// IR, so the recognizer is reconstructed here from the facts the parser already
+// records — the function name, the canonical parameter / return shape, and the
+// owning contract's inheritance — calibrated against the eth-infinitism reference
+// (`BaseAccount.validateUserOp`, `BasePaymaster.validatePaymasterUserOp`/`postOp`,
+// `IAccount`/`IPaymaster`).
+//
+// The three ERC-4337 validation entry points and their lowered shapes (verified
+// against the corpus):
+//
+//   * `validateUserOp(PackedUserOperation, bytes32 userOpHash, uint256
+//     missingAccountFunds) returns (uint256 validationData)` — an *account*.
+//   * `validatePaymasterUserOp(PackedUserOperation, bytes32 userOpHash, uint256
+//     maxCost) returns (bytes context, uint256 validationData)` — a *paymaster*
+//     (note the two-element return tuple).
+//   * `postOp(PostOpMode mode, bytes context, uint256 actualGasCost, uint256
+//     actualUserOpFeePerGas)` — a *paymaster* post-execution hook.
+//
+// `inherits_like` only inspects *direct* bases, so `SimpleAccount` (base
+// `BaseAccount`) resolves `inherits_like("baseaccount")` but a deeper account would
+// not resolve `iaccount`; the name+shape corroboration carries those. The name is
+// near-unique to ERC-4337, but the recognizer still requires at least one
+// corroborator (shape or inheritance) so a coincidentally-named ordinary function
+// cannot trip it.
+
+/// The three ERC-4337 validation / post-execution entry-point names (exact, the
+/// case used in the ERCs). Matched case-insensitively at the call site.
+pub const AA_VALIDATION_FN_NAMES: [&str; 3] =
+    ["validateuserop", "validatepaymasteruserop", "postop"];
+
+/// The base/interface names that mark a contract as an ERC-4337 account or
+/// paymaster (matched as a case-insensitive substring of a *direct* base).
+pub const AA_BASE_NAMES: [&str; 4] = ["baseaccount", "basepaymaster", "iaccount", "ipaymaster"];
+
+/// Is `f` an ERC-4337 validation / `postOp` entry point?
+///
+/// True when the function name is one of [`AA_VALIDATION_FN_NAMES`] **and** at
+/// least one corroborator holds:
+///   * the canonical parameter / return *shape* for that name
+///     ([`has_aa_validation_shape`]), or
+///   * the owning contract inherits an AA base/interface
+///     ([`AA_BASE_NAMES`] via `Contract::inherits_like`).
+///
+/// This recognizes the real `BaseAccount.validateUserOp`,
+/// `BasePaymaster.validatePaymasterUserOp` and `BasePaymaster.postOp` (and their
+/// `IAccount`/`IPaymaster` declarations and `SimpleAccount`-style overrides) while
+/// staying silent on an ordinary function that merely shares a name. For the
+/// "function transitively reached from a validation entry" notion the detectors
+/// use [`reachable_from_aa_validation`].
+pub fn is_aa_validation_fn(cx: &AnalysisContext, f: &Function) -> bool {
+    let nl = f.name.to_ascii_lowercase();
+    if !AA_VALIDATION_FN_NAMES.contains(&nl.as_str()) {
+        return false;
+    }
+    has_aa_validation_shape(f) || contract_inherits_aa(cx, f)
+}
+
+/// Does the owning contract of `f` inherit (by direct base name) an ERC-4337
+/// account/paymaster base or interface?
+pub fn contract_inherits_aa(cx: &AnalysisContext, f: &Function) -> bool {
+    cx.contract_of(f.id)
+        .is_some_and(|c| AA_BASE_NAMES.iter().any(|b| c.inherits_like(b)))
+}
+
+/// Does `f` have the canonical ERC-4337 parameter / return shape for one of the
+/// three entry points? Name-agnostic (the name is checked by the caller); this is
+/// the structural corroborator.
+///
+///   * **account** `validateUserOp`: a `bytes32` "userOpHash"-like param **and** a
+///     "missingAccountFunds"-like param (or a single `uint256` return — the
+///     `validationData` word), i.e. the `(_, bytes32, uint256) -> uint256` shape.
+///   * **paymaster** `validatePaymasterUserOp`: a `bytes32` param **and** the
+///     two-element `(bytes, uint256)` return tuple.
+///   * **paymaster** `postOp`: a first parameter whose type is `PostOpMode`.
+pub fn has_aa_validation_shape(f: &Function) -> bool {
+    aa_account_validate_shape(f) || aa_paymaster_validate_shape(f) || aa_postop_shape(f)
+}
+
+/// `validateUserOp` account shape: a `bytes32` hash param plus either a
+/// `missingAccountFunds`-named param or a sole `uint256` `validationData` return.
+fn aa_account_validate_shape(f: &Function) -> bool {
+    let has_hash_param = f.params.iter().any(param_is_userophash);
+    if !has_hash_param {
+        return false;
+    }
+    let has_missing_funds = f.params.iter().any(|p| {
+        param_name_contains(p, "missing") || param_name_contains(p, "accountfunds")
+    });
+    let returns_validation_word =
+        f.returns.len() == 1 && ty_is_uintish(&f.returns[0].ty);
+    has_missing_funds || returns_validation_word
+}
+
+/// `validatePaymasterUserOp` shape: a `bytes32` hash param plus the two-element
+/// `(bytes context, uint256 validationData)` return tuple.
+fn aa_paymaster_validate_shape(f: &Function) -> bool {
+    let has_hash_param = f.params.iter().any(param_is_userophash);
+    has_hash_param && returns_context_and_validation(f)
+}
+
+/// `postOp` shape: the first parameter's type is the `PostOpMode` enum.
+fn aa_postop_shape(f: &Function) -> bool {
+    f.params
+        .first()
+        .is_some_and(|p| ty_base(&p.ty).eq_ignore_ascii_case("postopmode"))
+}
+
+/// True for the paymaster validation return tuple `(bytes [memory], uint256)`.
+fn returns_context_and_validation(f: &Function) -> bool {
+    f.returns.len() == 2
+        && ty_base(&f.returns[0].ty).eq_ignore_ascii_case("bytes")
+        && ty_is_uintish(&f.returns[1].ty)
+}
+
+/// Is parameter `p` the `bytes32` user-operation hash? The canonical signatures
+/// pass `userOpHash` as the lone `bytes32`, so a `bytes32` parameter is the
+/// structural marker (the name `userOpHash`, when present, only corroborates).
+fn param_is_userophash(p: &sluice_ir::Param) -> bool {
+    ty_base(&p.ty) == "bytes32"
+}
+
+/// Does parameter `p` have a (lower-cased) name containing `needle`?
+fn param_name_contains(p: &sluice_ir::Param, needle: &str) -> bool {
+    p.name
+        .as_deref()
+        .is_some_and(|n| n.to_ascii_lowercase().contains(needle))
+}
+
+/// The base of a textual type, stripping a storage-location suffix the parser may
+/// keep (`"bytes memory"` -> `"bytes"`, `"PackedUserOperation calldata"` ->
+/// `"PackedUserOperation"`) and any array/`[]` tail.
+fn ty_base(ty: &str) -> &str {
+    let t = ty.trim();
+    let t = t
+        .split_whitespace()
+        .next()
+        .unwrap_or(t);
+    t.split('[').next().unwrap_or(t)
+}
+
+/// Is `ty` an unsigned-integer word (`uint`, `uint256`, ...)? The `validationData`
+/// return and the `missingAccountFunds`/`maxCost` params are all `uint256`.
+fn ty_is_uintish(ty: &str) -> bool {
+    let t = ty_base(ty);
+    t == "uint" || t == "uint256" || (t.starts_with("uint") && t[4..].parse::<u16>().is_ok())
+}
+
+/// Is `f` an ERC-4337 validation entry point **or** a function transitively
+/// reachable through internal calls from one (its `_validateSignature` /
+/// `_validateNonce` / `_validatePaymasterUserOp` / `_payPrefund` / `_postOp`
+/// helpers, recursively)? The ERC-7562 validation-scope rules (R26-1, R26-3) apply
+/// to the whole validation *call tree*, not just the named entry, so the env-opcode
+/// and untrusted-callout detectors use this wider predicate.
+///
+/// Reachability walks the resolved internal call graph (`Function::callees`),
+/// seeded by every [`is_aa_validation_fn`] entry, bounded by the function set
+/// (cycle-safe via a visited set).
+pub fn reachable_from_aa_validation(cx: &AnalysisContext, f: &Function) -> bool {
+    if is_aa_validation_fn(cx, f) {
+        return true;
+    }
+    // BFS the *reverse* of: collect every validation entry, expand its callees,
+    // and check membership of `f`. Equivalent to "does any validation entry reach
+    // `f`". We expand from the entries (usually a tiny set) so the walk is cheap.
+    use std::collections::HashSet;
+    let mut seen: HashSet<FunctionId> = HashSet::new();
+    let mut stack: Vec<FunctionId> = Vec::new();
+    for g in cx.functions() {
+        if is_aa_validation_fn(cx, g) {
+            stack.push(g.id);
+            seen.insert(g.id);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        if id == f.id {
+            return true;
+        }
+        if let Some(g) = cx.scir.function(id) {
+            for &c in &g.callees {
+                if seen.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    false
+}
+
 // ===================================================================== reporting
 
 /// Finalize a [`sluice_findings::FindingBuilder`] at a function + span — the
@@ -1016,5 +1207,201 @@ mod tests {
         assert_eq!(via_macro.message, manual.message);
         assert_eq!(via_macro.recommendation, manual.recommendation);
         assert_eq!(via_macro.references, manual.references);
+    }
+
+    // =============================================== ERC-4337 recognizer tests
+    //
+    // The `is_aa_validation_fn` recognizer is the load-bearing prerequisite for the
+    // R26 detectors, so it is unit-tested both on the real eth-infinitism reference
+    // contracts (when the corpus is present) and on self-contained synthetic shapes
+    // (always). It MUST recognize the genuine validation entries and stay silent on
+    // ordinary functions that merely share a name.
+
+    use sluice_dataflow::DataflowFacts;
+    use sluice_frontier::FrontierFacts;
+    use sluice_invariant::InvariantFacts;
+
+    /// Bundle owning the SCIR + the three fact tables so an `AnalysisContext` can
+    /// borrow from it across a test (the context borrows all four).
+    struct Harness {
+        scir: sluice_ir::Scir,
+        dataflow: DataflowFacts,
+        invariants: InvariantFacts,
+        frontier: FrontierFacts,
+        config: Config,
+    }
+    impl Harness {
+        fn from_sources(sources: Vec<(String, String)>) -> Self {
+            let scir = sluice_parse::parse_sources(sources).scir;
+            let dataflow = DataflowFacts::analyze(&scir);
+            let invariants = InvariantFacts::mine(&scir);
+            let frontier = FrontierFacts::analyze(&scir);
+            Self { scir, dataflow, invariants, frontier, config: Config::default() }
+        }
+        fn cx(&self) -> AnalysisContext<'_> {
+            AnalysisContext::new(&self.scir, &self.dataflow, &self.invariants, &self.frontier, &self.config)
+        }
+    }
+
+    /// Read a corpus file if the AA reference checkout is present; `None` skips the
+    /// corpus-dependent assertions on a machine without it (the synthetic tests
+    /// still cover the recognizer).
+    fn corpus_sources() -> Option<Vec<(String, String)>> {
+        let root = "/home/stan/Data/corpus/account-abstraction/contracts";
+        let paths = [
+            format!("{root}/core/BaseAccount.sol"),
+            format!("{root}/core/BasePaymaster.sol"),
+            format!("{root}/interfaces/IAccount.sol"),
+            format!("{root}/interfaces/IPaymaster.sol"),
+            format!("{root}/accounts/SimpleAccount.sol"),
+        ];
+        let mut out = Vec::new();
+        for p in &paths {
+            out.push((p.clone(), std::fs::read_to_string(p).ok()?));
+        }
+        Some(out)
+    }
+
+    fn find_fn<'a>(cx: &'a AnalysisContext, contract: &str, name: &str) -> Option<&'a Function> {
+        cx.functions().find(|f| {
+            f.name == name
+                && cx.contract_of(f.id).map(|c| c.name.as_str()) == Some(contract)
+        })
+    }
+
+    #[test]
+    fn recognizer_on_real_corpus() {
+        let Some(sources) = corpus_sources() else {
+            eprintln!("AA corpus absent — skipping corpus recognizer assertions");
+            return;
+        };
+        let h = Harness::from_sources(sources);
+        let cx = h.cx();
+
+        // MUST recognize the three real validation entries (concrete bodies).
+        let ba = find_fn(&cx, "BaseAccount", "validateUserOp").expect("BaseAccount.validateUserOp");
+        assert!(is_aa_validation_fn(&cx, ba), "BaseAccount.validateUserOp not recognized");
+
+        let bp_v = find_fn(&cx, "BasePaymaster", "validatePaymasterUserOp")
+            .expect("BasePaymaster.validatePaymasterUserOp");
+        assert!(is_aa_validation_fn(&cx, bp_v), "BasePaymaster.validatePaymasterUserOp not recognized");
+
+        let bp_post = find_fn(&cx, "BasePaymaster", "postOp").expect("BasePaymaster.postOp");
+        assert!(is_aa_validation_fn(&cx, bp_post), "BasePaymaster.postOp not recognized");
+
+        // The interface declarations are recognized too (shape carries them).
+        let ia = find_fn(&cx, "IAccount", "validateUserOp").expect("IAccount.validateUserOp");
+        assert!(is_aa_validation_fn(&cx, ia), "IAccount.validateUserOp not recognized");
+        let ip = find_fn(&cx, "IPaymaster", "validatePaymasterUserOp")
+            .expect("IPaymaster.validatePaymasterUserOp");
+        assert!(is_aa_validation_fn(&cx, ip), "IPaymaster.validatePaymasterUserOp not recognized");
+
+        // Must NOT misfire on ordinary helpers in the same files.
+        for (contract, name) in [
+            ("BaseAccount", "execute"),
+            ("BaseAccount", "getNonce"),
+            ("BaseAccount", "entryPoint"),
+            ("BaseAccount", "_requireFromEntryPoint"),
+            ("BasePaymaster", "deposit"),
+            ("BasePaymaster", "withdrawTo"),
+            ("SimpleAccount", "_validateSignature"),
+        ] {
+            if let Some(f) = find_fn(&cx, contract, name) {
+                assert!(!is_aa_validation_fn(&cx, f), "false positive on {contract}.{name}");
+            }
+        }
+
+        // `BaseAccount._payPrefund` is reached from `BaseAccount.validateUserOp`
+        // (a same-contract internal call the call graph resolves). This is the
+        // drain helper R26-4 escalates on, and confirms `reachable_from_aa_validation`
+        // walks the validation call tree. (Cross-contract *virtual override*
+        // resolution — `SimpleAccount._validateSignature` overriding the abstract
+        // `BaseAccount._validateSignature` — is not modeled by the static call
+        // graph; the detectors that need the wider tree therefore rely on the
+        // same-contract resolution exercised here.)
+        if let Some(pp) = find_fn(&cx, "BaseAccount", "_payPrefund") {
+            assert!(
+                reachable_from_aa_validation(&cx, pp),
+                "BaseAccount._payPrefund should be reachable from validateUserOp"
+            );
+        }
+        // And an unrelated helper is NOT reachable.
+        if let Some(dep) = find_fn(&cx, "BasePaymaster", "deposit") {
+            assert!(
+                !reachable_from_aa_validation(&cx, dep),
+                "BasePaymaster.deposit must not be reachable from a validation fn"
+            );
+        }
+    }
+
+    // Synthetic positives — each carries the canonical shape so the recognizer
+    // fires even without inheritance information.
+    const SYN_ACCOUNT: &str = r#"
+        struct PackedUserOperation { uint256 nonce; bytes signature; }
+        contract MyAccount {
+            function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, uint256 missingAccountFunds)
+                external returns (uint256 validationData) { return 0; }
+        }
+    "#;
+    const SYN_PAYMASTER: &str = r#"
+        struct PackedUserOperation { uint256 nonce; bytes signature; }
+        contract MyPaymaster {
+            function validatePaymasterUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, uint256 maxCost)
+                external returns (bytes memory context, uint256 validationData) { return ("", 0); }
+            enum PostOpMode { opSucceeded, opReverted, postOpReverted }
+            function postOp(PostOpMode mode, bytes calldata context, uint256 actualGasCost, uint256 actualUserOpFeePerGas)
+                external {}
+        }
+    "#;
+    // Inheritance-only: a `validateUserOp` whose param names are stripped but whose
+    // contract inherits `BaseAccount` — the inheritance corroborator must carry it.
+    const SYN_INHERIT: &str = r#"
+        abstract contract BaseAccount {}
+        contract Acct is BaseAccount {
+            function validateUserOp(bytes32, uint256) external returns (uint256) { return 0; }
+        }
+    "#;
+
+    #[test]
+    fn recognizer_fires_on_synthetic_shapes() {
+        let h = Harness::from_sources(vec![("a.sol".into(), SYN_ACCOUNT.into())]);
+        let cx = h.cx();
+        let f = find_fn(&cx, "MyAccount", "validateUserOp").unwrap();
+        assert!(is_aa_validation_fn(&cx, f));
+
+        let h = Harness::from_sources(vec![("p.sol".into(), SYN_PAYMASTER.into())]);
+        let cx = h.cx();
+        assert!(is_aa_validation_fn(&cx, find_fn(&cx, "MyPaymaster", "validatePaymasterUserOp").unwrap()));
+        assert!(is_aa_validation_fn(&cx, find_fn(&cx, "MyPaymaster", "postOp").unwrap()));
+
+        let h = Harness::from_sources(vec![("i.sol".into(), SYN_INHERIT.into())]);
+        let cx = h.cx();
+        assert!(is_aa_validation_fn(&cx, find_fn(&cx, "Acct", "validateUserOp").unwrap()));
+    }
+
+    // Synthetic negatives — share a name but lack both shape and inheritance, or
+    // are plain functions. None may be recognized.
+    const SYN_NEG: &str = r#"
+        contract NotAA {
+            // `postOp` with the wrong first-arg type and no PostOpMode enum.
+            function postOp(uint256 x, uint256 y) external returns (uint256) { return x + y; }
+            // a `validateUserOp` name with a totally unrelated shape (no bytes32 hash,
+            // no missingAccountFunds, multi-word return) and no AA base.
+            function validateUserOp(address user, uint256 amount) external returns (bool ok, uint256 z) { return (true, amount); }
+            // ordinary functions.
+            function transfer(address to, uint256 a) external returns (bool) { return true; }
+            function postOpHook(uint256 a) external {}
+        }
+    "#;
+
+    #[test]
+    fn recognizer_silent_on_lookalikes() {
+        let h = Harness::from_sources(vec![("n.sol".into(), SYN_NEG.into())]);
+        let cx = h.cx();
+        for name in ["postOp", "validateUserOp", "transfer", "postOpHook"] {
+            if let Some(f) = find_fn(&cx, "NotAA", name) {
+                assert!(!is_aa_validation_fn(&cx, f), "false positive on NotAA.{name}");
+            }
+        }
     }
 }

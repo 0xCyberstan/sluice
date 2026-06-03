@@ -90,6 +90,7 @@
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
 use crate::report;
+use rustc_hash::FxHashMap;
 use sluice_findings::{Category, Dimension, Finding, Severity};
 use sluice_ir::Function;
 
@@ -111,6 +112,25 @@ impl Detector for ProofAdmissionOnlyDetector {
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
         let mut out = Vec::new();
 
+        // Program-wide callee index, built ONCE (a single `all_functions()` pass)
+        // and shared by every `expanded_text` call below. `all_funcs` is the
+        // canonical `all_functions()` order; `callee_index` maps a function name to
+        // the positions (in that order) of every body-bearing function with that
+        // name. `expanded_text` then resolves a function's 1-hop internal callees by
+        // name lookup instead of re-scanning all functions per call (the old
+        // O(functions²) hot path). The per-name index lists are in `all_funcs`
+        // order, and `expanded_text` re-sorts a function's matched callees by that
+        // same index before concatenating, so the appended-callee order — and thus
+        // the concatenated text and every `.contains()`-derived finding — is
+        // byte-identical to the original `for callee in all_functions()` scan.
+        let all_funcs: Vec<&Function> = cx.scir.all_functions().collect();
+        let mut callee_index: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+        for (i, f) in all_funcs.iter().enumerate() {
+            if f.has_body {
+                callee_index.entry(f.name.as_str()).or_default().push(i);
+            }
+        }
+
         for c in cx.scir.iter_contracts() {
             if c.is_interface() {
                 continue;
@@ -126,7 +146,8 @@ impl Detector for ProofAdmissionOnlyDetector {
             // bodies), computed once. The credential check and the shared mapping
             // often live in a library function the entry dispatches to, so a
             // body-only scan would miss them.
-            let expanded: Vec<String> = funcs.iter().map(|f| expanded_text(cx, f)).collect();
+            let expanded: Vec<String> =
+                funcs.iter().map(|f| expanded_text(cx, f, &all_funcs, &callee_index)).collect();
 
             // Find an admission function A: credential check + single-prefix lock +
             // admits (reaches a value-update or marks a per-id status active).
@@ -245,20 +266,40 @@ fn is_entry(f: &Function) -> bool {
 /// `validateWithdrawalCredentials`, whose body holds the prefix check and the
 /// `validatorPubkeyHashToDetails` write), so the entry's own body alone is blind to
 /// them.
-fn expanded_text(cx: &AnalysisContext, f: &Function) -> String {
+fn expanded_text(
+    cx: &AnalysisContext,
+    f: &Function,
+    all_funcs: &[&Function],
+    callee_index: &FxHashMap<&str, Vec<usize>>,
+) -> String {
     let mut text = cx.source_text(f.span);
     if f.effects.internal_calls.is_empty() {
         return text;
     }
+    // Resolve `f`'s internal callees by name against the program-wide index instead
+    // of scanning every function. Each call name maps to the `all_funcs` positions
+    // of the body-bearing functions with that name (the index already drops
+    // `!has_body`, matching the old `continue`). Collect every matched position,
+    // then de-dup and sort by index so the callees are appended in `all_funcs`
+    // (i.e. `all_functions()`) order — exactly the order the original scan produced,
+    // even when `f` has several internal-call names (or a repeated name). This keeps
+    // the concatenated text, and so every finding, byte-identical.
+    let mut idxs: Vec<usize> = Vec::new();
+    for n in &f.effects.internal_calls {
+        if let Some(positions) = callee_index.get(n.as_str()) {
+            idxs.extend_from_slice(positions);
+        }
+    }
+    idxs.sort_unstable();
+    idxs.dedup();
     // Avoid pulling in `f` itself (a self-recursive name) twice.
-    for callee in cx.scir.all_functions() {
-        if callee.id == f.id || !callee.has_body {
+    for &i in &idxs {
+        let callee = all_funcs[i];
+        if callee.id == f.id {
             continue;
         }
-        if f.effects.internal_calls.iter().any(|n| n == &callee.name) {
-            text.push(' ');
-            text.push_str(&cx.source_text(callee.span));
-        }
+        text.push(' ');
+        text.push_str(&cx.source_text(callee.span));
     }
     text
 }

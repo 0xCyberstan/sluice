@@ -576,3 +576,28 @@ Hit two roadmap thrusts (speed #2, structure #1) + seeded the third (novel R&D �
   `all_functions()` rescan (~4.35s — the next bottleneck after integer-issues) + `context.rs::source_text`
   returning an owned `String` (clone per call; 71/126 detectors) → return `&str`/`Cow`. Also produced the
   **R26 ERC-4337/EIP-7702 account-abstraction detector backlog** (`docs/R26_AA_BACKLOG.md`, 7 ranked specs). _done._
+
+### Round 26 — 3 ERC-4337 account-abstraction detectors + proof-admission-only perf (worktree agents)
+Opens the **11th surface: account abstraction (ERC-4337)**. Built on a corpus-tuned recognizer.
+- **`is_aa_validation_fn` recognizer** (prelude.rs): name (validateUserOp/validatePaymasterUserOp/postOp) +
+  canonical param/return shape + `inherits_like(baseaccount|basepaymaster|iaccount|ipaymaster)` + BFS over the
+  internal call graph. Corpus sweep: **12/12 genuine AA entry points recognized, 0 misfires** on the hundreds of
+  other functions.
+- **MissingEntryPointGuard (Critical/High)** — a validation/postOp fn missing the `_requireFromEntryPoint` /
+  `msg.sender==entryPoint` guard (`_payPrefund` sends ETH to the direct caller; a forged `postOp` mis-accounts the
+  paymaster deposit). `_payPrefund` callout is a severity escalator, not a standalone trigger (fixed a WETH-withdraw FP).
+- **ValidationPhaseEnvOpcode (High/Info)** — a validation-tree fn reads block-env/tx.origin/balance (ERC-7562
+  OP-011/080) → bundler-DoS / mempool mass-invalidation. High when the env value gates control flow; Info when it
+  only packs validUntil/validAfter into the returned validationData.
+- **ValidationUntrustedCallout (High)** — external/low-level/delegate call to a non-EntryPoint/non-precompile target
+  during validation; escalates when the callee root-resolves to a param.
+- **Validated (R7 discipline; the AA corpus is mostly SAFE reference code):** all 3 **SILENT on the safe baseline**
+  (BaseAccount/BasePaymaster/EntryPoint/SimpleAccount = 0, corpus-guarded test), **FIRE only on the adversarial test
+  accounts** (MaliciousAccount/TestRevertAccount/TestWarmColdAccount = 4 genuine High findings) + on fixtures.
+- **Also (perf): `proof-admission-only` O(n²) → indexed** — a name→functions index built once instead of an
+  `all_functions()` rescan per function; **byte-identical** (full 2800-file all-detector scan: empty diff, identical
+  sha256/size), the detector's own time **~4.4s → ~0** (5.18s→0.79s isolated). Stacks on R25's 50× — the large-corpus
+  scan is now parse-bound.
+- **Result:** +3 → **129 detectors**. 718 engine tests (+16) + corpus 20/20 + 8/8 + 5 real-hack harnesses + 7
+  PoC-template tests, 0 warnings. Also produced the R27 perpetuals/derivatives backlog (`docs/R27_PERPS_BACKLOG.md`,
+  7 ranked specs; build-first #1 FundingIndexSettleOrdering + #3 OICapCheckedBeforeFillCallout). _done._

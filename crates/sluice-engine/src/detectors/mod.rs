@@ -162,6 +162,10 @@ pub mod locked_ether;
 // Round 23 — Uniswap v4 hook permission / delta-accounting classes.
 pub mod hook_return_delta_permission_gap;
 pub mod hook_permission_body_bitmap_mismatch;
+// Round 26 — ERC-4337 / EIP-7702 account-abstraction classes.
+pub mod missing_entrypoint_guard;
+pub mod validation_phase_env_opcode;
+pub mod validation_untrusted_callout;
 
 use crate::detector::Detector;
 
@@ -334,6 +338,10 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         // Round 23 — Uniswap v4 hook permission / delta-accounting classes.
         Box::new(hook_return_delta_permission_gap::HookReturnDeltaPermissionGapDetector),
         Box::new(hook_permission_body_bitmap_mismatch::HookPermissionBodyBitmapMismatchDetector),
+        // Round 26 — ERC-4337 / EIP-7702 account-abstraction classes.
+        Box::new(missing_entrypoint_guard::MissingEntryPointGuardDetector),
+        Box::new(validation_phase_env_opcode::ValidationPhaseEnvOpcodeDetector),
+        Box::new(validation_untrusted_callout::ValidationUntrustedCalloutDetector),
     ]
 }
 
