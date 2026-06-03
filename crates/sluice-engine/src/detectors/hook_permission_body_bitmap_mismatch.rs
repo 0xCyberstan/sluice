@@ -63,14 +63,12 @@ use crate::detector::Detector;
 use crate::report;
 use super::prelude::*;
 use sluice_findings::{Category, Dimension, Finding, Severity};
-use sluice_ir::{Contract, ContractKind, Expr, ExprKind, Function, Lit, Scir, StmtKind};
+use sluice_ir::{Contract, ContractKind, Function, Scir};
 
 pub struct HookPermissionBodyBitmapMismatchDetector;
 
 /// The canonical `getHookPermissions()` accessor every v4 hook declares.
 const PERMISSIONS_ACCESSOR: &str = "getHookPermissions";
-/// The struct type the accessor returns (`Hooks.Permissions` / `Permissions`).
-const PERMISSIONS_TYPE: &str = "Permissions";
 
 /// The 14 `Hooks.Permissions` fields in their **declaration order**
 /// (`v4-core/src/libraries/Hooks.sol:49-64`). The index into this table IS the bit
@@ -324,183 +322,24 @@ fn looks_like_hook(scir: &Scir, c: &Contract) -> bool {
 // ============================================================ DECL: literal parse
 
 /// Parse the `Hooks.Permissions` literal returned by `getHookPermissions()` into a
-/// concrete 14-bit boolean vector. Returns `None` when no `Permissions`
-/// construction is found, or when the construction's bits cannot be statically
-/// resolved to boolean literals (opaque / computed) — both cases suppress the
-/// contract (no fire), which is the detector's precision gate.
+/// concrete 14-bit boolean vector. Returns `None` when no `Permissions` construction
+/// is found, or when any bit cannot be statically resolved to a boolean literal
+/// (opaque / computed) — both cases suppress the contract (no fire), the detector's
+/// precision gate.
 ///
-/// Supports the two real `getHookPermissions` shapes:
-///   * **positional** — `Permissions(b0, b1, …, b13)` (14 positional booleans),
-///     read straight from the IR `Call.args` by index.
-///   * **named** — `Permissions({beforeSwap: true, …})`. The lowering drops the
-///     field labels (it keeps only the value exprs in source order), so the field
-///     names are recovered from the construction's source span text and matched
-///     against [`PERMISSION_FIELDS`]. Fields not present default to `false`
-///     (matching Solidity struct-literal semantics is not required — the canonical
-///     literal always lists all 14 — but a partial literal is still resolvable).
+/// The literal parse itself (both the positional `Permissions(b0, …, b13)` and the
+/// named `Hooks.Permissions({beforeSwap: true, …})` shapes) is the shared
+/// [`parse_hook_permissions`], which yields a per-slot `[Option<bool>; 14]`. This
+/// detector needs a fully-concrete bitmap, so it collapses that to `[bool; 14]`
+/// only when **every** slot resolved; any unresolved (`None`) slot makes the whole
+/// literal opaque and suppresses the contract.
 fn parse_permissions_literal(cx: &AnalysisContext, f: &Function) -> Option<[bool; 14]> {
-    let call = find_permissions_construction(f)?;
-
-    // Positional form: exactly 14 positional boolean-literal args.
-    if call.args.len() == 14 {
-        let mut bits = [false; 14];
-        for (i, a) in call.args.iter().enumerate() {
-            bits[i] = bool_lit(a)?; // any non-literal arg => opaque => suppress.
-        }
-        return Some(bits);
-    }
-
-    // Named form: recover `field: value` pairs from the source text of the
-    // construction span. The IR args are the values in source order; pairing them
-    // positionally with the field names parsed from source keeps value resolution
-    // on the (already-lowered) IR literal rather than re-lexing the value text.
-    let names = parse_named_fields_from_source(cx, f, call)?;
-    if names.is_empty() || names.len() != call.args.len() {
-        return None;
-    }
+    let slots = parse_hook_permissions(cx, f)?;
     let mut bits = [false; 14];
-    for (name, value) in names.iter().zip(call.args.iter()) {
-        // `name` is lowercased by `collect_field_labels`; match the table
-        // case-insensitively.
-        let idx = PERMISSION_FIELDS
-            .iter()
-            .position(|(fld, _)| fld.eq_ignore_ascii_case(name))?;
-        bits[idx] = bool_lit(value)?;
+    for (bit, slot) in bits.iter_mut().zip(slots.iter()) {
+        *bit = (*slot)?; // any unresolved slot => opaque => suppress.
     }
     Some(bits)
-}
-
-/// Find the `Permissions(...)` / `Hooks.Permissions(...)` construction call in the
-/// accessor body (typically the returned expression). Returns the first such call.
-fn find_permissions_construction(f: &Function) -> Option<&sluice_ir::Call> {
-    let mut found: Option<&sluice_ir::Call> = None;
-    for s in &f.body {
-        s.visit_exprs(&mut |e| {
-            if found.is_some() {
-                return;
-            }
-            if let ExprKind::Call(c) = &e.kind {
-                if call_constructs_permissions(c) {
-                    found = Some(c);
-                }
-            }
-        });
-    }
-    found
-}
-
-/// Is `c` a construction of the `Permissions` struct — `Permissions(...)`,
-/// `Hooks.Permissions(...)`, or the cast-shaped `Permissions({...})`? The callee
-/// name (or its trailing member) must be exactly `Permissions`.
-fn call_constructs_permissions(c: &sluice_ir::Call) -> bool {
-    if c.func_name.as_deref() == Some(PERMISSIONS_TYPE) {
-        return true;
-    }
-    // `Hooks.Permissions(...)` — the callee is a member chain ending in
-    // `Permissions`; `receiver` is the `Hooks` library qualifier.
-    callee_trailing_name(&c.callee) == Some(PERMISSIONS_TYPE)
-}
-
-/// The trailing identifier/member of a callee expression: `Permissions` for both
-/// `Permissions` and `Hooks.Permissions`.
-fn callee_trailing_name(e: &Expr) -> Option<&str> {
-    match &e.kind {
-        ExprKind::Ident(n) => Some(n),
-        ExprKind::Member { member, .. } => Some(member),
-        _ => None,
-    }
-}
-
-/// If `e` is a boolean literal, return its value; otherwise `None` (opaque).
-fn bool_lit(e: &Expr) -> Option<bool> {
-    match &e.kind {
-        ExprKind::Lit(Lit::Bool(b)) => Some(*b),
-        _ => None,
-    }
-}
-
-/// Recover the lowercase field-name sequence of a named `Permissions({a: x, b: y})`
-/// construction from its source span text (the lowering discards the labels). Each
-/// `identifier :` immediately inside the struct-literal braces is a field name, in
-/// source order. Returns `None` if the braces or any `name:` cannot be located.
-fn parse_named_fields_from_source(
-    cx: &AnalysisContext,
-    f: &Function,
-    call: &sluice_ir::Call,
-) -> Option<Vec<String>> {
-    // Use the *callee* span if it covers the construction; otherwise the whole
-    // accessor source. We need the brace block, so prefer the widest reliable text:
-    // the accessor body text, then locate the `Permissions` block within it.
-    let text = cx.source_text(f.span);
-    if text.is_empty() {
-        return None;
-    }
-    // Locate the `permissions` keyword (lowercased by `source_text`) that opens the
-    // construction, then the following `{ ... }`.
-    let _ = call; // the call drives the value side; names come from the brace block.
-    let open_kw = text.find("permissions")?;
-    let brace_open = text[open_kw..].find('{')? + open_kw;
-    let brace_close = matching_brace(&text, brace_open)?;
-    let inner = &text[brace_open + 1..brace_close];
-    Some(collect_field_labels(inner))
-}
-
-/// Given the inner text of a `{ ... }` struct literal, collect the field labels:
-/// every `ident :` at brace-depth 0 (so nested braces / ternaries do not leak
-/// inner identifiers). Names are returned lowercased, in source order.
-fn collect_field_labels(inner: &str) -> Vec<String> {
-    let bytes = inner.as_bytes();
-    let mut labels = Vec::new();
-    let mut depth: i32 = 0;
-    let mut i = 0;
-    // Track the start of the current top-level segment so we can extract its
-    // leading `ident` when we hit the `:`.
-    let mut seg_start = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' | b'(' | b'[' => depth += 1,
-            b'}' | b')' | b']' => depth -= 1,
-            b',' if depth == 0 => seg_start = i + 1,
-            b':' if depth == 0 => {
-                // Solidity has no `?:`-free top-level `:` other than the field
-                // label; ternaries live inside value segments (after a label) and
-                // are guarded by depth in practice because we reset `seg_start` on
-                // each comma. Extract the leading identifier of this segment.
-                let seg = &inner[seg_start..i];
-                let name = seg.trim().trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
-                if !name.is_empty() && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-                    labels.push(name.to_ascii_lowercase());
-                }
-                // Advance segment start past this label so a ternary `a ? b : c` in
-                // the value does not register `b` as a second label.
-                seg_start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    labels
-}
-
-/// Index of the `}` matching the `{` at `open` in `text`. `None` if unbalanced.
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth: i32 = 0;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 // ============================================================ IMPL: body analysis
@@ -526,8 +365,8 @@ fn compute_impl_bits(scir: &Scir, hook: &Contract) -> [Option<ImplState>; 14] {
         let Some(cb) = cb else { continue };
         if let Some(f) = resolve_callback(scir, hook, cb) {
             bits[i] = Some(ImplState {
-                implemented: is_real_implementation(f),
-                revert_only: is_revert_only(f),
+                implemented: !is_stub_body(f),
+                revert_only: is_revert_only_body(f),
                 fid: f.id,
                 span: f.span,
             });
@@ -556,149 +395,9 @@ fn resolve_callback<'a>(scir: &'a Scir, hook: &Contract, cb: &str) -> Option<&'a
     None
 }
 
-/// Is `f` a **real** callback implementation (not a stub)? A real body writes
-/// storage, makes any call (external/internal/low-level), or returns a value that
-/// is more than the bare selector / a constant. The `BaseHook` default
-/// (`return X.selector;`), a `revert`-only body, and an empty body are all stubs.
-fn is_real_implementation(f: &Function) -> bool {
-    // Storage writes are an unambiguous side effect.
-    if !f.effects.storage_writes.is_empty() {
-        return true;
-    }
-    // Any call site (external/internal/low-level/transfer) is real work — e.g.
-    // `manager.take(...)`, `currency.settle(...)`, an internal helper.
-    if !f.effects.call_sites.is_empty() || !f.effects.internal_calls.is_empty() {
-        return true;
-    }
-    // A non-trivial return (anything other than a bare selector / constant tuple).
-    if body_has_nonconstant_return(f) {
-        return true;
-    }
-    false
-}
-
-/// True if the body's *only* meaningful statement(s) reduce to a `revert` — the
-/// `BaseTestHooks` `revert HookNotImplemented();` shape — with no storage writes
-/// and no calls. Used to escalate a declared-but-empty finding to a pool brick.
-fn is_revert_only(f: &Function) -> bool {
-    if !f.effects.storage_writes.is_empty() || !f.effects.call_sites.is_empty() {
-        return false;
-    }
-    let mut saw_revert = false;
-    let mut saw_other_effect = false;
-    for s in &f.body {
-        match &s.kind {
-            StmtKind::Revert { .. } => saw_revert = true,
-            // A `require(false)` / `assert(false)` style revert via builtin call is
-            // captured as an Expr(Call Builtin Revert/Require); treat a lone such
-            // statement as a revert too.
-            StmtKind::Expr(e) if expr_is_revert_builtin(e) => saw_revert = true,
-            // Declarations / placeholders / empty are inert; anything else is "real".
-            StmtKind::VarDecl { .. } | StmtKind::Placeholder => {}
-            _ => saw_other_effect = true,
-        }
-    }
-    saw_revert && !saw_other_effect
-}
-
-/// Is `e` a `revert(...)` / `require(false, …)` builtin call?
-fn expr_is_revert_builtin(e: &Expr) -> bool {
-    if let ExprKind::Call(c) = &e.kind {
-        return matches!(
-            c.kind,
-            sluice_ir::CallKind::Builtin(sluice_ir::Builtin::Revert)
-        );
-    }
-    false
-}
-
-/// Does the body contain a `return` whose value is more than a bare selector or a
-/// compile-time constant? `return X.selector;` and `return (X.selector, 0, 0);`
-/// (the canonical no-op hook return) are **not** real implementations; a return
-/// that mentions a parameter, a state read, or a computed expression is.
-fn body_has_nonconstant_return(f: &Function) -> bool {
-    let mut real = false;
-    for s in &f.body {
-        s.visit(&mut |st| {
-            if let StmtKind::Return(Some(e)) = &st.kind {
-                if return_value_is_nontrivial(e) {
-                    real = true;
-                }
-            }
-        });
-    }
-    real
-}
-
-/// A returned expression is "nontrivial" if any of its components is neither a
-/// `*.selector` member, a numeric/bool/address literal, nor a zero-delta sentinel
-/// construction (`toBalanceDelta(0,0)`, `*.wrap(0)`, `*.ZERO_DELTA`). A tuple is
-/// nontrivial iff any element is. This deliberately treats the canonical
-/// `(selector, ZERO_DELTA, 0)` no-op return as trivial (a stub), matching the
-/// `BaseHook`/`BaseTestHooks` baseline.
-fn return_value_is_nontrivial(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::Tuple(items) => items.iter().flatten().any(return_value_is_nontrivial),
-        // `X.selector` — the mandatory selector echo, not real logic.
-        ExprKind::Member { member, .. } if member == "selector" => false,
-        // Literals (incl. the `0` / `0,0` zero-delta args) are trivial.
-        ExprKind::Lit(_) => false,
-        // A zero-delta sentinel call: `toBalanceDelta(0,0)`, `BeforeSwapDelta.wrap(0)`,
-        // `toBeforeSwapDelta(0,0)`. Treat as trivial iff every arg is a literal `0`.
-        ExprKind::Call(c) if is_zero_delta_construction(c) => false,
-        // A type-cast wrapping a trivial inner (`int128(0)`, `uint24(0)`).
-        ExprKind::Call(c) if c.kind == sluice_ir::CallKind::TypeCast => {
-            c.args.iter().any(return_value_is_nontrivial)
-        }
-        // A bare identifier that is a named constant cannot be distinguished here;
-        // be conservative and treat a lone identifier as trivial only if it reads
-        // like a zero/selector sentinel. Anything else (a param, a state read, a
-        // computed call) is nontrivial.
-        ExprKind::Ident(n) => {
-            let l = n.to_ascii_lowercase();
-            !(l.contains("zero") || l == "selector")
-        }
-        // Anything else — arithmetic, a parameter, a state/storage read, a
-        // non-sentinel call — is real returned logic.
-        _ => true,
-    }
-}
-
-/// Is `c` a zero-delta sentinel construction whose every argument is a literal `0`?
-/// (`toBalanceDelta(0,0)`, `toBeforeSwapDelta(0,0)`, `BeforeSwapDelta.wrap(0)`,
-/// `BalanceDeltaLibrary.ZERO_DELTA` surfaces as a member, handled separately.)
-fn is_zero_delta_construction(c: &sluice_ir::Call) -> bool {
-    let name = c
-        .func_name
-        .as_deref()
-        .or_else(|| callee_trailing_name(&c.callee))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let is_delta_ctor = name.contains("delta") && (name.starts_with("to") || name == "wrap")
-        || name == "wrap" && callee_mentions_delta(&c.callee);
-    if !is_delta_ctor {
-        return false;
-    }
-    !c.args.is_empty() && c.args.iter().all(|a| is_int_lit(a, 0))
-}
-
-/// Does the callee chain mention a `*Delta` type (so `.wrap(0)` is a delta wrap)?
-fn callee_mentions_delta(e: &Expr) -> bool {
-    let mut found = false;
-    e.visit(&mut |sub| {
-        if let ExprKind::Ident(n) = &sub.kind {
-            if n.to_ascii_lowercase().contains("delta") {
-                found = true;
-            }
-        }
-        if let ExprKind::Member { member, .. } = &sub.kind {
-            if member.to_ascii_lowercase().contains("delta") {
-                found = true;
-            }
-        }
-    });
-    found
-}
+// The per-callback stub / revert-only / non-constant-return classification used to
+// fill `ImplState` lives in `super::prelude` (`is_stub_body`, `is_revert_only_body`)
+// — shared with the v4 path of `flashloan_callback` and `hook_return_delta_*`.
 
 // ============================================================ inheritance walk
 

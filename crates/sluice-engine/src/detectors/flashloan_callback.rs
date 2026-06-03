@@ -64,8 +64,9 @@
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
+use super::prelude::*;
 use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
-use sluice_ir::{BinOp, CallKind, Expr, ExprKind, Function};
+use sluice_ir::{BinOp, Expr, ExprKind, Function};
 
 pub struct FlashloanCallbackDetector;
 
@@ -375,7 +376,7 @@ fn has_msg_sender_lender_check(cx: &AnalysisContext, f: &Function) -> bool {
             }
             // `msg.sender == address(this)` is not a lender pin (the pool is a
             // distinct contract); don't accept it as the lender check.
-            if is_address_this(unwrap_casts(other)) {
+            if is_address_this(peel_casts(other)) {
                 return;
             }
             // Accept: stored address, immutable, hardcoded address literal, or a
@@ -403,8 +404,8 @@ fn has_initiator_is_this_check(f: &Function, param: &str) -> bool {
             if !matches!(op, BinOp::Eq | BinOp::Ne) {
                 return;
             }
-            let l = unwrap_casts(lhs);
-            let r = unwrap_casts(rhs);
+            let l = peel_casts(lhs);
+            let r = peel_casts(rhs);
             let matches_pair = (is_named_ident(l, param) && is_address_this(r))
                 || (is_named_ident(r, param) && is_address_this(l));
             if matches_pair {
@@ -431,20 +432,6 @@ fn is_address_this(e: &Expr) -> bool {
 /// Bare identifier with the given name.
 fn is_named_ident(e: &Expr, name: &str) -> bool {
     matches!(&e.kind, ExprKind::Ident(n) if n == name)
-}
-
-/// Peel single-argument type casts (`address(...)`, `payable(...)`, `IERC20(...)`)
-/// so the underlying value can be inspected.
-fn unwrap_casts(e: &Expr) -> &Expr {
-    let mut cur = e;
-    loop {
-        match &cur.kind {
-            ExprKind::Call(c) if c.kind == CallKind::TypeCast && c.args.len() == 1 => {
-                cur = &c.args[0];
-            }
-            _ => return cur,
-        }
-    }
 }
 
 #[cfg(test)]

@@ -558,3 +558,21 @@ fully preserved (corpus + all real-hack harnesses green throughout).
   harnesses + 7 PoC-template tests, **0 warnings**; removed a stale dead-code test helper; fixed one PoC-template
   test fixture that had relied on the now-suppressed `^0.8.20`. Net measured noise across the 3 repos: floating-pragma
   −67, centralization −7, array-length −2, upgradeable −4 — all FPs/noise, recall intact. _done._
+
+### Round 25 — OPTIMIZATION round: ~50× scale speedup + extensibility dedup (3 worktree agents)
+Hit two roadmap thrusts (speed #2, structure #1) + seeded the third (novel R&D → R26 backlog).
+- **SPEED — ~50× on a 2800-file corpus (274s → 5.5s), byte-identical (3280 findings unchanged; RSS 513→496MB).**
+  New `SLUICE_PROFILE=1` per-phase/per-detector timing found ONE detector, `integer-issues`, consuming **225s
+  (99.97% of the detector phase)**: `struct_field_widths(cx)` (a full-corpus struct scan) was called once PER
+  FUNCTION → O(functions × total-source-bytes) ≈ 600GB of text scanning. **Hoisted it out of the per-function loop**
+  (loop-invariant → byte-identical). Plus (WF1, parse/IR/runner scope): killed a duplicate per-file source copy
+  (−15MB RSS), `functions_of` borrows instead of clones, + the profiling instrumentation.
+- **STRUCTURE — extensibility dedup (−133 LOC).** Lifted R23's 3 duplicated v4-hook helpers (`parse_hook_permissions`
+  [positional + named forms], `is_stub_body`, `is_provably_nonzero_delta_return`) into `prelude.rs`; refactored the
+  3 v4 detectors to consume them. Byte-identical (v4-core 126-detector scan: 100 findings / 133634 bytes, unchanged).
+- **Result:** 126 detectors. 739 workspace tests + corpus 20/20 + 8/8 + 5 real-hack harnesses + 7 PoC-template tests,
+  0 warnings. **The scale fix makes Sluice usable on large monorepos** (was ~4.5 min, now ~5.5s for 2800 files).
+- Deferred to a dedicated perf round (byte-identical care needed): `proof-admission-only`'s per-function
+  `all_functions()` rescan (~4.35s — the next bottleneck after integer-issues) + `context.rs::source_text`
+  returning an owned `String` (clone per call; 71/126 detectors) → return `&str`/`Cow`. Also produced the
+  **R26 ERC-4337/EIP-7702 account-abstraction detector backlog** (`docs/R26_AA_BACKLOG.md`, 7 ranked specs). _done._

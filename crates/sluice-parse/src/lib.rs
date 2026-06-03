@@ -27,6 +27,27 @@ use sluice_ir::{
 use solang_parser::pt;
 use std::path::Path;
 
+/// Lightweight phase profiling, gated on `SLUICE_PROFILE=1` (stderr only, never
+/// affects output). Mirrors the engine's helper so parse sub-phases are visible.
+fn profiling_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SLUICE_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    })
+}
+
+#[inline]
+fn phase<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if !profiling_enabled() {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let out = f();
+    eprintln!("[profile] {label:<22} {:>8.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    out
+}
+
 /// Result of parsing a set of sources.
 pub struct ParseOutput {
     pub scir: Scir,
@@ -51,22 +72,24 @@ pub fn parse_paths<P: AsRef<Path> + Sync>(paths: &[P]) -> ParseOutput {
     // extension alone; `read_to_string` on it returns "Is a directory (os error
     // 21)". The metadata probe skips any non-file silently (`None`) — neither a
     // source nor a `FileError` — so directory entries never pollute the report.
-    let read: Vec<Result<(String, String), FileError>> = paths
-        .par_iter()
-        .filter_map(|p| {
-            let path = p.as_ref();
-            if !std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
-                return None;
-            }
-            Some(match std::fs::read_to_string(path) {
-                Ok(content) => Ok((path.display().to_string(), content)),
-                Err(e) => Err(FileError {
-                    path: path.display().to_string(),
-                    message: format!("read error: {e}"),
-                }),
+    let read: Vec<Result<(String, String), FileError>> = phase("read-files", || {
+        paths
+            .par_iter()
+            .filter_map(|p| {
+                let path = p.as_ref();
+                if !std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+                    return None;
+                }
+                Some(match std::fs::read_to_string(path) {
+                    Ok(content) => Ok((path.display().to_string(), content)),
+                    Err(e) => Err(FileError {
+                        path: path.display().to_string(),
+                        message: format!("read error: {e}"),
+                    }),
+                })
             })
-        })
-        .collect();
+            .collect()
+    });
 
     let mut sources = Vec::with_capacity(read.len());
     let mut file_errors = Vec::new();
@@ -290,11 +313,10 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     struct FileWork {
         path: String,
         file: SourceFile,
-        content: String,
         parsed: Parsed,
     }
 
-    let work: Vec<FileWork> = sources
+    let work: Vec<FileWork> = phase("parse-files", || sources
         .into_par_iter()
         .enumerate()
         .map(|(idx, (path, content))| {
@@ -324,14 +346,19 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
                     ),
                 }
             };
-            let file = SourceFile::new(path.clone(), content.clone());
-            FileWork { path, file, content, parsed }
+            // `SourceFile` owns the content (needed for reporting). We used to also
+            // keep a *second* owned copy of the same bytes (`content`) to feed the
+            // lowerer / pragma scan; on a large corpus that doubled the resident
+            // source (tens of MB) and cost a full extra copy per file. Instead the
+            // downstream phases borrow the content straight out of `scir.files`
+            // (see `srcs` below) — one copy, same bytes.
+            let file = SourceFile::new(path.clone(), content);
+            FileWork { path, file, parsed }
         })
-        .collect();
+        .collect());
 
     // Fold the per-file results back in input order: identical to the serial loop.
     let mut units: Vec<(u32, pt::SourceUnit)> = Vec::new();
-    let mut srcs: Vec<String> = Vec::with_capacity(work.len());
     for (idx, fw) in work.into_iter().enumerate() {
         let file_no = idx as u32;
         match fw.parsed {
@@ -339,8 +366,12 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
             Parsed::Err(message) => file_errors.push(FileError { path: fw.path, message }),
         }
         scir.files.push(fw.file);
-        srcs.push(fw.content);
     }
+
+    // Borrowed view of each file's source text, indexed by `file_no`. This is the
+    // single source-of-truth copy (the `SourceFile.content` we just stored); the
+    // register/build phases read through it instead of a duplicated `Vec<String>`.
+    let srcs: Vec<&str> = scir.files.iter().map(|f| f.content.as_str()).collect();
 
     // ---- Phase 1: register contracts and collect global name sets. ----
     let mut known_types: FxHashSet<String> = FxHashSet::default();
@@ -356,6 +387,9 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     }
     let mut regs: Vec<Reg> = Vec::new();
     let mut next_cid: u32 = 0;
+    // First `pragma solidity` seen (assigned to `scir` after the borrow of `srcs`
+    // ends, to keep `scir.files` borrowed immutably through phases 1–2).
+    let mut pragma_solidity: Option<String> = None;
 
     for (file_no, unit) in &units {
         for part in &unit.0 {
@@ -397,9 +431,12 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
                     regs.push(Reg { id, file_no: *file_no, def });
                 }
                 pt::SourceUnitPart::PragmaDirective(p) => {
-                    if scir.pragma_solidity.is_none() {
+                    // Collect into a local (not `scir.pragma_solidity` directly) so
+                    // we don't need `&mut scir` while `srcs` borrows `scir.files`.
+                    // Same "first solidity pragma wins" semantics as before.
+                    if pragma_solidity.is_none() {
                         if let Some(text) = pragma_text(p, &srcs) {
-                            scir.pragma_solidity = Some(text);
+                            pragma_solidity = Some(text);
                         }
                     }
                 }
@@ -407,6 +444,7 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
             }
         }
     }
+    scir.pragma_solidity = pragma_solidity;
 
     // ---- Phase 2: build contracts + functions (in parallel). ----
     //
@@ -441,12 +479,12 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
         name_map: FxHashMap<String, FunctionId>,
     }
 
-    let built: Vec<BuiltContract> = regs
+    let built: Vec<BuiltContract> = phase("build-funcs", || regs
         .par_iter()
         .zip(fid_base.par_iter())
         .map(|(reg, &base_fid)| {
             let def = reg.def;
-            let src = &srcs[reg.file_no as usize];
+            let src: &str = srcs[reg.file_no as usize];
             let cname = def.name.as_ref().map(|i| i.name.clone()).unwrap_or_default();
 
             // Full (inherited) state-var name set for this contract.
@@ -509,7 +547,7 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
             };
             BuiltContract { contract, funcs, name_map }
         })
-        .collect();
+        .collect());
 
     // Fold the per-contract results back in `regs` order — identical to serial.
     let mut contract_fn_names: FxHashMap<ContractId, FxHashMap<String, FunctionId>> = FxHashMap::default();
@@ -526,7 +564,7 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     }
 
     // ---- Phase 3: resolve internal call edges (best-effort). ----
-    resolve_callees(&mut scir, &contract_fn_names, &base_names);
+    phase("resolve-callees", || resolve_callees(&mut scir, &contract_fn_names, &base_names));
 
     ParseOutput { scir, file_errors }
 }
@@ -849,7 +887,7 @@ fn span_of(loc: pt::Loc, file_no: u32) -> Span {
     }
 }
 
-fn pragma_text(p: &pt::PragmaDirective, srcs: &[String]) -> Option<String> {
+fn pragma_text(p: &pt::PragmaDirective, srcs: &[&str]) -> Option<String> {
     let (loc, is_solidity) = match p {
         pt::PragmaDirective::Version(loc, id, _) => (*loc, id.name == "solidity"),
         pt::PragmaDirective::Identifier(loc, id, _) => {

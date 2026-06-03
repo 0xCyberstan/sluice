@@ -110,9 +110,16 @@ impl Scir {
     }
 
     /// All functions defined in a contract.
+    ///
+    /// Borrows the contract's function-id list rather than cloning it: this is on
+    /// a hot path (detectors call it per-contract, sometimes nested), so the old
+    /// per-call `Vec<FunctionId>` clone showed up under load. Yields the exact
+    /// same functions in the exact same order, so output is unchanged.
     pub fn functions_of(&self, cid: ContractId) -> impl Iterator<Item = &Function> {
-        let ids = self.contracts.get(&cid).map(|c| c.functions.clone()).unwrap_or_default();
-        ids.into_iter().filter_map(move |fid| self.functions.get(&fid))
+        // Empty static fallback when the contract id is unknown — no allocation.
+        const NONE: &[FunctionId] = &[];
+        let ids: &[FunctionId] = self.contracts.get(&cid).map(|c| c.functions.as_slice()).unwrap_or(NONE);
+        ids.iter().filter_map(move |fid| self.functions.get(fid))
     }
 
     /// Every function across all contracts.

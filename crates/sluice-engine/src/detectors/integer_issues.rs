@@ -31,6 +31,12 @@ impl Detector for IntegerIssuesDetector {
 
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
         let mut out = Vec::new();
+        // Hoisted out of the per-function loop: `struct_field_widths` depends only on
+        // `cx` (it scans every parsed struct in the corpus), so calling it once instead
+        // of once-per-function turns an O(functions × total-source-bytes) full-corpus
+        // rescan (~225s on a 2800-file repo — the dominant cost of the whole analysis)
+        // into a single pass. Loop-invariant, so findings are byte-identical.
+        let fields = struct_field_widths(cx);
 
         for f in cx.functions() {
             if !f.has_body {
@@ -128,7 +134,6 @@ impl Detector for IntegerIssuesDetector {
                 // structs (widest == sound upper bound when a field name is reused
                 // with different widths in different structs). Lets a cast operand
                 // `request.amountOfEEth` (a `uint96` struct field) be proven safe.
-                let fields = struct_field_widths(cx);
                 let widths = value_widths(cx, f, &fields);
 
                 // DEDUPE: collapse repeated same-width downcasts inside one function

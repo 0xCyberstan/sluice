@@ -60,7 +60,10 @@
 
 use crate::context::AnalysisContext;
 use sluice_findings::Finding;
-use sluice_ir::{Builtin, Call, CallKind, Contract, Expr, ExprKind, Function, FunctionId, Lit, Span};
+use sluice_ir::{
+    Builtin, Call, CallKind, Contract, Expr, ExprKind, Function, FunctionId, Lit, Span, StmtKind,
+    ValueSource,
+};
 
 // Re-export the existing name-classifier / query helpers so a detector needs only
 // `use super::prelude::*;` rather than reaching into `super::` for some and
@@ -370,6 +373,446 @@ pub fn __finding_builder(
     category: sluice_findings::Category,
 ) -> sluice_findings::FindingBuilder {
     sluice_findings::FindingBuilder::new(id, category)
+}
+
+// =========================================================== Uniswap v4 hooks
+//
+// The v4 hook detectors (`hook_return_delta_permission_gap`,
+// `hook_permission_body_bitmap_mismatch`, and the v4 path of `flashloan_callback`)
+// independently re-derived three primitives:
+//
+//   * a parser for the `getHookPermissions()` `Hooks.Permissions` literal,
+//   * a "is this callback body a stub (`return selector;` / `revert`-only)" test,
+//   * a "does this `return` carry a provably non-zero hook delta" test.
+//
+// They are gathered here so a new v4-hook detector reuses one canonical, tested
+// implementation. Each is a behavior-preserving lift of the form that was already
+// copy-pasted — nothing new is analysed.
+
+/// The 14 `Hooks.Permissions` fields in their **struct-declaration order**
+/// (`v4-core/src/libraries/Hooks.sol:49-64`). The index of a field here is the bit
+/// position used by `validateHookPermissions` and by [`parse_hook_permissions`] for
+/// the parsed permission vector; it is also the positional-construction order.
+pub const HOOK_PERMISSION_FIELDS: [&str; 14] = [
+    "beforeInitialize",
+    "afterInitialize",
+    "beforeAddLiquidity",
+    "afterAddLiquidity",
+    "beforeRemoveLiquidity",
+    "afterRemoveLiquidity",
+    "beforeSwap",
+    "afterSwap",
+    "beforeDonate",
+    "afterDonate",
+    "beforeSwapReturnDelta",
+    "afterSwapReturnDelta",
+    "afterAddLiquidityReturnDelta",
+    "afterRemoveLiquidityReturnDelta",
+];
+
+/// Parse the `Hooks.Permissions` literal returned by a hook's `getHookPermissions()`
+/// body `f` into a `[Option<bool>; 14]` keyed on [`HOOK_PERMISSION_FIELDS`]. Returns
+/// `None` when `f`'s body contains no `Permissions(...)` construction at all — the
+/// precision gate the v4-hook detectors hinge on (no literal ⇒ no signal ⇒ silent).
+/// A slot is `Some(bool)` when that field resolved to a boolean literal and `None`
+/// when it could not (field absent, or a non-literal / computed value); callers
+/// treat `None` conservatively.
+///
+/// Both real `getHookPermissions` shapes are handled:
+///   * **named** — `Permissions({beforeSwap: true, …})` / `Hooks.Permissions({…})`.
+///     The IR lowers the construction to positional value args and drops the field
+///     labels, so the labels are recovered from the construction's source text and
+///     each `field: true|false` pair is read by name (order-independent — Solidity
+///     allows reordering named struct fields).
+///   * **positional** — `Permissions(b0, b1, …, b13)`, read straight from the IR
+///     `Call.args` by index.
+pub fn parse_hook_permissions(cx: &AnalysisContext, f: &Function) -> Option<[Option<bool>; 14]> {
+    let mut found: Option<[Option<bool>; 14]> = None;
+    for s in &f.body {
+        if found.is_some() {
+            break;
+        }
+        s.visit_exprs(&mut |e| {
+            if found.is_some() {
+                return;
+            }
+            let ExprKind::Call(call) = &e.kind else { return };
+            if !call_constructs_permissions(call) {
+                return;
+            }
+            found = Some(parse_permissions_call(cx, e, &call.args));
+        });
+    }
+    found
+}
+
+/// Is `c` a construction of the `Hooks.Permissions` struct — a bare
+/// `Permissions(...)` or a qualified `Hooks.Permissions(...)`? The callee name (or
+/// the trailing member of the callee chain) must be exactly `Permissions`.
+fn call_constructs_permissions(c: &Call) -> bool {
+    if c.func_name.as_deref() == Some("Permissions") {
+        return true;
+    }
+    callee_trailing_name(&c.callee) == Some("Permissions")
+}
+
+/// The trailing identifier/member of a callee expression: `Permissions` for both
+/// `Permissions` and `Hooks.Permissions`.
+fn callee_trailing_name(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some(n),
+        ExprKind::Member { member, .. } => Some(member),
+        _ => None,
+    }
+}
+
+/// Parse one `Permissions(...)` call into the 14-slot vector. The construction's
+/// source text picks the form: a struct-key `:` ⇒ named (recover labels from text,
+/// resolve each field by name); otherwise ⇒ bare positional (the IR args by index).
+fn parse_permissions_call(cx: &AnalysisContext, call_expr: &Expr, args: &[Expr]) -> [Option<bool>; 14] {
+    let text = cx.scir.span_text(call_expr.span);
+    if text.contains(':') {
+        parse_named_permissions(text)
+    } else {
+        parse_positional_permissions(args)
+    }
+}
+
+/// Named-field form: scan the literal source text for `field: true|false` pairs
+/// (robust to arbitrary field ordering). A field whose value is not a literal
+/// `true`/`false` (or is absent) stays `None`.
+fn parse_named_permissions(text: &str) -> [Option<bool>; 14] {
+    let mut out = [None; 14];
+    for (idx, field) in HOOK_PERMISSION_FIELDS.iter().enumerate() {
+        if let Some(val) = permission_field_bool(text, field) {
+            out[idx] = Some(val);
+        }
+    }
+    out
+}
+
+/// Find `field` used as a struct-literal key (`field` followed, modulo whitespace,
+/// by `:`) and return the literal bool that follows, if any. Matches on whole-token
+/// boundaries so `afterSwap` does not match inside `afterSwapReturnDelta`.
+fn permission_field_bool(text: &str, field: &str) -> Option<bool> {
+    let bytes = text.as_bytes();
+    let flen = field.len();
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find(field) {
+        let start = search_from + rel;
+        let end = start + flen;
+        search_from = end;
+
+        // Left boundary: previous non-space char must not be an identifier char, so
+        // `afterSwap` does not match the tail of `XafterSwap`.
+        let left_ok = bytes[..start]
+            .iter()
+            .rev()
+            .find(|b| !b.is_ascii_whitespace())
+            .map(|b| !is_ident_byte(*b))
+            .unwrap_or(true);
+        if !left_ok {
+            continue;
+        }
+
+        // Right boundary: the field name must be followed by `:` (after optional
+        // whitespace) with no further identifier chars in between — so `afterSwap`
+        // followed by `ReturnDelta…` (next char `R`, an identifier byte) is rejected.
+        let mut j = end;
+        if j < bytes.len() && is_ident_byte(bytes[j]) {
+            continue;
+        }
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            continue;
+        }
+        j += 1; // past ':'
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Read the value token.
+        let vstart = j;
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        let val = &text[vstart..j];
+        return match val {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None, // a non-literal (a variable / expression) — unknown
+        };
+    }
+    None
+}
+
+/// Positional form `Permissions(b0, b1, …, b13)`: read each IR arg as a literal bool
+/// by index. A non-literal arg leaves that slot `None`.
+fn parse_positional_permissions(args: &[Expr]) -> [Option<bool>; 14] {
+    let mut out = [None; 14];
+    for (i, slot) in out.iter_mut().enumerate() {
+        if let Some(a) = args.get(i) {
+            if let ExprKind::Lit(Lit::Bool(b)) = &a.kind {
+                *slot = Some(*b);
+            }
+        }
+    }
+    out
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Is `f` a **stub** hook-callback body — i.e. NOT a real implementation? A real
+/// (non-stub) body writes storage, makes any call (external/internal/low-level), or
+/// returns a value that is more than the bare selector / a constant / a zero-delta
+/// sentinel. The `BaseHook`/`BaseTestHooks` defaults — `return X.selector;`,
+/// `revert HookNotImplemented();`, an empty body, or `(selector, ZERO_DELTA, 0)` —
+/// are all stubs. (The complement, "is a real implementation", is simply
+/// `!is_stub_body(f)`.)
+pub fn is_stub_body(f: &Function) -> bool {
+    !is_real_implementation(f)
+}
+
+/// Inverse of [`is_stub_body`]: does `f` have a real (non-stub) callback body?
+fn is_real_implementation(f: &Function) -> bool {
+    // Storage writes are an unambiguous side effect.
+    if !f.effects.storage_writes.is_empty() {
+        return true;
+    }
+    // Any call site (external/internal/low-level/transfer) is real work — e.g.
+    // `manager.take(...)`, `currency.settle(...)`, an internal helper.
+    if !f.effects.call_sites.is_empty() || !f.effects.internal_calls.is_empty() {
+        return true;
+    }
+    // A non-trivial return (anything other than a bare selector / constant tuple).
+    body_has_nonconstant_return(f)
+}
+
+/// Is the body's *only* meaningful effect a `revert` — the `BaseTestHooks`
+/// `revert HookNotImplemented();` shape — with no storage writes and no calls? Used
+/// to escalate a declared-but-empty hook callback to a pool brick.
+pub fn is_revert_only_body(f: &Function) -> bool {
+    if !f.effects.storage_writes.is_empty() || !f.effects.call_sites.is_empty() {
+        return false;
+    }
+    let mut saw_revert = false;
+    let mut saw_other_effect = false;
+    for s in &f.body {
+        match &s.kind {
+            StmtKind::Revert { .. } => saw_revert = true,
+            // A `require(false)` / `revert(...)` builtin call as a lone statement
+            // counts as a revert too.
+            StmtKind::Expr(e) if expr_is_revert_builtin(e) => saw_revert = true,
+            // Declarations / placeholders / empty are inert; anything else is "real".
+            StmtKind::VarDecl { .. } | StmtKind::Placeholder => {}
+            _ => saw_other_effect = true,
+        }
+    }
+    saw_revert && !saw_other_effect
+}
+
+/// Is `e` a `revert(...)` builtin call statement?
+fn expr_is_revert_builtin(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Call(c) if matches!(c.kind, CallKind::Builtin(Builtin::Revert)))
+}
+
+/// Does the body contain a `return` whose value is more than a bare selector or a
+/// compile-time constant? `return X.selector;` and `return (X.selector, 0, 0);` (the
+/// canonical no-op hook return) are not real implementations; a return that mentions
+/// a parameter, a state read, or a computed expression is.
+fn body_has_nonconstant_return(f: &Function) -> bool {
+    let mut real = false;
+    for s in &f.body {
+        s.visit(&mut |st| {
+            if let StmtKind::Return(Some(e)) = &st.kind {
+                if return_value_is_nontrivial(e) {
+                    real = true;
+                }
+            }
+        });
+    }
+    real
+}
+
+/// A returned expression is "nontrivial" if any component is neither a `*.selector`
+/// member, a numeric/bool/address literal, nor a zero-delta sentinel construction
+/// (`toBalanceDelta(0,0)`, `*.wrap(0)`, `*.ZERO_DELTA`). A tuple is nontrivial iff
+/// any element is. The canonical `(selector, ZERO_DELTA, 0)` no-op return is treated
+/// as trivial (a stub), matching the `BaseHook`/`BaseTestHooks` baseline.
+fn return_value_is_nontrivial(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Tuple(items) => items.iter().flatten().any(return_value_is_nontrivial),
+        // `X.selector` — the mandatory selector echo, not real logic.
+        ExprKind::Member { member, .. } if member == "selector" => false,
+        // Literals (incl. the `0` / `0,0` zero-delta args) are trivial.
+        ExprKind::Lit(_) => false,
+        // A zero-delta sentinel call: `toBalanceDelta(0,0)`, `BeforeSwapDelta.wrap(0)`.
+        ExprKind::Call(c) if is_zero_delta_construction(c) => false,
+        // A type-cast wrapping a trivial inner (`int128(0)`, `uint24(0)`).
+        ExprKind::Call(c) if c.kind == CallKind::TypeCast => {
+            c.args.iter().any(return_value_is_nontrivial)
+        }
+        // A lone identifier is trivial only if it reads like a zero/selector
+        // sentinel; anything else (a param, a state read, a computed call) is real.
+        ExprKind::Ident(n) => {
+            let l = n.to_ascii_lowercase();
+            !(l.contains("zero") || l == "selector")
+        }
+        // Anything else — arithmetic, a parameter, a state/storage read, a
+        // non-sentinel call — is real returned logic.
+        _ => true,
+    }
+}
+
+/// Is `c` a zero-delta sentinel construction whose every argument is a literal `0`?
+/// (`toBalanceDelta(0,0)`, `toBeforeSwapDelta(0,0)`, `BeforeSwapDelta.wrap(0)`).
+fn is_zero_delta_construction(c: &Call) -> bool {
+    let name = c
+        .func_name
+        .as_deref()
+        .or_else(|| callee_trailing_name(&c.callee))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_delta_ctor = name.contains("delta") && (name.starts_with("to") || name == "wrap")
+        || name == "wrap" && callee_mentions_delta(&c.callee);
+    if !is_delta_ctor {
+        return false;
+    }
+    !c.args.is_empty() && c.args.iter().all(|a| is_int_lit(a, 0))
+}
+
+/// Does the callee chain mention a `*Delta` type (so `.wrap(0)` is a delta wrap)?
+fn callee_mentions_delta(e: &Expr) -> bool {
+    let mut found = false;
+    e.visit(&mut |sub| {
+        if let ExprKind::Ident(n) = &sub.kind {
+            if n.to_ascii_lowercase().contains("delta") {
+                found = true;
+            }
+        }
+        if let ExprKind::Member { member, .. } = &sub.kind {
+            if member.to_ascii_lowercase().contains("delta") {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// Span of the first `return` in `f` whose tuple element at `delta_idx` is a
+/// provably-non-zero hook delta (per [`is_provably_nonzero_delta_return`]), if any.
+pub fn first_nonzero_delta_return(cx: &AnalysisContext, f: &Function, delta_idx: usize) -> Option<Span> {
+    let mut hit: Option<Span> = None;
+    for s in &f.body {
+        s.visit(&mut |stmt| {
+            if hit.is_some() {
+                return;
+            }
+            if let StmtKind::Return(Some(e)) = &stmt.kind {
+                if let Some(delta) = return_delta_element(e, delta_idx) {
+                    if is_provably_nonzero_delta_return(cx, f, delta) {
+                        hit = Some(delta.span);
+                    }
+                }
+            }
+        });
+        if hit.is_some() {
+            break;
+        }
+    }
+    hit
+}
+
+/// The delta tuple element of a `return` expression: for a tuple `return (a, b, c)`
+/// it is the element at `delta_idx`; for a single-value `return x` it is `x` when
+/// `delta_idx == 0`. `None` if the element is absent.
+fn return_delta_element(ret: &Expr, delta_idx: usize) -> Option<&Expr> {
+    match &ret.kind {
+        ExprKind::Tuple(items) => items.get(delta_idx).and_then(|o| o.as_ref()),
+        _ if delta_idx == 0 => Some(ret),
+        _ => None,
+    }
+}
+
+/// Is `d` a provably non-zero hook delta returned from a delta-bearing callback?
+///
+///   * NOT a zero sentinel: not `*.ZERO_DELTA`, not `to*Delta(0[,0])`, not
+///     `*.wrap(0)`, not a literal `0` (incl. `int128(0)` / `int256(0)`).
+///   * AND positively non-zero by one of: a `to*Delta`/`*.wrap` construction whose
+///     argument is non-literal or a non-zero literal; provenance ∈
+///     {AttackerInput, StorageState}; or a cast-peeled root that is a function
+///     parameter or a state variable of the contract.
+pub fn is_provably_nonzero_delta_return(cx: &AnalysisContext, f: &Function, d: &Expr) -> bool {
+    if is_zero_delta_sentinel(d) {
+        return false;
+    }
+
+    // (a) A delta constructor / `.wrap` with a non-zero / computed argument.
+    if let Some(args) = delta_constructor_args(d) {
+        if args.iter().any(|a| !is_zero_literal(peel_casts(a))) {
+            return true;
+        }
+        // All-zero constructor args ⇒ zero delta.
+        return false;
+    }
+
+    // (b) Provenance-derived: attacker input or storage state flowing into the
+    // returned delta is a real (non-constant) value.
+    let prov = cx.provenance_of(f.id, d);
+    if prov.contains(ValueSource::AttackerInput) || prov.contains(ValueSource::StorageState) {
+        return true;
+    }
+
+    // (c) The delta's (cast-peeled) root is a parameter or a state variable.
+    root_is_param(f, d) || root_is_state_var(cx, f, d)
+}
+
+/// True if `d` is a recognised ZERO-delta sentinel:
+///   * `*.ZERO_DELTA`,
+///   * `to*Delta(0)` / `to*Delta(0, 0)` / `*.wrap(0)` (every arg a literal `0`),
+///   * a literal `0` (including `int128(0)` / `int256(0)` casts of `0`).
+fn is_zero_delta_sentinel(d: &Expr) -> bool {
+    if let ExprKind::Member { member, .. } = &d.kind {
+        if member == "ZERO_DELTA" {
+            return true;
+        }
+    }
+    if is_zero_literal(peel_casts(d)) {
+        return true;
+    }
+    if let Some(args) = delta_constructor_args(d) {
+        if !args.is_empty() && args.iter().all(|a| is_zero_literal(peel_casts(a))) {
+            return true;
+        }
+    }
+    false
+}
+
+/// If `d` is a delta-constructing call — a free function `to*Delta(...)` (e.g.
+/// `toBalanceDelta`, `toBeforeSwapDelta`) or a `Type.wrap(...)` — return its argument
+/// list. `None` if `d` is not such a construction.
+fn delta_constructor_args(d: &Expr) -> Option<&[Expr]> {
+    let ExprKind::Call(call) = &d.kind else { return None };
+    match call.func_name.as_deref() {
+        Some(n) if n.starts_with("to") && n.ends_with("Delta") => Some(&call.args),
+        Some("wrap") => Some(&call.args),
+        _ => None,
+    }
+}
+
+/// True if `e` is a literal integer `0` (decimal `0`, hex `0x0`/`0x00…`).
+fn is_zero_literal(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Lit(Lit::Number(n)) => n.trim().trim_start_matches('-').parse::<u128>() == Ok(0),
+        ExprKind::Lit(Lit::HexNumber(h)) => {
+            let s = h.trim().trim_start_matches("0x").trim_start_matches("0X");
+            !s.is_empty() && s.bytes().all(|b| b == b'0')
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

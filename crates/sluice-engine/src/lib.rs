@@ -27,6 +27,29 @@ pub use sluice_ir::Scir;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
+/// Lightweight per-phase profiling, gated on `SLUICE_PROFILE=1`. Prints
+/// `[profile] <label> <millis>ms` to stderr. Off by default and never touches
+/// the finding set, so it cannot affect determinism.
+fn profiling_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SLUICE_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    })
+}
+
+/// Run `f`, and if profiling is on, print how long `label` took to stderr.
+#[inline]
+fn phase<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if !profiling_enabled() {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let out = f();
+    eprintln!("[profile] {label:<22} {:>8.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    out
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     pub contracts: usize,
@@ -70,9 +93,9 @@ pub fn analyze_paths<P: AsRef<std::path::Path> + Sync>(paths: &[P], cfg: &Config
 
 /// Core: analyze an already-parsed module.
 pub fn analyze_scir(scir: Scir, cfg: &Config) -> EngineResult {
-    let dataflow = DataflowFacts::analyze(&scir);
-    let invariants = InvariantFacts::mine(&scir);
-    let frontier = FrontierFacts::analyze(&scir);
+    let dataflow = phase("dataflow", || DataflowFacts::analyze(&scir));
+    let invariants = phase("invariant", || InvariantFacts::mine(&scir));
+    let frontier = phase("frontier", || FrontierFacts::analyze(&scir));
 
     let stats = Stats {
         contracts: scir.contracts.len(),
@@ -81,15 +104,37 @@ pub fn analyze_scir(scir: Scir, cfg: &Config) -> EngineResult {
     };
 
     let (findings, raw_n, det_n) = {
-        let cx = AnalysisContext::new(&scir, &dataflow, &invariants, &frontier, cfg);
+        let cx = phase("context-build", || {
+            AnalysisContext::new(&scir, &dataflow, &invariants, &frontier, cfg)
+        });
 
         let dets = builtin_detectors();
         let enabled: Vec<&Box<dyn Detector>> =
             dets.iter().filter(|d| cfg.detector_enabled(d.id())).collect();
-        let raw: Vec<Finding> = enabled.par_iter().flat_map(|d| d.run(&cx)).collect();
+        let raw: Vec<Finding> = phase("detectors", || {
+            if profiling_enabled() {
+                // Per-detector timing so a dominant detector is attributable.
+                // Same flat_map result, just timed individually.
+                let mut timed: Vec<(f64, &str, Vec<Finding>)> = enabled
+                    .par_iter()
+                    .map(|d| {
+                        let t = std::time::Instant::now();
+                        let fs = d.run(&cx);
+                        (t.elapsed().as_secs_f64() * 1000.0, d.id(), fs)
+                    })
+                    .collect();
+                timed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                for (ms, id, _) in timed.iter().take(15) {
+                    eprintln!("[profile]   detector {id:<28} {ms:>8.1}ms");
+                }
+                timed.into_iter().flat_map(|(_, _, fs)| fs).collect()
+            } else {
+                enabled.par_iter().flat_map(|d| d.run(&cx)).collect()
+            }
+        });
         let raw_n = raw.len();
         let det_n = enabled.len();
-        (finalize(raw, &cx, cfg), raw_n, det_n)
+        (phase("finalize", || finalize(raw, &cx, cfg)), raw_n, det_n)
     };
 
     EngineResult {
