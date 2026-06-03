@@ -74,6 +74,9 @@ pub enum Category {
     GovernanceTimelock,
     ApproveRace,
     StorageGap,
+    TwapManipulation,
+    FlashloanCallback,
+    PriceBounds,
     Other,
 }
 
@@ -123,6 +126,9 @@ impl Category {
             GovernanceTimelock => "governance-timelock",
             ApproveRace => "approve-race",
             StorageGap => "storage-gap",
+            TwapManipulation => "twap-manipulation",
+            FlashloanCallback => "flashloan-callback",
+            PriceBounds => "price-bounds",
             Other => "other",
         }
     }
@@ -154,6 +160,9 @@ impl Category {
             GovernanceTimelock => &["CWE-284"],
             ApproveRace => &["SWC-114"],
             StorageGap => &["CWE-1108"],
+            TwapManipulation => &["CWE-1339", "CWE-20"],
+            FlashloanCallback => &["CWE-345", "CWE-863"],
+            PriceBounds => &["CWE-20", "CWE-1339"],
             _ => &[],
         }
     }

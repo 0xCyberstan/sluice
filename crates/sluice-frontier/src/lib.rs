@@ -11,6 +11,9 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use sluice_ir::{CallKind, ContractId, Function, FunctionId, GuardKind, Scir, Span};
 
+pub mod xcontract;
+pub use xcontract::ContractResolver;
+
 /// One external-call crossing.
 #[derive(Debug, Clone)]
 pub struct Crossing {
@@ -55,11 +58,14 @@ pub struct ReentrancyRisk {
 pub struct FrontierFacts {
     pub crossings: Vec<Crossing>,
     pub reentrancy: Vec<ReentrancyRisk>,
+    /// Interface/type -> implementation resolver, for cross-contract analysis.
+    pub resolver: ContractResolver,
 }
 
 impl FrontierFacts {
     pub fn analyze(scir: &Scir) -> Self {
         let mut facts = FrontierFacts::default();
+        facts.resolver = ContractResolver::build(scir);
         for c in scir.iter_contracts() {
             let contract_has_lock = c.inherits_like("reentrancyguard") || c.inherits_like("reentrant");
 

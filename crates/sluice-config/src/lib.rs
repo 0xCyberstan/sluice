@@ -119,8 +119,6 @@ fn default_excludes() -> Vec<String> {
         ".s.sol",
         "/proposals/",
         "/proposal/",
-        "/deploy/",
-        "/deployments/",
     ]
     .iter()
     .map(|s| s.to_string())

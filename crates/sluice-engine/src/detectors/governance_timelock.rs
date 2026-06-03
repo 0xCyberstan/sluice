@@ -49,12 +49,13 @@ fn criticality(f: &Function) -> u8 {
 fn is_critical_change(f: &Function) -> bool {
     let l = f.name.to_ascii_lowercase();
 
-    // (1) Upgrade surface. `_authorizeUpgrade` is the UUPS internal hook, so we
-    // intentionally do not require external visibility for the upgrade family.
-    let is_upgrade = matches!(
-        l.as_str(),
-        "upgradeto" | "upgradetoandcall" | "_authorizeupgrade" | "setimplementation"
-    );
+    // (1) Upgrade surface. `_authorizeUpgrade` is excluded: it is the UUPS auth
+    // hook present in essentially every upgradeable contract, and the timelock
+    // for upgrades conventionally lives in the owner/governance contract, not in
+    // this hook — flagging it indiscriminately is pure noise (14/15 FPs observed
+    // on real code). We flag the externally-callable upgrade entry points instead.
+    let is_upgrade = matches!(l.as_str(), "upgradeto" | "upgradetoandcall" | "setimplementation")
+        && f.is_externally_reachable();
     if is_upgrade {
         return true;
     }

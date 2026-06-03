@@ -192,6 +192,14 @@ pub const SPOT_PRICE_FUNCS: &[&str] = &[
     "getPricePerFullShare",
     "get_virtual_price",
     "getVirtualPrice",
+    // generic instantaneous price reads (a Chainlink-style robust feed is
+    // suppressed separately by the oracle detector's `uses_robust_oracle` check)
+    "getPrice",
+    "getCurrentPrice",
+    "currentPrice",
+    "latestPrice",
+    "getSpotPrice",
+    "spotPrice",
 ];
 
 /// Is this call a price read we treat as *manipulable within a transaction*?

@@ -109,8 +109,24 @@ impl SeverityArg {
 }
 
 fn main() {
+    // Parse args on the main thread (so clap's --help/--version exit cleanly),
+    // then run analysis on a worker thread with a large (1 GiB) stack. Solidity
+    // can nest expressions arbitrarily deep, and a recursive-descent parse +
+    // analysis of a pathological/adversarial file would otherwise overflow the
+    // default 8 MiB stack and abort the process — a hostile-input DoS that would
+    // crash CI. The big stack absorbs realistic worst cases gracefully.
     let cli = Cli::parse();
-    let code = match cli.cmd {
+    let code = std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(move || dispatch(cli))
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or(2);
+    std::process::exit(code);
+}
+
+fn dispatch(cli: Cli) -> i32 {
+    match cli.cmd {
         Cmd::Scan(args) => run_scan(args).unwrap_or_else(|e| {
             eprintln!("{} {e:#}", "error:".red().bold());
             2
@@ -133,8 +149,7 @@ fn main() {
                 2
             })
         }
-    };
-    std::process::exit(code);
+    }
 }
 
 fn build_config(args: &ScanArgs) -> Result<Config> {

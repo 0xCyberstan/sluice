@@ -31,6 +31,13 @@ pub mod msg_value_loop;
 pub mod oracle_staleness;
 pub mod rounding;
 pub mod storage_gap;
+// Round 1 (perpetual loop) detectors.
+pub mod delegatecall_loop;
+pub mod flashloan_callback;
+pub mod price_bounds;
+pub mod reward_debt;
+pub mod selfdestruct;
+pub mod twap_manipulation;
 
 use crate::detector::Detector;
 
@@ -66,6 +73,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(approve_race::ApproveRaceDetector),
         Box::new(storage_gap::StorageGapDetector),
         Box::new(rounding::RoundingDetector),
+        // Round 1 (perpetual loop).
+        Box::new(twap_manipulation::TwapManipulationDetector),
+        Box::new(flashloan_callback::FlashloanCallbackDetector),
+        Box::new(selfdestruct::SelfdestructDetector),
+        Box::new(delegatecall_loop::DelegatecallLoopDetector),
+        Box::new(reward_debt::RewardDebtDetector),
+        Box::new(price_bounds::PriceBoundsDetector),
     ]
 }
 

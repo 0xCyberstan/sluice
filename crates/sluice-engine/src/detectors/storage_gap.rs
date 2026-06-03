@@ -29,10 +29,23 @@ impl Detector for StorageGapDetector {
 
     fn run(&self, cx: &AnalysisContext) -> Vec<Finding> {
         let mut out = Vec::new();
+        // A storage gap only protects a contract that other contracts INHERIT
+        // from — appending state to a leaf/final implementation corrupts nothing
+        // downstream. Collect the set of names used as a base anywhere.
+        let inherited: std::collections::HashSet<&str> = cx
+            .scir
+            .iter_contracts()
+            .flat_map(|c| c.bases.iter().map(|b| b.as_str()))
+            .collect();
+
         for c in cx.scir.iter_contracts() {
             // Libraries and interfaces have no instance storage layout, so a gap
             // is meaningless for them.
             if c.is_library() || c.is_interface() {
+                continue;
+            }
+            // Only base contracts (inherited by another contract) need a gap.
+            if !inherited.contains(c.name.as_str()) {
                 continue;
             }
             if !is_upgradeable_like(cx, c) {
@@ -111,9 +124,11 @@ mod tests {
     }
 
     // Upgradeable (Initializable + initialize), mutable state, NO __gap → fires.
+    // `VaultBase` is an upgradeable BASE (inherited by `VaultV1`) that declares
+    // state but reserves no gap — appending state to it would corrupt the child.
     const VULN: &str = r#"
         pragma solidity ^0.8.20;
-        contract Vault is Initializable {
+        contract VaultBase is Initializable {
             address public owner;
             uint256 public totalAssets;
             function initialize(address o) public initializer {
@@ -123,12 +138,15 @@ mod tests {
                 totalAssets += amt;
             }
         }
+        contract VaultV1 is VaultBase {
+            uint256 public extra;
+        }
     "#;
 
-    // Same shape but with the OpenZeppelin storage gap reserved → suppressed.
+    // Same shape but the base reserves the OpenZeppelin storage gap → suppressed.
     const SAFE: &str = r#"
         pragma solidity ^0.8.20;
-        contract Vault is Initializable {
+        contract VaultBase is Initializable {
             address public owner;
             uint256 public totalAssets;
             function initialize(address o) public initializer {
@@ -138,6 +156,9 @@ mod tests {
                 totalAssets += amt;
             }
             uint256[50] private __gap;
+        }
+        contract VaultV1 is VaultBase {
+            uint256 public extra;
         }
     "#;
 

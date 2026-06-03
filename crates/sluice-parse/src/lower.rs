@@ -20,7 +20,16 @@ pub struct Lowerer<'a> {
     /// method is one of these is a `using`-bound internal library call (e.g.
     /// `digest.recover(sig)`, `token.safeTransfer(...)`), not an external call.
     pub known_lib_funcs: &'a FxHashSet<String>,
+    /// Current expression-nesting depth, to bound recursion on pathological /
+    /// adversarial inputs (deeply nested parentheses or chained operators) so a
+    /// single file cannot blow the stack or make analysis super-linear.
+    pub depth: std::cell::Cell<u32>,
 }
+
+/// Maximum expression nesting depth we lower. Real Solidity is rarely >~30 deep;
+/// beyond this we collapse to `Unsupported`, bounding the IR depth (and thus all
+/// downstream passes) on hostile input.
+const MAX_EXPR_DEPTH: u32 = 256;
 
 impl<'a> Lowerer<'a> {
     pub fn span(&self, loc: pt::Loc) -> Span {
@@ -166,6 +175,19 @@ impl<'a> Lowerer<'a> {
     // ---------------------------------------------------------------- expressions
 
     pub fn lower_expr(&self, e: &pt::Expression) -> Expr {
+        // Depth-guard: collapse pathologically deep nesting to `Unsupported` so a
+        // hostile file cannot overflow the stack or make analysis super-linear.
+        let d = self.depth.get();
+        if d >= MAX_EXPR_DEPTH {
+            return Expr::new(self.span(expr_loc(e)), ExprKind::Unsupported);
+        }
+        self.depth.set(d + 1);
+        let out = self.lower_expr_inner(e);
+        self.depth.set(d);
+        out
+    }
+
+    fn lower_expr_inner(&self, e: &pt::Expression) -> Expr {
         use pt::Expression as E;
         let span = self.span(expr_loc(e));
         let kind = match e {

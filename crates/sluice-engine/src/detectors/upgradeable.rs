@@ -104,8 +104,15 @@ impl Detector for UpgradeableDetector {
                 continue;
             }
             let ctor = cx.scir.functions_of(c.id).find(|f| f.is_constructor());
+            // The implementation is locked if the constructor calls
+            // `_disableInitializers()` OR carries the `initializer` modifier
+            // (`constructor() initializer {}` — an equally valid, common idiom).
             let disables = ctor
-                .map(|f| cx.scir.span_text(f.span).contains("_disableInitializers"))
+                .map(|f| {
+                    cx.scir.span_text(f.span).contains("_disableInitializers")
+                        || cx.is_initializer(f)
+                        || f.has_modifier_like("initializer")
+                })
                 .unwrap_or(false);
             if !disables {
                 let span = c.span;

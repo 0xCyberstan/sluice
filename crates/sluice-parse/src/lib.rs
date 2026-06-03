@@ -58,6 +58,33 @@ pub fn parse_paths<P: AsRef<Path>>(paths: &[P]) -> ParseOutput {
     out
 }
 
+/// Maximum bracket-nesting depth a file may contain before we skip it as a
+/// likely DoS input. The parser is super-linear in nesting depth, so this guards
+/// against a hostile file; real Solidity is rarely more than a few dozen deep.
+const MAX_NESTING_DEPTH: usize = 1024;
+
+/// O(bytes) scan for the maximum `()[]{}` nesting depth; returns `Some(depth)` if
+/// it exceeds `limit`, else `None`. (Brackets inside strings/comments are counted
+/// too, but a legitimate file with 1024+ nested brackets does not exist, so the
+/// crude approximation never causes a meaningful false skip.)
+fn excessive_nesting(src: &str, limit: usize) -> Option<usize> {
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    for b in src.bytes() {
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if depth > max {
+                    max = depth;
+                }
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    (max > limit).then_some(max)
+}
+
 /// Parse in-memory `(path, content)` sources into an [`Scir`].
 pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     let mut scir = Scir::new();
@@ -68,6 +95,19 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
     let mut srcs: Vec<String> = Vec::new();
     for (path, content) in sources {
         let file_no = srcs.len() as u32;
+        // Pre-scan: reject pathologically nested input in O(bytes) BEFORE handing
+        // it to the parser. The parser is super-linear in bracket-nesting depth,
+        // so a ~60 KB file of nested parens would otherwise burn seconds of CPU
+        // (a hostile-input DoS). Real Solidity is never this deep.
+        if let Some(depth) = excessive_nesting(&content, MAX_NESTING_DEPTH) {
+            file_errors.push(FileError {
+                path: path.clone(),
+                message: format!("skipped: bracket-nesting depth {depth} exceeds limit {MAX_NESTING_DEPTH} (possible DoS input)"),
+            });
+            scir.files.push(SourceFile::new(path, content.clone()));
+            srcs.push(content);
+            continue;
+        }
         match solang_parser::parse(&content, file_no as usize) {
             Ok((unit, _comments)) => {
                 units.push((file_no, unit));
@@ -173,6 +213,7 @@ pub fn parse_sources(sources: Vec<(String, String)>) -> ParseOutput {
             known_types: &known_types,
             known_libraries: &known_libs,
             known_lib_funcs: &known_lib_funcs,
+            depth: std::cell::Cell::new(0),
         };
 
         // State variables (own).
@@ -609,6 +650,16 @@ mod tests {
         let set_owner = scir.functions_of(c.id).find(|f| f.name == "setOwner").unwrap();
         assert!(set_owner.has_modifier_like("onlyOwner"));
         assert!(set_owner.effects.writes_var("owner"));
+    }
+
+    #[test]
+    fn rejects_pathological_nesting_without_hanging() {
+        // A deeply nested expression must be skipped fast (not crash or hang).
+        let src = format!("contract C {{ function f() public pure returns (uint) {{ return {}1{}; }} }}",
+            "(".repeat(5000), ")".repeat(5000));
+        let out = parse_sources(vec![("bomb.sol".into(), src)]);
+        assert!(out.file_errors.iter().any(|e| e.message.contains("nesting")));
+        assert!(out.scir.contract_named("C").is_none(), "pathological file is skipped");
     }
 
     #[test]
