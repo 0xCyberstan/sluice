@@ -68,6 +68,15 @@ pub mod internal_share_pricing_rounding;
 pub mod pooled_shares_reprice_desync;
 pub mod proportional_split_residual;
 pub mod silenced_privileged_callback;
+pub mod netted_aggregate_desync;
+// Round 8 (perpetual loop) — cross-chain / bridge value-flow classes.
+pub mod crosschain_rate_staleness;
+// Round 9 (perpetual loop) — remaining Renzo-mined novel classes.
+pub mod cooldown_bypass_flag;
+pub mod oracle_first_mint_seeding;
+pub mod proportional_payout_tx_value;
+pub mod snapshot_redeem_asymmetry;
+pub mod unguarded_accounting_mutator;
 
 use crate::detector::Detector;
 
@@ -142,6 +151,7 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(proportional_split_residual::ProportionalSplitResidualDetector),
         Box::new(pooled_shares_reprice_desync::PooledSharesRepriceDesyncDetector),
         Box::new(silenced_privileged_callback::SilencedPrivilegedCallbackDetector),
+        Box::new(netted_aggregate_desync::NettedAggregateDesyncDetector),
         // R8-tuned + re-activated (were R7-quarantined). internal-share-pricing-rounding
         // now matches ONLY a bare `mulDiv` (no Rounding arg) with a pooled-aggregate
         // divisor spanning share+asset operands (kills the 52 FPs); checkpoint-hint-trust
@@ -149,6 +159,15 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         // cert-verifier / observation-buffer FPs) and fires on the real Checkpoints.sol.
         Box::new(internal_share_pricing_rounding::InternalSharePricingRoundingDetector),
         Box::new(checkpoint_hint_trust::CheckpointHintTrustDetector),
+        // Round 8 — cross-chain rate staleness (Renzo xRenzoDeposit class).
+        Box::new(crosschain_rate_staleness::CrossChainRateStalenessDetector),
+        // Round 9 — remaining Renzo-mined novel classes (each self-validated in its
+        // worktree: fires on the cited real Renzo site, ~0 FP on the 5 prior codebases).
+        Box::new(unguarded_accounting_mutator::UnguardedAccountingMutatorDetector),
+        Box::new(snapshot_redeem_asymmetry::SnapshotRedeemAsymmetryDetector),
+        Box::new(cooldown_bypass_flag::CooldownBypassFlagDetector),
+        Box::new(oracle_first_mint_seeding::OracleFirstMintSeedingDetector),
+        Box::new(proportional_payout_tx_value::ProportionalPayoutTxValueDetector),
     ]
 }
 

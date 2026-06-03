@@ -218,6 +218,40 @@ symbiotic-audit/symbiotic-core/src/contracts):
 6. **proportional-payout-tx-value-trust** — push splitter sizing each cut from a re-read `address(this).balance`, swallowing failed legs (order-dependent skew) (Renzo `PaymentSplitter.sol:191`). Inverse of `dos.rs` (failures swallowed, not reverting).
 7. **whitelist-cooldown-bypass-coupled-to-pause** — withdrawal cooldown skipped for whitelisted users UNLESS an unrelated risk/pause flag is set (Renzo `WithdrawQueue.sol:434`). Distinct from governance-timelock (no-timelock); this is timelock-present-but-conditionally-bypassed.
 _(Full agent report with SCIR signatures + FP-suppression per class is in the R8 WF3 task transcript.)_
+
+#### R9 candidate verification (WF3, adversarial/skeptical) — HONEST result
+Triaged the 12 live Symbiotic novel-detector hits + the 2 flagged Renzo sites. **0 of 14 are exploitable bugs** on
+these mature audited protocols: the Symbiotic hits are documented loss-socialization (slash shrinks the asset side;
+claims gated to past epochs), conservative floor-rounding (protocol-favorable, dust), self-correcting hinted lookups
+(binary-search fallback), and deliberately fire-and-forget hooks (DoS resistance). **Renzo B1 (OperatorDelegator
+`emergencyTrackSlashedQueuedWithdrawalDelta` L572): a REAL, confirmed missing-`onlyEmergency*` inconsistency vs its 3
+siblings — but the body is an idempotent recompute over trusted state (can only push TVL to its true value; no profit
+path) → a legitimate hygiene/consistency finding, not fund-loss.** Renzo B2 (WithdrawQueue cooldown bypass): intended
+trusted-partner design, min-clamped pricing, no loss. **Takeaway:** the detectors correctly surface the risky shapes
+(true to thesis) and the verification layer correctly triages them — the surface→triage pipeline works like a good
+auditor; "first confirmed EXPLOITABLE bug" is not yet reached (expected on audited targets). This is why every novel
+detector ships at modest severity/confidence as an auditor-attention signal, not an autonomous verdict.
+
+### Round 9 — 7 Renzo-mined novel detectors (via parallel worktree agents) + adversarial verification
+- **Result:** +7 detectors → **64 active** (13 now genuinely-novel restaking/LST/cross-chain/queue classes). Authored by
+  7 parallel worktree-isolated agents (each built + scanned real Renzo + the 5 prior codebases in its own checkout):
+  unguarded-accounting-mutator, snapshot-redeem-asymmetry, cooldown-bypass-flag, crosschain-rate-staleness,
+  netted-aggregate-desync, oracle-first-mint-seeding, proportional-payout-tx-value. Independent dogfood (authoritative):
+  **all 5 prior codebases unchanged (0 R9 FPs: olympus 92 / eigenlayer 23 / pendle 81 / etherfi 126 / symbiotic 41)**,
+  while **all 7 fire on real Renzo (8 hits)**. 276 tests, 0 warnings, corpus 20/20 + 8/8. The 8 Renzo hits are candidate
+  findings: WF3 verified the two highest-value ones (B1 unguarded-mutator = real-but-benign hygiene; B2 cooldown =
+  design tradeoff); the other 6 are unverified (likely design tradeoffs on this audited protocol, worth human triage).
+  Milestone: the surface→verify pipeline now spans two live protocols with 0 confirmed-exploitable but 1 real hygiene find.
+
+### Round 10 — ROTATE THEME per roadmap: performance/scale + architecture/extensibility
+R7–R9 were all novel-detector rounds; the roadmap says interleave the optimization thrusts. R10 (parallel worktree agents):
+- **WF1 performance/scale:** generate/locate a very large Solidity corpus (10k+ files — concat/replicate or a big monorepo)
+  and benchmark `sluice scan`; profile hot paths; parallelize per-file parse + per-detector execution (rayon); intern
+  strings/spans; add wall-clock + peak-RSS as GATED metrics. Target: stay sub-linear-feeling at 50× today's repos.
+- **WF2 architecture/extensibility:** extract shared SCIR query primitives (the call-target trust map, ordered effect
+  stream, taint/hint queries, name-classifiers) into a `detectors/prelude` + a `detector!{}` authoring macro to kill the
+  per-detector boilerplate (measure "lines/concepts to add a detector" before/after); migrate 3-4 detectors onto it as proof.
+- **WF3:** R11 novel-bug research on a fresh target (karak/morpho) + a full dogfood re-measure of all 64 detectors. _status: pending._
 - **Result:** 50 detectors; corpus 20/20 recall + 8/8 clean; **R4 hacks now 8/8** (TempleDAO caught by the
   new `untrusted-call-target` detector — the R4 MISS, closed). 153 tests, 0 warnings. Delivered:
   - **WF1 cast precision:** integer-issues width-bit suppression (`uintN(address)`/`uintN(bytesM)`/narrower-int

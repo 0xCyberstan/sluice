@@ -100,6 +100,14 @@ pub enum Category {
     PooledSharesRepriceDesync,
     InternalSharePricingRounding,
     SilencedPrivilegedCallback,
+    // ---- Round 9: novel classes mined from Renzo (LST/LRT, cross-chain, queues) ----
+    UnguardedAccountingMutator,
+    CrossChainRateStaleness,
+    SnapshotRedeemAsymmetry,
+    NettedAggregateDesync,
+    OracleFirstMintSeeding,
+    ProportionalPayoutTxValue,
+    CooldownBypassFlag,
     Other,
 }
 
@@ -174,6 +182,13 @@ impl Category {
             PooledSharesRepriceDesync => "pooled-shares-reprice-desync",
             InternalSharePricingRounding => "internal-share-pricing-rounding",
             SilencedPrivilegedCallback => "silenced-privileged-callback",
+            UnguardedAccountingMutator => "unguarded-accounting-mutator",
+            CrossChainRateStaleness => "crosschain-rate-staleness",
+            SnapshotRedeemAsymmetry => "snapshot-redeem-asymmetry",
+            NettedAggregateDesync => "netted-aggregate-desync",
+            OracleFirstMintSeeding => "oracle-first-mint-seeding",
+            ProportionalPayoutTxValue => "proportional-payout-tx-value",
+            CooldownBypassFlag => "cooldown-bypass-flag",
             Other => "other",
         }
     }
@@ -230,6 +245,13 @@ impl Category {
             PooledSharesRepriceDesync => &["CWE-682", "CWE-841"],
             InternalSharePricingRounding => &["CWE-682"],
             SilencedPrivilegedCallback => &["CWE-252", "CWE-754"],
+            UnguardedAccountingMutator => &["CWE-862", "CWE-284"],
+            CrossChainRateStaleness => &["CWE-672", "CWE-345"],
+            SnapshotRedeemAsymmetry => &["CWE-682", "CWE-840"],
+            NettedAggregateDesync => &["CWE-682", "CWE-191"],
+            OracleFirstMintSeeding => &["CWE-1339", "CWE-682"],
+            ProportionalPayoutTxValue => &["CWE-682", "CWE-362"],
+            CooldownBypassFlag => &["CWE-284", "CWE-841"],
             _ => &[],
         }
     }
