@@ -150,6 +150,11 @@ pub enum Category {
     OftDecimalSupplyLeak,
     LzReceiveFailureSilent,
     UnsetPeerDefaultTrust,
+    // ---- Round 17: OP-Stack fault-proof bond / clock / aliasing classes ----
+    RefundCreditPreVerdict,
+    ConditionalSenderAliasing,
+    ClockExtensionDepthBranch,
+    RespectedGameTypeSnapshotSwap,
     Other,
 }
 
@@ -267,6 +272,10 @@ impl Category {
             OftDecimalSupplyLeak => "oft-decimal-supply-leak",
             LzReceiveFailureSilent => "lzreceive-failure-silent",
             UnsetPeerDefaultTrust => "unset-peer-default-trust",
+            RefundCreditPreVerdict => "refund-credit-pre-verdict",
+            ConditionalSenderAliasing => "conditional-sender-aliasing",
+            ClockExtensionDepthBranch => "clock-extension-depth-branch",
+            RespectedGameTypeSnapshotSwap => "respected-gametype-snapshot-swap",
             Other => "other",
         }
     }
@@ -366,6 +375,10 @@ impl Category {
             OftDecimalSupplyLeak => &["CWE-682"],
             LzReceiveFailureSilent => &["CWE-755"],
             UnsetPeerDefaultTrust => &["CWE-909", "CWE-345"],
+            RefundCreditPreVerdict => &["CWE-682", "CWE-840"],
+            ConditionalSenderAliasing => &["CWE-345", "CWE-290"],
+            ClockExtensionDepthBranch => &["CWE-682", "CWE-362"],
+            RespectedGameTypeSnapshotSwap => &["CWE-345", "CWE-672"],
             _ => &[],
         }
     }
