@@ -123,6 +123,14 @@ pub enum Category {
     Eip712TypehashMismatch,
     DelegatedSignerSingleStep,
     PreAuthCalloutTarget,
+    // ---- Round 13: yield-tokenization / AMM-curve classes (Pendle; a 6th domain) ----
+    SyRateJumpTrust,
+    MonotoneClampNegativeYield,
+    PostExpiryDualIndex,
+    CurveLogitDomainEdge,
+    StaleAnchorReset,
+    SolverConvergenceTrust,
+    RatioDenominatorSignEdge,
     Other,
 }
 
@@ -217,6 +225,13 @@ impl Category {
             Eip712TypehashMismatch => "eip712-typehash-mismatch",
             DelegatedSignerSingleStep => "delegated-signer-single-step",
             PreAuthCalloutTarget => "preauth-callout-target",
+            SyRateJumpTrust => "sy-rate-jump-trust",
+            MonotoneClampNegativeYield => "monotone-clamp-negative-yield",
+            PostExpiryDualIndex => "post-expiry-dual-index",
+            CurveLogitDomainEdge => "curve-logit-domain-edge",
+            StaleAnchorReset => "stale-anchor-reset",
+            SolverConvergenceTrust => "solver-convergence-trust",
+            RatioDenominatorSignEdge => "ratio-denominator-sign-edge",
             Other => "other",
         }
     }
@@ -293,6 +308,13 @@ impl Category {
             Eip712TypehashMismatch => &["CWE-347"],
             DelegatedSignerSingleStep => &["CWE-284"],
             PreAuthCalloutTarget => &["CWE-863", "CWE-345"],
+            SyRateJumpTrust => &["CWE-345", "CWE-1339"],
+            MonotoneClampNegativeYield => &["CWE-682", "CWE-840"],
+            PostExpiryDualIndex => &["CWE-682", "CWE-362"],
+            CurveLogitDomainEdge => &["CWE-682", "CWE-1339"],
+            StaleAnchorReset => &["CWE-672", "CWE-1339"],
+            SolverConvergenceTrust => &["CWE-682", "CWE-345"],
+            RatioDenominatorSignEdge => &["CWE-682", "CWE-369"],
             _ => &[],
         }
     }
