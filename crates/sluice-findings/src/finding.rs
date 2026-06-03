@@ -108,6 +108,14 @@ pub enum Category {
     OracleFirstMintSeeding,
     ProportionalPayoutTxValue,
     CooldownBypassFlag,
+    // ---- Round 11: novel classes mined from Karak V2 (map to real Karak/C4 findings) ----
+    SharesEscrowedRepriced,
+    PercentSlashOnLiveBase,
+    HashGatedStructReplay,
+    ClampResidualBurnSink,
+    ProofAdmissionOnly,
+    ExternalRootCallerTimestamp,
+    ZeroMarginTimingWindow,
     Other,
 }
 
@@ -189,6 +197,13 @@ impl Category {
             OracleFirstMintSeeding => "oracle-first-mint-seeding",
             ProportionalPayoutTxValue => "proportional-payout-tx-value",
             CooldownBypassFlag => "cooldown-bypass-flag",
+            SharesEscrowedRepriced => "shares-escrowed-repriced",
+            PercentSlashOnLiveBase => "percent-slash-live-base",
+            HashGatedStructReplay => "hash-gated-replay",
+            ClampResidualBurnSink => "clamp-residual-burn",
+            ProofAdmissionOnly => "proof-admission-only",
+            ExternalRootCallerTimestamp => "external-root-caller-timestamp",
+            ZeroMarginTimingWindow => "zero-margin-timing-window",
             Other => "other",
         }
     }
@@ -252,6 +267,13 @@ impl Category {
             OracleFirstMintSeeding => &["CWE-1339", "CWE-682"],
             ProportionalPayoutTxValue => &["CWE-682", "CWE-362"],
             CooldownBypassFlag => &["CWE-284", "CWE-841"],
+            SharesEscrowedRepriced => &["CWE-682", "CWE-841"],
+            PercentSlashOnLiveBase => &["CWE-682", "CWE-672"],
+            HashGatedStructReplay => &["CWE-294", "CWE-345"],
+            ClampResidualBurnSink => &["CWE-682"],
+            ProofAdmissionOnly => &["CWE-345", "CWE-863"],
+            ExternalRootCallerTimestamp => &["CWE-345", "CWE-672"],
+            ZeroMarginTimingWindow => &["CWE-362", "CWE-367"],
             _ => &[],
         }
     }
