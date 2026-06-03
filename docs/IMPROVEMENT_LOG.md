@@ -350,6 +350,28 @@ R15 picks (broadly matchable on ANY codebase — raise baseline coverage; checke
 5. (lower) cross-protocol read-only-reentrancy — needs the consumer in-corpus (high FP otherwise).
 **PERPS DEFERRED as NEEDS-CORPUS:** no on-disk perps engine (no fundingRate/openInterest/markPrice). Per the R7 lesson,
 do NOT build perp-funding-mark / ADL fixture-only — defer until a GMX-v2 / Synthetix-perps / dYdX-v4 repo is added.
+
+### Round 15 — 4 protocol-agnostic primitive detectors (worktree agents) + validated on the Optimism L2 corpus
+- **Result:** +4 → **94 active**. Authored by 4 worktree agents via the prelude. Independent dogfood:
+  **tstore-guard-misscope fires 4× on the real Optimism EIP-1153 code** (TransientContext / L2ToL2CrossDomainMessenger —
+  its intended target); **0 R15 FPs on all 6 other codebases** (olympus 92 / pendle 107 / etherfi 126 / ethena 31 /
+  symbiotic 41 / eigenlayer 24 — unchanged). gap-not-shrunk / batch-verify-skip / uninitialized-storage-pointer found no
+  real instance in the audited codebases (modern 0.8 code rarely has them) — tight, 0-FP, self-test-validated, correctly
+  dormant. **Bonus: Sluice scanned the ~2,400-file Optimism L2 corpus cleanly (152 findings, no timeout) — the R10 rayon
+  perf work holds at real scale.** 480 tests, 0 warnings, corpus 20/20 + 8/8. (Optimism + LayerZero now usable as
+  standing dogfood + R16 targets.)
+
+#### R16 backlog (R15 WF3 — L2 / cross-chain INFRASTRUCTURE: an 8th domain, the #1 DeFi loss category; real OP Stack + LayerZero v2 targets)
+Bridge-verification is the highest-payout exploit class in DeFi (Wormhole $325M, Nomad $190M, Ronin $625M). All checked non-overlapping vs bridge.rs (Nomad/Poly) + crosschain-rate-staleness:
+1. **dvn-quorum-confirmations-conflation** — LayerZero ULN M-of-N verify compares block-CONFIRMATIONS (liveness) not SIGNER quorum → Wormhole-class forge-a-message mint. `layerzero/.../uln/ReceiveUlnBase.sol:48-57,90-124`. (generalizes to Axelar/CCIP/Hyperlane M-of-N.)
+2. **prove-finalize-game-substitution** — OptimismPortal2 withdrawal proven against one dispute-game, finalized while that game's validity is re-evaluated from a mutable registry + a caller-supplied proofSubmitter key → fake-withdrawal bridge-ETH theft. `optimism/.../L1/OptimismPortal2.sol:461,572,651`.
+3. **interop-message-no-source-binding** — Superchain relay authorizes by cross-domain sender but never pins source chainId → cross-cluster replay / unbacked-ETH mint. `optimism/.../L2/SuperchainETHBridge.sol:64-78`.
+4. **bond-credit-accrued-before-finalization-verdict** — fault-proof bond credited at subgame-resolve before the final verdict.
+5. **oft-decimal-truncation-supply-leak** — OFT cross-chain debit/credit loses dust asymmetrically → burn≠mint supply break.
+6. **lz-receive-failure-silent-vs-stored** — endpoint clears payload before execution → a reverting/under-gassed lzReceive is lost (no replay).
+7. **l1-to-l2-alias-trust-on-eoa-shortcut** — privileged L2 handler trusts an aliased L1 sender with the alias applied conditionally.
+8. **unset-peer-eid-default-trust** — OApp/OFT receive treats an unconfigured peer (bytes32(0)) / unconfigured-EID as trusted.
+R16 = the highest-payout round yet (bridges); items 1–3 have concrete production targets. Full signatures in the R15 WF3 transcript.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector

@@ -36,6 +36,7 @@ pub mod msg_value_loop;
 pub mod oracle_staleness;
 pub mod rounding;
 pub mod storage_gap;
+pub mod gap_not_shrunk;
 // Round 1 (perpetual loop) detectors.
 pub mod delegatecall_loop;
 pub mod flashloan_callback;
@@ -112,6 +113,10 @@ pub mod param_update_retroactive;
 pub mod rfq_fill_accounting;
 pub mod vote_weight_checkpoint;
 pub mod feegrowth_accounting;
+// Round 15 (perpetual loop) — protocol-agnostic primitive classes.
+pub mod tstore_guard_misscope;
+pub mod batch_verify_skip;
+pub mod uninitialized_storage_pointer;
 
 use crate::detector::Detector;
 
@@ -146,6 +151,7 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(governance_timelock::GovernanceTimelockDetector),
         Box::new(approve_race::ApproveRaceDetector),
         Box::new(storage_gap::StorageGapDetector),
+        Box::new(gap_not_shrunk::GapNotShrunkDetector),
         Box::new(rounding::RoundingDetector),
         // Round 1 (perpetual loop).
         Box::new(twap_manipulation::TwapManipulationDetector),
@@ -235,6 +241,10 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(rfq_fill_accounting::RfqFillAccountingDetector),
         Box::new(vote_weight_checkpoint::VoteWeightCheckpointDetector),
         Box::new(feegrowth_accounting::FeegrowthAccountingDetector),
+        // Round 15 — protocol-agnostic primitive classes.
+        Box::new(tstore_guard_misscope::TstoreGuardMisscopeDetector),
+        Box::new(batch_verify_skip::BatchVerifySkipDetector),
+        Box::new(uninitialized_storage_pointer::UninitializedStoragePointerDetector),
     ]
 }
 
