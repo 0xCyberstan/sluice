@@ -141,6 +141,13 @@ pub mod churn_stale_stake_double_count;
 pub mod index_registry_pop_swap_stale;
 pub mod ejection_ratelimit_live_base;
 pub mod reregister_cooldown_bitmap_residue;
+pub mod keeper_reward_timestamp_auction;
+pub mod policy_permission_declaration_gap;
+pub mod module_active_flag_scope;
+pub mod wall_capacity_regen_desync;
+pub mod module_upgrade_state_drop;
+pub mod lifecycle_role_revoke_gap;
+pub mod backing_spot_inflation;
 
 use crate::detector::Detector;
 
@@ -293,6 +300,15 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(index_registry_pop_swap_stale::IndexRegistryPopSwapStaleDetector),
         Box::new(ejection_ratelimit_live_base::EjectionRatelimitLiveBaseDetector),
         Box::new(reregister_cooldown_bitmap_residue::ReregisterCooldownBitmapResidueDetector),
+        Box::new(keeper_reward_timestamp_auction::KeeperRewardTimestampAuctionDetector),
+        // Round 20 — Olympus Default-Framework two-table permission-contract gap.
+        Box::new(policy_permission_declaration_gap::PolicyPermissionDeclarationGapDetector),
+        // Round 20 — remaining Default-Framework / algorithmic-stability classes.
+        Box::new(module_active_flag_scope::ModuleActiveFlagScopeDetector),
+        Box::new(wall_capacity_regen_desync::WallCapacityRegenDesyncDetector),
+        Box::new(module_upgrade_state_drop::ModuleUpgradeStateDropDetector),
+        Box::new(lifecycle_role_revoke_gap::LifecycleRoleRevokeGapDetector),
+        Box::new(backing_spot_inflation::BackingSpotInflationDetector),
     ]
 }
 

@@ -458,6 +458,23 @@ AVS verification is EigenLayer's trust root (high payout). Full signatures in th
 6. **KeeperRewardTimestampAuction** — keeper incentive scaled by `block.timestamp`-elapsed, caller-mintable (Heart).
 7. **BackingSpotInflationFromUnbufferedPrice** — emission/bond payout sized from an instantaneous `getLastPrice`/pool spot. EmissionManager.sol.
 Adds a 9th surface: framework-ARCHITECTURE-specific classes (the Default-Framework Kernel/module/policy permission model), not just a value domain. Full signatures in the R19 WF3 transcript.
+
+### Round 20 — 7 olympus-v3 Default-Framework detectors — opens the 9th surface (framework ARCHITECTURE)
+- **Result:** +7 → **117 active** (73 novel classes; 9th surface = framework-architecture-specific). 6 of 7 fire on real
+  olympus-v3 (15 hits) — flagship **policy-permission-declaration-gap ×4** (cross-policy/module Kernel requestPermissions-
+  vs-called check), module-active-flag-scope ×4, backing-spot-inflation ×4, + module-upgrade/keeper-reward/wall-regen ×1;
+  **0 R20 FPs on all 6 non-framework codebases** (correctly 0 where there is no Kernel). lifecycle-role-revoke-gap fixture-only.
+  643 tests, 0 warnings, corpus 20/20 + 8/8. A bug class NO generalist tool (Slither/Mythril/Aderyn) models.
+
+### R21 work-plan (R20 WF3 taxonomy audit) — COMPLETE THE CANONICAL BASELINE
+Verdict: Sluice covers 10/10 OWASP SC Top-10 + every high-loss Rekt/Immunefi logic class, strongest where funds are lost
+(bridge/share-accounting/oracle + protocol-specific logic generalist tools miss); weakness = mundane lints (18/37 SWC).
+R21 builds the ~7 table-stakes baseline classes the novel rounds skipped: missing-event-emit (highest), floating-pragma
+(SWC-103), strict-balance-equality (SWC-132), deprecated-eth-send (.transfer/.send 2300-gas), shadowed-state-var (SWC-119),
+encodepacked-collision (SWC-133), locked-ether. NOT building: SWC-118/129/130/131/135/136 legacy-lints + supply-chain.
+
+_(Doc-hygiene: this log accumulated some stale R10-era duplication below from worktree copy-backs of the log file; the
+authoritative per-round record is lines through here. Cleanup pending; does not affect code.)_
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector
