@@ -143,6 +143,13 @@ pub enum Category {
     GapNotShrunk,
     BatchVerifySkip,
     UninitializedStoragePointer,
+    // ---- Round 16: L2 / cross-chain INFRASTRUCTURE (bridges — the #1 DeFi loss category) ----
+    DvnQuorumConflation,
+    ProveFinalizeGameSubstitution,
+    InteropNoSourceBinding,
+    OftDecimalSupplyLeak,
+    LzReceiveFailureSilent,
+    UnsetPeerDefaultTrust,
     Other,
 }
 
@@ -254,6 +261,12 @@ impl Category {
             GapNotShrunk => "gap-not-shrunk",
             BatchVerifySkip => "batch-verify-skip",
             UninitializedStoragePointer => "uninitialized-storage-pointer",
+            DvnQuorumConflation => "dvn-quorum-conflation",
+            ProveFinalizeGameSubstitution => "prove-finalize-game-substitution",
+            InteropNoSourceBinding => "interop-no-source-binding",
+            OftDecimalSupplyLeak => "oft-decimal-supply-leak",
+            LzReceiveFailureSilent => "lzreceive-failure-silent",
+            UnsetPeerDefaultTrust => "unset-peer-default-trust",
             Other => "other",
         }
     }
@@ -347,6 +360,12 @@ impl Category {
             GapNotShrunk => &["SWC-112", "CWE-1108"],
             BatchVerifySkip => &["CWE-347"],
             UninitializedStoragePointer => &["SWC-109", "CWE-824"],
+            DvnQuorumConflation => &["CWE-347", "CWE-345"],
+            ProveFinalizeGameSubstitution => &["CWE-362", "CWE-345"],
+            InteropNoSourceBinding => &["CWE-345", "CWE-294"],
+            OftDecimalSupplyLeak => &["CWE-682"],
+            LzReceiveFailureSilent => &["CWE-755"],
+            UnsetPeerDefaultTrust => &["CWE-909", "CWE-345"],
             _ => &[],
         }
     }
