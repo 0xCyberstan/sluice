@@ -312,6 +312,15 @@ These open a 5th domain (yield-tokenization/AMM); the AMM-curve math is invisibl
   (solver-convergence-trust fires 12× on Pendle's router — eager on the target, 0-FP elsewhere; a Pendle-specific tighten
   candidate, not a regression.) 419 tests, 0 warnings, corpus 20/20 + 8/8.
 
+### Round 14 — 6 lending / intent-RFQ / governance / AMM-fee detectors — opens the LENDING domain
+- **Result:** +6 → **90 active** (46 novel classes across 7 DeFi domains; lending is the new, largest-TVL domain).
+  Authored by 6 worktree agents via the prelude. Independent dogfood: the **3 lending detectors fire on the real Olympus
+  `MonoCooler`** (interest-index-desync, bad-debt-socialization, param-update-retroactive — 1 each, at the borrow/
+  liquidate/setLtv sites), **rfq-fill-accounting fires on Pendle's limit router** (2×); **0 R14 FPs on all 6 other
+  codebases** (eigenlayer 24 / etherfi 126 / symbiotic 41 / karak 15 / ethena 31 / olympus-contracts 92 — unchanged).
+  vote-weight-checkpoint + feegrowth-accounting are fixture-only here (no governance/Uni-V3-AMM corpus on-disk) — tight,
+  0-FP, self-test-validated, correctly dormant. 457 tests, 0 warnings, corpus 20/20 + 8/8.
+
 #### R14+ STRATEGIC backlog (R13 WF3 completeness-critic — the structural blind spots; steers the next several rounds)
 Whole DeFi domains with ZERO detectors today. Ranked by payout × matchability × non-overlap; each tied to a real on-disk target:
 1. **interest-index-desync** (lending) — debt/LTV checked against a STALE interest accumulator (RO index gates a write). Target: Olympus `MonoCooler.sol` (interestAccumulatorRay, _globalStateRO vs RW). ≠ LiquidationAbuse (that's seize/bonus only).
@@ -325,6 +334,22 @@ Whole DeFi domains with ZERO detectors today. Ranked by payout × matchability �
 9. **aa-paymaster-validation** — ERC-4337 paymaster/validation-phase storage-rule violation / griefing.
 10. **nft-claim-stale-rate** — NFT-fi redemption/withdrawal-queue claim at a stale rate.
 Lending (#1/#3) + RFQ (#2) are the highest-leverage next targets (huge TVL class, real on-disk targets, clean non-overlap). Full signatures in the R13 WF3 transcript.
+
+#### R15 backlog (R14 WF3 — protocol-agnostic primitives, overlap-checked vs the 90; + NEW corpora + perps deferral)
+**NEW on-disk corpora discovered** (expand validation/target pool): **Optimism** (2,418 .sol — incl. real EIP-1153
+`TransientContext.sol` + `L2ToL2CrossDomainMessenger`), **LayerZero** (2,549), a sui EVM bridge (29). These give the
+tstore-guard detector a REAL target and add L2-infra/cross-chain dogfood surface.
+R15 picks (broadly matchable on ANY codebase — raise baseline coverage; checked non-overlapping):
+1. **tstore-guard-mis-scope** — EIP-1153 transient-storage reentrancy guard set without clear-on-all-paths / cleared at
+   wrong call-depth / dirty transient value read cross-call. Validated target: Optimism TransientContext + L2ToL2CDM;
+   exempt the canonical OZ-v5 `ReentrancyGuardTransient` (library-name exemption, like signature_malleability does).
+2. **gap-not-shrunk** — a `__gap` that EXISTS but wasn't shrunk when state was appended, or mid-layout insertion (distinct
+   from StorageGap, which only catches an ABSENT gap). Surface: eigenlayer/symbiotic/pendle `*Storage`/`*Upg` (75 files).
+3. **batch-verify-skip** — batch/aggregate signature verify that SKIPS an invalid sig instead of reverting.
+4. **uninitialized-storage-pointer** — a local `storage` struct/array ref defaulting to slot 0, overwriting state.
+5. (lower) cross-protocol read-only-reentrancy — needs the consumer in-corpus (high FP otherwise).
+**PERPS DEFERRED as NEEDS-CORPUS:** no on-disk perps engine (no fundingRate/openInterest/markPrice). Per the R7 lesson,
+do NOT build perp-funding-mark / ADL fixture-only — defer until a GMX-v2 / Synthetix-perps / dYdX-v4 repo is added.
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector

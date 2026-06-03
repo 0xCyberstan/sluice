@@ -105,6 +105,13 @@ pub mod post_expiry_dual_index;
 pub mod stale_anchor_reset;
 pub mod solver_convergence_trust;
 pub mod ratio_denominator_sign_edge;
+// Round 14 (perpetual loop) — lending / intent-RFQ / governance / AMM-fee classes.
+pub mod interest_index_desync;
+pub mod bad_debt_socialization;
+pub mod param_update_retroactive;
+pub mod rfq_fill_accounting;
+pub mod vote_weight_checkpoint;
+pub mod feegrowth_accounting;
 
 use crate::detector::Detector;
 
@@ -221,6 +228,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(stale_anchor_reset::StaleAnchorResetDetector),
         Box::new(solver_convergence_trust::SolverConvergenceTrustDetector),
         Box::new(ratio_denominator_sign_edge::RatioDenominatorSignEdgeDetector),
+        // Round 14 — lending / intent-RFQ / governance / AMM-fee classes.
+        Box::new(interest_index_desync::InterestIndexDesyncDetector),
+        Box::new(bad_debt_socialization::BadDebtSocializationDetector),
+        Box::new(param_update_retroactive::ParamUpdateRetroactiveDetector),
+        Box::new(rfq_fill_accounting::RfqFillAccountingDetector),
+        Box::new(vote_weight_checkpoint::VoteWeightCheckpointDetector),
+        Box::new(feegrowth_accounting::FeegrowthAccountingDetector),
     ]
 }
 
