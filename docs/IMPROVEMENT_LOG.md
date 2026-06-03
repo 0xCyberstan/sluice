@@ -601,3 +601,22 @@ Opens the **11th surface: account abstraction (ERC-4337)**. Built on a corpus-tu
 - **Result:** +3 → **129 detectors**. 718 engine tests (+16) + corpus 20/20 + 8/8 + 5 real-hack harnesses + 7
   PoC-template tests, 0 warnings. Also produced the R27 perpetuals/derivatives backlog (`docs/R27_PERPS_BACKLOG.md`,
   7 ranked specs; build-first #1 FundingIndexSettleOrdering + #3 OICapCheckedBeforeFillCallout). _done._
+
+### Round 27 — 3 perpetuals/derivatives detectors (132 active) — opens the 12th surface
+Per the corpus-verified backlog (`docs/R27_PERPS_BACKLOG.md`), built the wave-1 perps detectors tuned against the
+read-only Code4rena 2025-08 **GTE Perps** corpus (R7 anti-overfit). Opens the **12th surface: perpetuals/derivatives**.
+- **FundingIndexSettleOrdering (High)** — realizes funding / makes a solvency decision against the global
+  cumulative-funding index without first advancing it via the interval-gated settle routine. Uses a cycle-safe
+  transitive BFS over `callees` (the decision sites are 2 hops below the state-mutating entries — a one-level fold
+  missed them). **Fires on 6 genuine GTE shapes** (LiquidatorPanel.liquidate/backstopLiquidate/deleverage +
+  PerpManager.addMargin/removeMargin/setPositionLeverage), silent on the settle routine + view quotes.
+- **OICapCheckedBeforeFillCallout (High)** — an OI/capacity cap asserted before a position-modifying callout, OI
+  mutated only after, no post-callout recheck (span-exact ordering). Correctly **silent on GTE** (which has no OI
+  cap — its pre-fill gate is solvency), fires on the Synthetix-V3 `maxMarketSize` shape + fixtures.
+- **MarkVsIndexPriceInconsistency (High, narrow)** — the solvency check reads one of mark/index while the
+  close/settlement path reads the other (disjoint surfaces). The FP-prone "lone comparison" secondary signal is
+  suppression-only (precision over recall, R7). **0 FP on GTE** (uniform `markPrice`), fires on a disjoint fixture.
+- **Result:** +3 → **132 detectors**. Integrated workspace green (corpus 20/20 + 8/8 + 5 real-hack harnesses + 7
+  PoC-template tests), 0 warnings; perps dogfood on real GTE = 6 funding-index findings + 0/0 (correct) for the
+  other two. Each keeps its perps-shaped gate local (dedup to prelude in a future structure round). Deferred (need
+  more corpus tuning): perps #4 PnlSettledBeforeFundingApplied, #5 ADL, #6 InsuranceFund, #7 SameBlockMarkPriceSnapshot. _done._

@@ -166,6 +166,10 @@ pub mod hook_permission_body_bitmap_mismatch;
 pub mod missing_entrypoint_guard;
 pub mod validation_phase_env_opcode;
 pub mod validation_untrusted_callout;
+// Round 27 — perpetuals / derivatives classes.
+pub mod funding_index_settle_ordering;
+pub mod oi_cap_checked_before_fill_callout;
+pub mod mark_vs_index_price_inconsistency;
 
 use crate::detector::Detector;
 
@@ -342,6 +346,10 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(missing_entrypoint_guard::MissingEntryPointGuardDetector),
         Box::new(validation_phase_env_opcode::ValidationPhaseEnvOpcodeDetector),
         Box::new(validation_untrusted_callout::ValidationUntrustedCalloutDetector),
+        // Round 27 — perpetuals / derivatives classes.
+        Box::new(funding_index_settle_ordering::FundingIndexSettleOrderingDetector),
+        Box::new(oi_cap_checked_before_fill_callout::OICapCheckedBeforeFillCalloutDetector),
+        Box::new(mark_vs_index_price_inconsistency::MarkVsIndexPriceInconsistencyDetector),
     ]
 }
 
