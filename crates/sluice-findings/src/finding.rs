@@ -162,6 +162,14 @@ pub enum Category {
     IndexRegistryPopSwapStale,
     EjectionRatelimitLiveBase,
     ReregisterCooldownBitmapResidue,
+    // ---- Round 20: Default-Framework module-permission / algorithmic-stability (olympus-v3) ----
+    PolicyPermissionDeclarationGap,
+    ModuleActiveFlagPrivilegeScope,
+    WallCapacityRegenDesync,
+    ModuleUpgradeStateDrop,
+    LifecycleRoleRevokeGap,
+    KeeperRewardTimestampAuction,
+    BackingSpotInflation,
     Other,
 }
 
@@ -289,6 +297,13 @@ impl Category {
             IndexRegistryPopSwapStale => "index-registry-pop-swap-stale",
             EjectionRatelimitLiveBase => "ejection-ratelimit-live-base",
             ReregisterCooldownBitmapResidue => "reregister-cooldown-bitmap-residue",
+            PolicyPermissionDeclarationGap => "policy-permission-declaration-gap",
+            ModuleActiveFlagPrivilegeScope => "module-active-flag-scope",
+            WallCapacityRegenDesync => "wall-capacity-regen-desync",
+            ModuleUpgradeStateDrop => "module-upgrade-state-drop",
+            LifecycleRoleRevokeGap => "lifecycle-role-revoke-gap",
+            KeeperRewardTimestampAuction => "keeper-reward-timestamp-auction",
+            BackingSpotInflation => "backing-spot-inflation",
             Other => "other",
         }
     }
@@ -398,6 +413,13 @@ impl Category {
             IndexRegistryPopSwapStale => &["CWE-672", "CWE-824"],
             EjectionRatelimitLiveBase => &["CWE-682", "CWE-840"],
             ReregisterCooldownBitmapResidue => &["CWE-459", "CWE-841"],
+            PolicyPermissionDeclarationGap => &["CWE-862", "CWE-863"],
+            ModuleActiveFlagPrivilegeScope => &["CWE-284", "CWE-269"],
+            WallCapacityRegenDesync => &["CWE-682", "CWE-841"],
+            ModuleUpgradeStateDrop => &["CWE-665", "CWE-1108"],
+            LifecycleRoleRevokeGap => &["CWE-266", "CWE-284"],
+            KeeperRewardTimestampAuction => &["SWC-116", "CWE-829"],
+            BackingSpotInflation => &["CWE-1339", "CWE-682"],
             _ => &[],
         }
     }
