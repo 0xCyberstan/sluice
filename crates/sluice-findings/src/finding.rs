@@ -186,6 +186,10 @@ pub enum Category {
     ValidationPhaseEnvOpcode,
     ValidationUntrustedCallout,
     MissingEntryPointGuard,
+    // ---- Round 27: perpetuals / derivatives classes ----
+    FundingIndexSettleOrdering,
+    OICapCheckedBeforeFillCallout,
+    MarkVsIndexPriceInconsistency,
     Other,
 }
 
@@ -333,6 +337,9 @@ impl Category {
             ValidationPhaseEnvOpcode => "validation-phase-env-opcode",
             ValidationUntrustedCallout => "validation-untrusted-callout",
             MissingEntryPointGuard => "missing-entrypoint-guard",
+            FundingIndexSettleOrdering => "funding-index-settle-ordering",
+            OICapCheckedBeforeFillCallout => "oi-cap-checked-before-fill-callout",
+            MarkVsIndexPriceInconsistency => "mark-vs-index-price-inconsistency",
             Other => "other",
         }
     }
@@ -462,6 +469,9 @@ impl Category {
             ValidationPhaseEnvOpcode => &["CWE-400", "SWC-116"],
             ValidationUntrustedCallout => &["CWE-829", "CWE-691"],
             MissingEntryPointGuard => &["CWE-862", "CWE-284"],
+            FundingIndexSettleOrdering => &["CWE-682", "CWE-696"],
+            OICapCheckedBeforeFillCallout => &["CWE-367", "CWE-691"],
+            MarkVsIndexPriceInconsistency => &["CWE-682", "CWE-840"],
             _ => &[],
         }
     }
