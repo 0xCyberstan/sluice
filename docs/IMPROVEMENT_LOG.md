@@ -51,4 +51,16 @@ cross-contract linking → path-sensitivity → performance/caching → PoC comp
 - Validation: +8 historical hacks (Rari-Fuse cross, Hundred, Inverse, Radiant, Qubit, PancakeBunny, Conic, Sturdy).
 - Dogfood: olympus-contracts, eigenlayer-middleware, layerzero (deeper), re-scan Pendle to confirm.
 - Core: a cross-contract detector that uses the R1 resolver (oracle-from-resolved-pool / cross-contract reentrancy).
+- **Result:** 39 detectors; +8 hacks (26 fixtures, all 29 harness entries caught). Oracle detector now follows the
+  resolver to flag CROSS-CONTRACT spot-oracle dependencies. **Major precision win from dogfooding:**
+  access-control awareness — params of onlyOwner/onlyRole functions are no longer seeded as attacker input
+  (fixed reentrancy/oracle/integer FPs on admin setters everywhere); `balanceOf(address(this))` excluded from
+  spot-price; reentrancy/oracle downgraded on access-controlled fns; cross-function reentrancy dropped there.
+  olympus-contracts 134→96, EigenLayer 30. 86 tests, 0 warnings. _done._
+
+### Round 3 — core: reentrancy CEI/ordering precision
+- Detectors (6): decimals-assumption, centralization-risk, erc721-safety, unchecked-abi-decode, hardcoded-gas-stipend, cached-domain-separator.
+- Validation: +8 hacks (Warp, Grim, Cover, bEarn, Nerve, Spartan, Value DeFi, ApeRocket).
+- Dogfood: nitro-audit, firedancer-audit, grafana/cacti (sol?), re-scan olympus-contracts to confirm.
+- Core: tighten reentrancy to require an SSTORE strictly after the call (exclude post-call reads / trailing calls).
 - _status: launched._

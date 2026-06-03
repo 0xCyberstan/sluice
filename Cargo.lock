@@ -733,6 +733,7 @@ name = "sluice-frontier"
 version = "0.1.0"
 dependencies = [
  "rustc-hash",
+ "sluice-dataflow",
  "sluice-ir",
  "sluice-parse",
 ]

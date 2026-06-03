@@ -25,6 +25,14 @@ impl Detector for ReentrancyDetector {
                 if r.guarded || cx.has_reentrancy_guard(f) {
                     continue;
                 }
+                // Access-controlled functions can only be entered by a trusted
+                // actor, so reentrancy risk is much lower. Cross-function (the
+                // weakest signal) is dropped entirely there; classic/read-only are
+                // downgraded to a low confidence so they sink to Low/Info.
+                let access_controlled = cx.has_access_control(f);
+                if access_controlled && r.kind == ReentrancyKind::CrossFunction {
+                    continue;
+                }
                 let (cat, sev, conf, title) = match r.kind {
                     ReentrancyKind::Classic => (
                         Category::Reentrancy,
@@ -45,6 +53,7 @@ impl Detector for ReentrancyDetector {
                         "Shared state reachable during external call (cross-function reentrancy)",
                     ),
                 };
+                let conf = if access_controlled { conf * 0.5 } else { conf };
                 let mut b = FindingBuilder::new(self.id(), cat)
                     .title(title)
                     .severity(sev)

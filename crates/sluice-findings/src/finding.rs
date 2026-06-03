@@ -77,6 +77,10 @@ pub enum Category {
     TwapManipulation,
     FlashloanCallback,
     PriceBounds,
+    ArrayLengthMismatch,
+    DoubleEntryToken,
+    LiquidationAbuse,
+    BlockNumberTime,
     Other,
 }
 
@@ -129,6 +133,10 @@ impl Category {
             TwapManipulation => "twap-manipulation",
             FlashloanCallback => "flashloan-callback",
             PriceBounds => "price-bounds",
+            ArrayLengthMismatch => "array-length-mismatch",
+            DoubleEntryToken => "double-entry-token",
+            LiquidationAbuse => "liquidation-abuse",
+            BlockNumberTime => "block-number-time",
             Other => "other",
         }
     }
@@ -163,6 +171,10 @@ impl Category {
             TwapManipulation => &["CWE-1339", "CWE-20"],
             FlashloanCallback => &["CWE-345", "CWE-863"],
             PriceBounds => &["CWE-20", "CWE-1339"],
+            ArrayLengthMismatch => &["CWE-129"],
+            DoubleEntryToken => &["CWE-20"],
+            LiquidationAbuse => &["CWE-682", "CWE-840"],
+            BlockNumberTime => &["SWC-116"],
             _ => &[],
         }
     }

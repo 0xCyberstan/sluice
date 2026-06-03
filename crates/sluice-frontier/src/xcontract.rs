@@ -85,6 +85,43 @@ impl ContractResolver {
     pub fn is_empty(&self) -> bool {
         self.impls.is_empty()
     }
+
+    /// Cross-contract oracle dependency: does a `type.method(...)` call resolve to
+    /// an in-repo implementation whose body reads a *manipulable spot price*
+    /// (`getReserves`/`slot0`/`balanceOf`/`getPrice`/...)? If so, a consumer that
+    /// trusts `type.method()` as a price is transitively exposed to spot
+    /// manipulation even though its own body contains no spot read — a bug that
+    /// single-contract analysis cannot see. Returns the implementing contract.
+    pub fn resolves_to_spot_oracle(
+        &self,
+        scir: &Scir,
+        type_name: &str,
+        method: &str,
+    ) -> Option<ContractId> {
+        for cid in self.implementations(type_name) {
+            let Some(c) = scir.contract(*cid) else { continue };
+            for fid in &c.functions {
+                let Some(f) = scir.function(*fid) else { continue };
+                if f.name != method {
+                    continue;
+                }
+                let mut spot = false;
+                for s in &f.body {
+                    s.visit_exprs(&mut |e| {
+                        if let sluice_ir::ExprKind::Call(call) = &e.kind {
+                            if sluice_dataflow::is_spot_price_call(call) {
+                                spot = true;
+                            }
+                        }
+                    });
+                }
+                if spot {
+                    return Some(*cid);
+                }
+            }
+        }
+        None
+    }
 }
 
 fn push_unique(map: &mut FxHashMap<String, Vec<ContractId>>, key: String, id: ContractId) {
@@ -116,6 +153,28 @@ mod tests {
         // resolve a method on the interface type to the implementation
         let fid = r.resolve_method(&m, "IOracle", "price").unwrap();
         assert_eq!(m.function(fid).unwrap().name, "price");
+    }
+
+    #[test]
+    fn detects_cross_contract_spot_oracle() {
+        // `PriceOracle.getPrice()` computes its price from a spot reserve read, so
+        // a consumer trusting `IOracle(o).getPrice()` is cross-contract exposed.
+        let m = scir(
+            "interface IPair { function getReserves() external view returns (uint112, uint112, uint32); }
+             interface IOracle { function getPrice() external view returns (uint256); }
+             contract PriceOracle is IOracle {
+                 IPair public pair;
+                 function getPrice() external view returns (uint256) {
+                     (uint112 r0, uint112 r1, ) = pair.getReserves();
+                     return uint256(r1) * 1e18 / uint256(r0);
+                 }
+             }",
+        );
+        let r = ContractResolver::build(&m);
+        let impl_cid = m.contract_named("PriceOracle").unwrap().id;
+        assert_eq!(r.resolves_to_spot_oracle(&m, "IOracle", "getPrice"), Some(impl_cid));
+        // A method that is not a spot read resolves to nothing.
+        assert_eq!(r.resolves_to_spot_oracle(&m, "IOracle", "decimals"), None);
     }
 
     #[test]

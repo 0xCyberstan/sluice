@@ -38,6 +38,13 @@ pub mod price_bounds;
 pub mod reward_debt;
 pub mod selfdestruct;
 pub mod twap_manipulation;
+// Round 2 (perpetual loop) detectors.
+pub mod array_length_mismatch;
+pub mod block_number_time;
+pub mod double_entry_token;
+pub mod liquidation_abuse;
+pub mod signature_malleability;
+pub mod unprotected_initializer;
 
 use crate::detector::Detector;
 
@@ -80,6 +87,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(delegatecall_loop::DelegatecallLoopDetector),
         Box::new(reward_debt::RewardDebtDetector),
         Box::new(price_bounds::PriceBoundsDetector),
+        // Round 2 (perpetual loop).
+        Box::new(signature_malleability::SignatureMalleabilityDetector),
+        Box::new(unprotected_initializer::UnprotectedInitializerDetector),
+        Box::new(array_length_mismatch::ArrayLengthMismatchDetector),
+        Box::new(double_entry_token::DoubleEntryTokenDetector),
+        Box::new(liquidation_abuse::LiquidationAbuseDetector),
+        Box::new(block_number_time::BlockNumberTimeDetector),
     ]
 }
 

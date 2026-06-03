@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 sluice-ir = { workspace = true }
+sluice-dataflow = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]

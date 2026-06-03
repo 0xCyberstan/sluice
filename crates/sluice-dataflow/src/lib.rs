@@ -13,7 +13,9 @@
 //! caller flows). Sound as an over-approximation for reachability.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use sluice_ir::{Builtin, Call, CallKind, Expr, ExprKind, Function, FunctionId, Lit, Scir, ValueSource};
+use sluice_ir::{
+    Builtin, Call, CallKind, Expr, ExprKind, Function, FunctionId, GuardKind, Lit, Scir, ValueSource,
+};
 
 const MAX_ROUNDS: usize = 6;
 const MAX_LOCAL_ITERS: usize = 8;
@@ -210,11 +212,40 @@ pub const SPOT_PRICE_FUNCS: &[&str] = &[
 /// produced oracle false positives on legitimate vaults.
 pub fn is_spot_price_call(c: &Call) -> bool {
     match &c.func_name {
-        Some(n) => {
-            // balanceOf(<pool>) used as a value is the canonical manipulable read.
-            n == "balanceOf" || SPOT_PRICE_FUNCS.contains(&n.as_str())
+        Some(n) if n == "balanceOf" => {
+            // `balanceOf(<pool>)` used as a value is the canonical manipulable
+            // read — but `balanceOf(address(this))` / `balanceOf(msg.sender)` is a
+            // contract reading its OWN holdings (an audit/accounting read), not an
+            // external price, and cannot be flash-loan-moved against itself.
+            !balance_of_self_or_sender(c)
         }
+        Some(n) => SPOT_PRICE_FUNCS.contains(&n.as_str()),
         None => false,
+    }
+}
+
+/// True if a `balanceOf(...)` call's argument is `address(this)` / `this` /
+/// `msg.sender` (an own-balance read, not a pool spot price).
+fn balance_of_self_or_sender(c: &Call) -> bool {
+    let Some(arg) = c.args.first() else { return false };
+    match &arg.kind {
+        // `address(this)` / `address(msg.sender)` — a TypeCast over this/sender.
+        ExprKind::Call(inner) if inner.kind == CallKind::TypeCast => inner
+            .args
+            .first()
+            .map(|a| is_this_or_sender(a))
+            .unwrap_or(false),
+        _ => is_this_or_sender(arg),
+    }
+}
+
+fn is_this_or_sender(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => n == "this",
+        ExprKind::Member { base, member } => {
+            member == "sender" && matches!(&base.kind, ExprKind::Ident(b) if b == "msg")
+        }
+        _ => false,
     }
 }
 
@@ -227,7 +258,13 @@ fn build_flow(scir: &Scir, f: &Function, facts: &DataflowFacts) -> FnFlow {
     // parameters are attacker-controlled. Internal/private functions inherit the
     // provenance their callers pass in (interprocedural), defaulting to Unknown
     // when no caller is known yet.
-    let attacker = f.is_externally_reachable();
+    // A function gated by an access-control guard (onlyOwner / onlyRole /
+    // require(msg.sender == ...)) can only be called by a trusted privileged
+    // actor, so its parameters are NOT arbitrary attacker input. Treating them as
+    // attacker-controlled produced large false-positive volume on admin/governor
+    // setters across real protocols. Such functions are taint-seeded like internal
+    // ones (from caller args, else Unknown).
+    let attacker = f.is_externally_reachable() && !is_access_controlled(f);
     let incoming = facts.param_in.get(&f.id);
     for (i, p) in f.params.iter().enumerate() {
         if let Some(name) = &p.name {
@@ -403,6 +440,12 @@ fn eval_call(facts: &DataflowFacts, scir: &Scir, fid: FunctionId, flow: &FnFlow,
     }
 }
 
+/// True if the function is gated by an access-control guard (a `msg.sender`/role
+/// check or an auth modifier), so its caller is a trusted privileged actor.
+fn is_access_controlled(f: &Function) -> bool {
+    f.effects.guards.iter().any(|g| matches!(g.kind, GuardKind::MsgSenderCheck))
+}
+
 fn is_state_var(scir: &Scir, fid: FunctionId, name: &str) -> bool {
     let Some(f) = scir.function(fid) else { return false };
     let Some(c) = scir.contract(f.contract) else { return false };
@@ -562,11 +605,19 @@ mod tests {
     }
 
     #[test]
-    fn balance_of_is_price_like() {
+    fn balance_of_pool_is_price_like_but_self_is_not() {
+        // `balanceOf(pool)` of an external address is a manipulable spot read...
         let (scir, facts) = analyze(
-            "contract C { function p(address t) external returns (uint256) { return IERC20(t).balanceOf(address(this)); } }",
+            "contract C { function p(address t, address pool) external returns (uint256) { return IERC20(t).balanceOf(pool); } }",
         );
         let f = scir.all_functions().find(|f| f.name == "p").unwrap();
         assert!(facts.flow(f.id).unwrap().return_prov.contains(ValueSource::PriceLike));
+
+        // ...but `balanceOf(address(this))` is an own-balance read, NOT a price.
+        let (scir2, facts2) = analyze(
+            "contract C { function q(address t) external returns (uint256) { return IERC20(t).balanceOf(address(this)); } }",
+        );
+        let g = scir2.all_functions().find(|f| f.name == "q").unwrap();
+        assert!(!facts2.flow(g.id).unwrap().return_prov.contains(ValueSource::PriceLike));
     }
 }
