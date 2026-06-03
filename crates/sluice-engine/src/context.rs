@@ -9,6 +9,48 @@ use sluice_frontier::FrontierFacts;
 use sluice_invariant::InvariantFacts;
 use sluice_ir::{Contract, ContractId, Expr, Function, FunctionId, GuardKind, Scir, Span};
 
+/// Remove `//` line comments and `/* */` block comments from Solidity source so
+/// keyword-based heuristics don't match commentary. String literals are left
+/// intact (over-stripping comments only; rare keyword-in-string is acceptable).
+fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            // line comment to end of line
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            // block comment until */
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else {
+            // copy this byte (char-safe: push the char starting here)
+            let ch_len = utf8_len(b[i]);
+            if let Some(s) = src.get(i..i + ch_len) {
+                out.push_str(s);
+            }
+            i += ch_len;
+        }
+    }
+    out
+}
+
+fn utf8_len(first: u8) -> usize {
+    match first {
+        b if b < 0x80 => 1,
+        b if b >> 5 == 0b110 => 2,
+        b if b >> 4 == 0b1110 => 3,
+        _ => 4,
+    }
+}
+
 pub struct AnalysisContext<'a> {
     pub scir: &'a Scir,
     pub dataflow: &'a DataflowFacts,
@@ -57,6 +99,14 @@ impl<'a> AnalysisContext<'a> {
     pub fn finish(&self, b: FindingBuilder, fid: FunctionId, span: Span) -> Finding {
         let (c, f) = self.names(fid);
         b.at(self.scir, c, f, span).build()
+    }
+
+    /// Source text for a span with `//` and `/* */` comments stripped, lowercased.
+    /// Detectors that key suppression/heuristics on keywords ("timelock", "vrf",
+    /// "nonce", ...) MUST use this rather than raw `span_text`, otherwise a comment
+    /// like `// no timelock here` falsely trips the keyword check.
+    pub fn source_text(&self, span: Span) -> String {
+        strip_comments(self.scir.span_text(span)).to_ascii_lowercase()
     }
 
     // -------- value-flow queries --------

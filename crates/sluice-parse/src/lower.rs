@@ -266,7 +266,14 @@ impl<'a> Lowerer<'a> {
             E::AssignModulo(_, t, v) => self.assign(AssignOp::Mod, t, v),
 
             E::BoolLiteral(_, b) => ExprKind::Lit(Lit::Bool(*b)),
-            E::NumberLiteral(_, v, _, _) => ExprKind::Lit(Lit::Number(v.clone())),
+            // Preserve the exponent: `1e18` parses as value="1", exp="18". Dropping
+            // the exponent collapsed every scientific literal to its mantissa,
+            // hiding `1e18`/`1e6`-style scale constants from detectors.
+            E::NumberLiteral(_, v, exp, _) => ExprKind::Lit(Lit::Number(if exp.is_empty() {
+                v.clone()
+            } else {
+                format!("{v}e{exp}")
+            })),
             E::RationalNumberLiteral(_, m, f, _, _) => {
                 ExprKind::Lit(Lit::Number(format!("{m}.{f}")))
             }

@@ -63,4 +63,17 @@ cross-contract linking → path-sensitivity → performance/caching → PoC comp
 - Validation: +8 hacks (Warp, Grim, Cover, bEarn, Nerve, Spartan, Value DeFi, ApeRocket).
 - Dogfood: nitro-audit, firedancer-audit, grafana/cacti (sol?), re-scan olympus-contracts to confirm.
 - Core: tighten reentrancy to require an SSTORE strictly after the call (exclude post-call reads / trailing calls).
+- **Result:** 45 detectors; 34 hack fixtures, all 37 harness entries caught (4 harnesses). Fixes: a real
+  **parser bug** (scientific literals `1e18` lost their exponent → now preserved); a **comment-stripping**
+  `source_text` helper (a `// no timelock` comment was falsely suppressing centralization — general fragility);
+  3 R3-detector self-test bugs (cached-domain mistook the constructor's separator-build for chainId handling).
+  Core: cross-function reentrancy now requires the precise stale-read shape, AND external calls to project-defined
+  `view`/`pure` methods (`gOHM.balanceFrom()`) are recognized as non-reentrant. olympus-contracts reentrancy
+  58→36→**14** across the loop; 99 tests, 0 warnings. _done._
+
+### Round 4 — core: migrate keyword detectors to comment-stripped source
+- Detectors (6): l2-sequencer-uptime, lp-slippage, weird-erc20-no-revert, unchecked-erc1155-receiver, stale-while-paused, vote-no-snapshot-delegation.
+- Validation: +8 hacks (Deus, Saddle, Sturdy2, UwU, Prisma, JimboLong, Gamma, KyberSwap).
+- Dogfood: re-scan olympus-contracts/eigenlayer/pendle to confirm, + a fresh target.
+- Core: route all keyword-suppression detectors (signature/randomness/price_bounds/twap/oracle/governance/...) through cx.source_text so comments never trip suppression.
 - _status: launched._

@@ -66,6 +66,9 @@ impl FrontierFacts {
     pub fn analyze(scir: &Scir) -> Self {
         let mut facts = FrontierFacts::default();
         facts.resolver = ContractResolver::build(scir);
+        // Project-wide view/pure method names — external calls to these are reads,
+        // not re-entry vectors (computed once for the whole module).
+        let view_methods = module_view_methods(scir);
         for c in scir.iter_contracts() {
             let contract_has_lock = c.inherits_like("reentrancyguard") || c.inherits_like("reentrant");
 
@@ -81,7 +84,7 @@ impl FrontierFacts {
                 }
                 let guarded = function_has_lock(f) || contract_has_lock;
 
-                let first_ext = first_reentrant_call(f, &trusted);
+                let first_ext = first_reentrant_call(f, &trusted, &view_methods);
                 for cs in &f.effects.call_sites {
                     if !cs.kind.is_external_transfer_of_control() {
                         continue;
@@ -162,7 +165,7 @@ impl FrontierFacts {
 
             // Cross-function reentrancy: an external call in function A leaves a
             // shared var that sibling B writes/reads, while A has no lock.
-            detect_cross_function(scir, c.id, &mut facts);
+            detect_cross_function(scir, c.id, &mut facts, &view_methods);
         }
         facts
     }
@@ -208,15 +211,43 @@ fn is_view_method(name: Option<&str>) -> bool {
 }
 
 /// True if a call site can hand control to code that may re-enter this contract.
-fn is_reentrancy_capable(cs: &sluice_ir::CallSite) -> bool {
+fn is_reentrancy_capable(cs: &sluice_ir::CallSite, view_methods: &FxHashSet<String>) -> bool {
     match cs.kind {
         CallKind::LowLevelCall | CallKind::DelegateCall | CallKind::Send | CallKind::Transfer => true,
         // A non-view external method call can run attacker code; a view read cannot.
-        CallKind::External => cs.sends_value || !is_view_method(cs.func_name.as_deref()),
+        // `view_methods` adds the project's own view/pure-declared method names
+        // (resolved from interfaces/contracts) to the built-in view list, so a call
+        // like `gOHM.balanceFrom(x)` or `treasury.baseSupply()` is recognized as a
+        // staticcall-equivalent read and does not count as a re-entry vector.
+        CallKind::External => {
+            cs.sends_value
+                || !(is_view_method(cs.func_name.as_deref())
+                    || cs.func_name.as_deref().map(|n| view_methods.contains(n)).unwrap_or(false))
+        }
         // staticcall is read-only by construction.
         CallKind::StaticCall => false,
         _ => false,
     }
+}
+
+/// Method names declared `view`/`pure` anywhere in the module, MINUS any name
+/// also declared state-mutating somewhere (kept conservative to avoid silencing a
+/// genuinely mutating call that happens to share a name). Used to recognize
+/// external calls to project-defined view functions as non-reentrant.
+fn module_view_methods(scir: &Scir) -> FxHashSet<String> {
+    let mut view: FxHashSet<String> = FxHashSet::default();
+    let mut mutating: FxHashSet<String> = FxHashSet::default();
+    for f in scir.all_functions() {
+        if f.is_modifier() || f.is_constructor() {
+            continue;
+        }
+        if f.is_view_or_pure() {
+            view.insert(f.name.clone());
+        } else if f.is_state_mutating() {
+            mutating.insert(f.name.clone());
+        }
+    }
+    view.difference(&mutating).cloned().collect()
 }
 
 /// Order of the first reentrancy-capable external call in a function, ignoring
@@ -224,11 +255,15 @@ fn is_reentrancy_capable(cs: &sluice_ir::CallSite) -> bool {
 /// is set once at construction (WETH, a router, an in-protocol module) and is not
 /// an attacker-controlled re-entry vector — though value-sending and low-level
 /// calls are still counted regardless of target.
-fn first_reentrant_call(f: &Function, trusted: &FxHashSet<String>) -> Option<u32> {
+fn first_reentrant_call(
+    f: &Function,
+    trusted: &FxHashSet<String>,
+    view_methods: &FxHashSet<String>,
+) -> Option<u32> {
     f.effects
         .call_sites
         .iter()
-        .filter(|cs| is_reentrancy_capable(cs) && !is_trusted_external(cs, trusted))
+        .filter(|cs| is_reentrancy_capable(cs, view_methods) && !is_trusted_external(cs, trusted))
         .map(|cs| cs.order)
         .min()
 }
@@ -312,7 +347,12 @@ fn is_value_oracle_getter(name: &str) -> bool {
     .any(|k| l.contains(k))
 }
 
-fn detect_cross_function(scir: &Scir, cid: ContractId, facts: &mut FrontierFacts) {
+fn detect_cross_function(
+    scir: &Scir,
+    cid: ContractId,
+    facts: &mut FrontierFacts,
+    view_methods: &FxHashSet<String>,
+) {
     // Collect (function, vars-written-after-call, guarded) for functions with
     // an external call that is NOT followed by their own write (so classic
     // doesn't fire) but leaves shared state for siblings.
@@ -325,21 +365,28 @@ fn detect_cross_function(scir: &Scir, cid: ContractId, facts: &mut FrontierFacts
         if !f.is_externally_reachable() || f.is_constructor() {
             continue;
         }
-        let Some(first) = first_reentrant_call(f, &trusted) else {
+        let Some(first) = first_reentrant_call(f, &trusted, view_methods) else {
             continue;
         };
         if function_has_lock(f) {
             continue;
         }
-        // Vars read or written by f around the call.
+        // The real cross-function pattern: f READS a shared var before its
+        // external call (and relies on that value afterwards), and a sibling can
+        // WRITE that var during the re-entry, invalidating f's stale read. We key
+        // on reads-before-call (not arbitrary touches) — a var f merely writes
+        // before the call, or only reads after, is not this bug, and counting
+        // those was the dominant cross-function false-positive source.
         let touched: Vec<&str> = f
             .effects
             .storage_reads
             .iter()
-            .chain(f.effects.storage_writes.iter())
             .filter(|a| a.order < first)
             .map(|a| a.var.as_str())
             .collect();
+        if touched.is_empty() {
+            continue;
+        }
         // Does a sibling mutate one of those vars (so re-entering it is harmful)?
         for sib in &funcs {
             if sib.id == f.id || !sib.is_state_mutating() || !sib.is_externally_reachable() {

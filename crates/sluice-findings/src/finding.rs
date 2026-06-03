@@ -81,6 +81,12 @@ pub enum Category {
     DoubleEntryToken,
     LiquidationAbuse,
     BlockNumberTime,
+    DecimalsAssumption,
+    Centralization,
+    Erc721Safety,
+    UncheckedAbiDecode,
+    HardcodedGasStipend,
+    CachedDomainSeparator,
     Other,
 }
 
@@ -137,6 +143,12 @@ impl Category {
             DoubleEntryToken => "double-entry-token",
             LiquidationAbuse => "liquidation-abuse",
             BlockNumberTime => "block-number-time",
+            DecimalsAssumption => "decimals-assumption",
+            Centralization => "centralization-risk",
+            Erc721Safety => "erc721-safety",
+            UncheckedAbiDecode => "unchecked-abi-decode",
+            HardcodedGasStipend => "hardcoded-gas-stipend",
+            CachedDomainSeparator => "cached-domain-separator",
             Other => "other",
         }
     }
@@ -175,6 +187,12 @@ impl Category {
             DoubleEntryToken => &["CWE-20"],
             LiquidationAbuse => &["CWE-682", "CWE-840"],
             BlockNumberTime => &["SWC-116"],
+            DecimalsAssumption => &["CWE-682"],
+            Centralization => &["CWE-269"],
+            Erc721Safety => &["CWE-20"],
+            UncheckedAbiDecode => &["CWE-20", "SWC-128"],
+            HardcodedGasStipend => &["SWC-134"],
+            CachedDomainSeparator => &["SWC-117", "CWE-347"],
             _ => &[],
         }
     }

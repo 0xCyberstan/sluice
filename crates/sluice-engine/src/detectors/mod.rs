@@ -45,6 +45,13 @@ pub mod double_entry_token;
 pub mod liquidation_abuse;
 pub mod signature_malleability;
 pub mod unprotected_initializer;
+// Round 3 (perpetual loop) detectors.
+pub mod cached_domain_separator;
+pub mod centralization;
+pub mod decimals_assumption;
+pub mod erc721_safety;
+pub mod hardcoded_gas_stipend;
+pub mod unchecked_abi_decode;
 
 use crate::detector::Detector;
 
@@ -94,6 +101,13 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(double_entry_token::DoubleEntryTokenDetector),
         Box::new(liquidation_abuse::LiquidationAbuseDetector),
         Box::new(block_number_time::BlockNumberTimeDetector),
+        // Round 3 (perpetual loop).
+        Box::new(decimals_assumption::DecimalsAssumptionDetector),
+        Box::new(centralization::CentralizationDetector),
+        Box::new(erc721_safety::Erc721SafetyDetector),
+        Box::new(unchecked_abi_decode::UncheckedAbiDecodeDetector),
+        Box::new(hardcoded_gas_stipend::HardcodedGasStipendDetector),
+        Box::new(cached_domain_separator::CachedDomainSeparatorDetector),
     ]
 }
 
