@@ -155,6 +155,13 @@ pub enum Category {
     ConditionalSenderAliasing,
     ClockExtensionDepthBranch,
     RespectedGameTypeSnapshotSwap,
+    // ---- Round 19: EigenLayer AVS-middleware (quorum / BLS-registry / churn) ----
+    ApkMembershipDesync,
+    VerifySnapshotBlockCallerTrust,
+    ChurnStaleStakeDoubleCount,
+    IndexRegistryPopSwapStale,
+    EjectionRatelimitLiveBase,
+    ReregisterCooldownBitmapResidue,
     Other,
 }
 
@@ -276,6 +283,12 @@ impl Category {
             ConditionalSenderAliasing => "conditional-sender-aliasing",
             ClockExtensionDepthBranch => "clock-extension-depth-branch",
             RespectedGameTypeSnapshotSwap => "respected-gametype-snapshot-swap",
+            ApkMembershipDesync => "apk-membership-desync",
+            VerifySnapshotBlockCallerTrust => "verify-snapshot-block-caller-trust",
+            ChurnStaleStakeDoubleCount => "churn-stale-stake-double-count",
+            IndexRegistryPopSwapStale => "index-registry-pop-swap-stale",
+            EjectionRatelimitLiveBase => "ejection-ratelimit-live-base",
+            ReregisterCooldownBitmapResidue => "reregister-cooldown-bitmap-residue",
             Other => "other",
         }
     }
@@ -379,6 +392,12 @@ impl Category {
             ConditionalSenderAliasing => &["CWE-345", "CWE-290"],
             ClockExtensionDepthBranch => &["CWE-682", "CWE-362"],
             RespectedGameTypeSnapshotSwap => &["CWE-345", "CWE-672"],
+            ApkMembershipDesync => &["CWE-347", "CWE-345"],
+            VerifySnapshotBlockCallerTrust => &["CWE-345", "CWE-672"],
+            ChurnStaleStakeDoubleCount => &["CWE-682"],
+            IndexRegistryPopSwapStale => &["CWE-672", "CWE-824"],
+            EjectionRatelimitLiveBase => &["CWE-682", "CWE-840"],
+            ReregisterCooldownBitmapResidue => &["CWE-459", "CWE-841"],
             _ => &[],
         }
     }
