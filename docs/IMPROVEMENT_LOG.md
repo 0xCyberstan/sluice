@@ -514,3 +514,26 @@ Threaded real `contract_id`/`function_id` into `Finding` (serde-skip `Option`, v
   **precision backlog** from a 3-codebase dogfood (`docs/PRECISION_BACKLOG.md` — floating-pragma sub-classing,
   array-length full-body guard scan, upgradeable inheritance-chain `_disableInitializers`, centralization-Info
   suppression, + 2 engine bugs: `contract … layout at N is …` parse recovery, `is_file()` IO guard).
+
+### Round 23 — 3 Uniswap-v4 hook / flash-accounting detectors (worktree agents, CORPUS-VERIFIED)
+Per the corpus-verified build specs (`docs/R23_BUILD_SPECS.md`), built the wave-1 v4 detectors and tuned them
+against the read-only `~/Data/corpus/v4-{core,periphery}` clone — the anti-overfit discipline (real source, not
+just fixtures). Opens the **10th surface: Uniswap v4 (hooks + singleton flash-accounting)**.
+- **V4CallbackMissingPoolManagerAuth (Critical)** — extends `flashloan_callback.rs`: a v4 hook / `unlockCallback`
+  that is external, has a real side-effect (storage write / value-call / PoolManager-mutator — incl. via internal
+  helpers, the ActionsRouter case), and lacks an `onlyPoolManager` / `msg.sender==poolManager` guard. The
+  Cork-Protocol ~$12M (2025-05-28) class. **Fires on the 21 genuine unguarded hooks** in v4-core
+  (SkipCallsTestHook/MockHooks/ActionsRouter), **silent on every safe form** (SafeCallback/onlyPoolManager,
+  inline-require routers, revert stubs, interface) + **0 on all of v4-periphery**.
+- **HookReturnDeltaPermissionGap (High)** — a hook returns a provably-non-zero delta while the matching
+  `*ReturnDelta` bit in `getHookPermissions()` is `false` → the PoolManager silently drops it
+  (`callHookWithReturnDelta`'s `if(!parseReturn) return 0`). Gated on a parseable Permissions literal.
+- **HookPermissionBodyBitmapMismatch (Med/High)** — implemented-vs-declared callback-bitmap diff
+  (impl-without-decl → dead logic; declared-but-stub; declared+revert → bricks the pool); clones the
+  policy-permission-gap two-table topology. Both new hook detectors are correctly **silent on the whole v4-core
+  corpus** (no `getHookPermissions` exists there — grep-confirmed), fixture-proven, and gated on the Permissions
+  literal → no FP-flood on non-hook code.
+- **Result:** +2 → **126 active** (V4Callback extends an existing detector). **685 engine tests** (+14: 4+6+4) +
+  corpus 20/20 + 8/8 + 5 real-hack harnesses + 7 PoC-template tests, 0 warnings. Deferred to a round with a real
+  hook/integrator corpus (per the R23 corpus-reality check): Spec 3 V4PayerSpoofSettleDrain + the live-positive
+  validation of the two bitmap detectors. _done._

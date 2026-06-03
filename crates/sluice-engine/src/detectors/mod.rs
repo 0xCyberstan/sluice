@@ -159,6 +159,9 @@ pub mod deprecated_eth_send;
 pub mod shadowed_state_var;
 pub mod encodepacked_collision;
 pub mod locked_ether;
+// Round 23 — Uniswap v4 hook permission / delta-accounting classes.
+pub mod hook_return_delta_permission_gap;
+pub mod hook_permission_body_bitmap_mismatch;
 
 use crate::detector::Detector;
 
@@ -328,6 +331,9 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(shadowed_state_var::ShadowedStateVarDetector),
         Box::new(encodepacked_collision::EncodePackedCollisionDetector),
         Box::new(locked_ether::LockedEtherDetector),
+        // Round 23 — Uniswap v4 hook permission / delta-accounting classes.
+        Box::new(hook_return_delta_permission_gap::HookReturnDeltaPermissionGapDetector),
+        Box::new(hook_permission_body_bitmap_mismatch::HookPermissionBodyBitmapMismatchDetector),
     ]
 }
 
