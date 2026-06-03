@@ -52,3 +52,21 @@ positives** across v4-core/v4-periphery/account-abstraction/gte-perps/eigenlayer
   R5 `layout at` / R24 comment-skip recovery — offset-preserving).
 
 _No crashes on any of the 7 corpora; scan times 0.02–0.30s per repo. Total 132 detectors, all corpora traversed._
+
+## R28 real-project benchmark — Aave v3 (`aave-dao/aave-v3-origin`, never tuned against)
+172 source files scanned in **1.56s / 29 MB RSS**, 0 crashes → 192 findings (1 Crit / 4 High / 19 Med / 22 Low /
+146 Info[floating-pragma]). Aave v3 is battle-tested, so the Crit/High are a pure precision test. Triage:
+- **3× `oracle-manipulation` (High) = CONFIRMED FALSE POSITIVES** — `ERC4626StataTokenUpgradeable.{depositATokens,
+  depositWithPermit,maxRedeem}` read the **user's own balance** (`balanceOf(_msgSender())` to cap a deposit,
+  `balanceOf(owner)` to cap a redeem), NOT a price/reserve. **FIX (high-value, concrete):** `oracle-manipulation`
+  must NOT treat `balanceOf(<msg.sender | a user/owner param>)` as price-like — only `balanceOf(address(this))` or a
+  read off a pool/pair/oracle handle is a manipulable spot value. This is the single clearest precision win surfaced.
+- **1× `upgradeable` (Critical)** — `InitializableUpgradeabilityProxy.initialize` delegatecalls a non-immutable
+  `_logic`. Defensible (Parity-class shape) but **over-severity** on the canonical OZ proxy (safe given atomic
+  one-shot init). Downgrade standard-proxy delegatecall-to-init-param below Critical.
+- **1× `reentrancy` (High)** — `RewardsController._claimRewards`: claim-then-transfer via a configured
+  `ITransferStrategyBase`. Likely safe (audited, trusted strategy) but a defensible review flag.
+**Verdict:** 0 real bugs (expected on Aave v3), 3 clear FPs + 2 over-rated-but-defensible flags. Confirms the tool is
+fast/clean at scale and flags the right CATEGORIES (oracle/proxy/reentrancy/oracle-staleness in a lending protocol),
+but top-severity precision on untuned real code needs the core-detector pass above — esp. the `balanceOf(self/user)`
+oracle-manipulation fix.
