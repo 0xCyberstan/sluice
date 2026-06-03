@@ -1,8 +1,10 @@
 # Sluice Detector Catalog
 
-This catalog documents every detector registered in `builtin_detectors()`
-(`crates/sluice-engine/src/detectors/mod.rs`). There are **18** registered
-detectors. Each row is one registered detector. Categories, CWE/SWC references,
+This catalog documents detectors registered in `builtin_detectors()`
+(`crates/sluice-engine/src/detectors/mod.rs`). There are **124** registered
+detectors as of R21; the table below documents the original core set, while the
+full, always-current registry is enumerated by `sluice detectors`.
+Each row is one detector. Categories, CWE/SWC references,
 and the three analysis dimensions (`value-flow`, `invariant`, `frontier`) are
 defined in `crates/sluice-findings/src/finding.rs`.
 

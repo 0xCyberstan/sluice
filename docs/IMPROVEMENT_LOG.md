@@ -149,6 +149,14 @@ zero crashes; the bug surface is **precision/labeling**, plus one parser gap). T
   carries 0.5 so 45×0.75=33.75 lands as Medium). Totals: olympus 97→92, eigenlayer 26→23, pendle 96→81,
   etherfi 134→126. _done._
 
+### Round 6 — core: per-call-site trust map + return-value provenance + R5-FP precision
+Driven by the R5 dogfood FP sources. WF1: signed-cast no longer matches return-tuple signature lines / width-safe
+casts and inherits integer-issues' width-bit + clamp + guard suppression. WF2: upgradeable self-delegatecall
+de-"Parity"'d, DoS excludes fault-tolerant `try*`/read-only multicalls, + new `uninitialized-storage-pointer`
+detector. WF3: centralization reserves Low+ for genuine fund-sinks (Info otherwise). Core: a per-call-site trust
+classifier (constant/immutable/param/storage/return-derived) + external-return provenance, shared by
+signed-cast/gas-griefing/reentrancy/untrusted-call-target/upgradeable. _done._
+
 ### Round 7 — FIRST novel-bug R&D round (per the long-horizon roadmap, thrust #3)
 Build detectors for the under-publicised classes WF3's R6 research surfaced on Symbiotic Core (restaking), each
 with a reconstructed fixture + harness entry. Three workflows:
@@ -473,62 +481,12 @@ R21 builds the ~7 table-stakes baseline classes the novel rounds skipped: missin
 (SWC-103), strict-balance-equality (SWC-132), deprecated-eth-send (.transfer/.send 2300-gas), shadowed-state-var (SWC-119),
 encodepacked-collision (SWC-133), locked-ether. NOT building: SWC-118/129/130/131/135/136 legacy-lints + supply-chain.
 
-_(Doc-hygiene: this log accumulated some stale R10-era duplication below from worktree copy-backs of the log file; the
-authoritative per-round record is lines through here. Cleanup pending; does not affect code.)_
-  WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
-  eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
-  migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector
-  now costs `use super::prelude::*;` + a `report!{}` block instead of ~120 lines of re-derived helpers. (Note: the
-  worktree agent's copy-back was mangled by a file-watcher — main got a broken `pub use` prelude + unmigrated detectors;
-  recovered by pulling the 5 correct files from the worktree.)
+- **Result:** +7 → **124 active** — the canonical SWC/OWASP baseline, completing the taxonomy. Clean build (0
+  warnings); **671 unit tests + corpus 20/20 + 8/8 + all 5 real-hack harnesses (r1–r4) green**. Dogfood on
+  freshly-cloned Uniswap v4-core/v4-periphery (never-scanned real code): floating-pragma fires broadly (45+58 Info,
+  correct on `^0.8.x` libraries); strict-balance-equality on the genuine `assert(balanceOf(POOL_MANAGER)==totalSupply())`
+  (Low); locked-ether on the genuine payable-no-egress mixins Permit2Forwarder/UnorderedNonce (Low, precise message);
+  the other four correctly silent on v4's safe forms. No FP-flood, right severities; each lint's `fires_on_*` unit test
+  proves it fires on the genuine shape. Sluice now spans the full SWC baseline AND every high-loss logic class. _done._
 
-#### R10 WF3 outputs (done)
-**Full 64-detector dogfood baseline** (current binary, 6 repos): all exit 0, no crashes; 657 .sol scanned in 0.06–0.45s
-each, 11–37 MB RSS; 413 findings total (2 Crit / 35 High / 213 Med / 103 Low / 60 Info); 50/64 detectors fired.
-Noisiest (precision targets for a future round): centralization-risk 94, reentrancy 46, integer-issues 27,
-upgradeable 24, access-control 19, unchecked-return 17, denial-of-service 16, missing-zero-check 14, price-bounds 14.
-
-**R11 candidate backlog (mined from Karak V2 — all map to real Karak/C4 audit findings; non-overlapping with the 64):**
-1. shares-escrowed-queue-repriced-live — request escrows SHARE units, claim repays at LIVE price (slash-leak); Vault.sol:137/168. (≠ snapshot-redeem-asymmetry: no clamp/reserve.)
-2. percent-slash-on-live-aggregate — finalize computes `storedPct × totalAssets()` at settle, not a request-time snapshot; SlasherLib.sol:81/133. (≠ epoch-boundary-staleness: no `*At` accessor exists.)
-3. hash-gated-struct-replay — `mapping[keccak256(abi.encode(s))]` authenticates the tuple but unhashed/derived fields then index MUTATED live state (K-C-01 revival); SlasherLib.sol:116-137.
-4. clamp-then-recompute-burn-sink — residual after a clamp is routed to a burn/void sink (asymmetric value destruction).
-5. beacon-proof-admission-only — a credential/prefix proof checked only at admission, never re-validated on the value-update path.
-6. eip4788-caller-timestamp — external/beacon root resolved from a caller-controlled timestamp with no recency floor.
-7. zero-margin-timing-window — finalize/veto window constants with no margin → same-block race between competing finalizers.
-- **Result:** 50 detectors; corpus 20/20 recall + 8/8 clean; **R4 hacks now 8/8** (TempleDAO caught by the
-  new `untrusted-call-target` detector — the R4 MISS, closed). 153 tests, 0 warnings. Delivered:
-  - **WF1 cast precision:** integer-issues width-bit suppression (`uintN(address)`/`uintN(bytesM)`/narrower-int
-    operand), `min()`-clamp, division-down, `type(uintN).max`-dominating-guard, unchecked-nonce — **etherfi
-    integer-issues 48→31, eigenlayer 8→0** (measured). signed-cast width-safety added.
-  - **WF2 reentrancy precision:** read-only-reentrancy now requires a real external call on the path (the etherfi
-    zero-call getter FP); classic CEI requires a write STRICTLY after the call (write-before-call no longer fires);
-    trusted (immutable/constant) callee downgrade — **olympus reentrancy 14→11** (measured).
-  - **WF3 labeling/trust:** centralization fund-flow split (soft "parameter setter" title), erc721-vs-erc20 type
-    exclusion (**etherfi erc721 3→0**), gas-griefing constant/immutable-callee exclusion (**eigenlayer 3→0**),
-    selector EIP-712 `\x19\x01` allowlist + length-pinned-arg rule (**eigenlayer selector 3→0**).
-  - **Core (direct):** new **untrusted-call-target** detector; **`layout at` parser recovery** (offset-preserving
-    blank — Solidity 0.8.29 files no longer silently dropped); **guard-ordering root fix** — a `require(...)`/`assert(...)`
-    now claims its order before its condition is walked, so an inline `require(msg.sender == authority.governor())`
-    (call in the condition) is recognized as access control instead of being dropped past the leading-guard cutoff.
-    This lifts `has_access_control` accuracy for EVERY detector (olympus access-control 8→6).
-  - Dogfood re-measure (olympus/eigenlayer/pendle/etherfi): all exit 0, zero crashes. eigenlayer 32→26, etherfi
-    143→134. **olympus 83→97 is correct, not a regression** — the guard-fix exposed ~21 genuinely privileged
-    authority-guarded fund-movers that the ordering bug had hidden from centralization. _done._
-
-### Round 6 — core: per-call-site trust map + return-value provenance
-Driven by the R5 dogfood re-measure (the two real FP sources it surfaced). Three workflows:
-- **WF1 — signed-cast & integer residual:** signed-cast fires on function **return-tuple signature lines**
-  (`(int256 _netSyIn, int256 _netSyFee, …)` — pendle calcSyIn/calcSyOut, 6 FPs) and on width-safe / constant
-  casts (`uint256(ONE_18)`, `uint16(year-1)`) — fix the location/false-match (only real `TypeCast` expression
-  spans, never a return-param list) and port integer-issues' width-bit + clamp + guard suppression into signed-cast;
-  also drive etherfi integer-issues 31→lower. Regression fixtures from the pendle/eigenlayer cases.
-- **WF2 — upgradeable & DoS context (untouched in R5):** upgradeable self-delegatecall (`address(this).delegatecall`
-  / `_delegateToSelf` — pendle, 3+ FPs) must not carry the foreign-takeover "Parity" message; cap `simulate()`-then-
-  `revert` entrypoints below Critical; DoS must not fire on fault-tolerant `try*`/read-only multicalls (pendle
-  Multicall2). + new detector: **uninitialized-storage-pointer** or **divide-before-multiply** (precision-loss).
-- **WF3 — centralization severity & dogfood:** suppress initializers/`setVault`-style from centralization; reserve
-  Low+ for genuine fund-sinks, Info for the rest (olympus 30 → tighter); re-scan all four targets + a fresh codebase
-  (symbiotic / karak / renzo) to measure and to find new FP classes.
-- Core: a per-call-site trust classifier (constant/immutable/param/storage/return-derived) + first-class external-
-  return provenance, shared by signed-cast, gas-griefing, reentrancy, untrusted-call-target, upgradeable. _status: pending._
+_(Doc-hygiene: stale R10/R11 duplication + the out-of-order pending-R6 draft removed below; authoritative record is Rounds 1-20 + R21 above.)_

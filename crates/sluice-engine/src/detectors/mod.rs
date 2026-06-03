@@ -148,6 +148,17 @@ pub mod wall_capacity_regen_desync;
 pub mod module_upgrade_state_drop;
 pub mod lifecycle_role_revoke_gap;
 pub mod backing_spot_inflation;
+// Round 21 — canonical-baseline lints (SWC table-stakes; fire broadly at Low/Info,
+// precise on the safe form). WF1: missing-event-emit, floating-pragma, strict-balance-
+// equality (SWC-132), deprecated-eth-send (.transfer/.send 2300 stipend). WF2: shadowed-
+// state-var (SWC-119), encodepacked-collision (SWC-133), locked-ether (payable, no egress).
+pub mod missing_event_emit;
+pub mod floating_pragma;
+pub mod strict_balance_equality;
+pub mod deprecated_eth_send;
+pub mod shadowed_state_var;
+pub mod encodepacked_collision;
+pub mod locked_ether;
 
 use crate::detector::Detector;
 
@@ -309,6 +320,14 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(module_upgrade_state_drop::ModuleUpgradeStateDropDetector),
         Box::new(lifecycle_role_revoke_gap::LifecycleRoleRevokeGapDetector),
         Box::new(backing_spot_inflation::BackingSpotInflationDetector),
+        // Round 21 — canonical-baseline lints (SWC table-stakes).
+        Box::new(missing_event_emit::MissingEventEmitDetector),
+        Box::new(floating_pragma::FloatingPragmaDetector),
+        Box::new(strict_balance_equality::StrictBalanceEqualityDetector),
+        Box::new(deprecated_eth_send::DeprecatedEthSendDetector),
+        Box::new(shadowed_state_var::ShadowedStateVarDetector),
+        Box::new(encodepacked_collision::EncodePackedCollisionDetector),
+        Box::new(locked_ether::LockedEtherDetector),
     ]
 }
 
