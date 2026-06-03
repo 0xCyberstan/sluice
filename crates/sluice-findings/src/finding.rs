@@ -138,6 +138,11 @@ pub enum Category {
     VoteWeightCheckpoint,
     FeegrowthAccounting,
     ParamUpdateRetroactive,
+    // ---- Round 15: protocol-agnostic primitive classes (matchable broadly) ----
+    TstoreGuardMisscope,
+    GapNotShrunk,
+    BatchVerifySkip,
+    UninitializedStoragePointer,
     Other,
 }
 
@@ -245,6 +250,10 @@ impl Category {
             VoteWeightCheckpoint => "vote-weight-checkpoint",
             FeegrowthAccounting => "feegrowth-accounting",
             ParamUpdateRetroactive => "param-update-retroactive",
+            TstoreGuardMisscope => "tstore-guard-misscope",
+            GapNotShrunk => "gap-not-shrunk",
+            BatchVerifySkip => "batch-verify-skip",
+            UninitializedStoragePointer => "uninitialized-storage-pointer",
             Other => "other",
         }
     }
@@ -334,6 +343,10 @@ impl Category {
             VoteWeightCheckpoint => &["CWE-682", "CWE-345"],
             FeegrowthAccounting => &["CWE-682"],
             ParamUpdateRetroactive => &["CWE-362", "CWE-840"],
+            TstoreGuardMisscope => &["SWC-107", "CWE-459"],
+            GapNotShrunk => &["SWC-112", "CWE-1108"],
+            BatchVerifySkip => &["CWE-347"],
+            UninitializedStoragePointer => &["SWC-109", "CWE-824"],
             _ => &[],
         }
     }
