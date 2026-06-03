@@ -61,6 +61,13 @@ pub mod signed_cast;
 pub mod untrusted_call_target;
 // Round 6 (perpetual loop) detectors.
 pub mod erc721_mint_reentrancy;
+// Round 7 (perpetual loop) — novel / under-publicised classes (restaking, checkpoints, slashing).
+pub mod checkpoint_hint_trust;
+pub mod epoch_boundary_staleness;
+pub mod internal_share_pricing_rounding;
+pub mod pooled_shares_reprice_desync;
+pub mod proportional_split_residual;
+pub mod silenced_privileged_callback;
 
 use crate::detector::Detector;
 
@@ -126,6 +133,22 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(untrusted_call_target::UntrustedCallTargetDetector),
         // Round 6 (perpetual loop).
         Box::new(erc721_mint_reentrancy::Erc721MintReentrancyDetector),
+        // Round 7 (perpetual loop) — novel classes. Shipped after the R7 dogfood vs
+        // REAL Symbiotic Core + the 4 prior codebases. `epoch-boundary-staleness` fires
+        // on the real Vault epoch ops (+ a few low-cost hits elsewhere); the other three
+        // are tight (0 FPs on all 5 codebases). R8 will tune them to also fire on the
+        // real Vault.onSlash / withdrawal-queue / pop(call) shapes (currently fixture-only).
+        Box::new(epoch_boundary_staleness::EpochBoundaryStalenessDetector),
+        Box::new(proportional_split_residual::ProportionalSplitResidualDetector),
+        Box::new(pooled_shares_reprice_desync::PooledSharesRepriceDesyncDetector),
+        Box::new(silenced_privileged_callback::SilencedPrivilegedCallbackDetector),
+        // QUARANTINED pending R8 real-code tuning (the R7 dogfood showed these regress
+        // precision): internal-share-pricing-rounding floods on every internal `a*b/c`
+        // (52 FPs across the 4 codebases — reward-index / points / penalty-ratio math),
+        // and checkpoint-hint-trust over-fires on cert verifiers AND misses the real
+        // Checkpoints.sol it targets. R8 tightens both, then re-activates.
+        // Box::new(internal_share_pricing_rounding::InternalSharePricingRoundingDetector),
+        // Box::new(checkpoint_hint_trust::CheckpointHintTrustDetector),
     ]
 }
 

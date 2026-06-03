@@ -168,6 +168,35 @@ with a reconstructed fixture + harness entry. Three workflows:
 - Core: shared SCIR primitives the novel detectors need (ordered effect stream already exists; add a caller-supplied-
   index/`hint` taint query + a "pooled balance vs per-key share supply" co-update query) — a down payment on the
   roadmap's architecture/extensibility thrust. _status: pending._
+- **Result:** 6 novel detectors authored + self-tested (fire on fixture, silent on SAFE) + 6 reconstructed fixtures.
+  Dogfood vs REAL Symbiotic Core + the 4 prior codebases was the deciding gate and it was honest: **4 shipped, 2
+  quarantined.** Shipped (55 active detectors): `epoch-boundary-staleness` (fires on real Vault deposit/withdraw/redeem
+  + a few low-cost hits; net +~3 FPs on prior codebases), `proportional-split-residual`, `pooled-shares-reprice-desync`,
+  `silenced-privileged-callback` (0 FPs everywhere). Quarantined (kept compiled, `fires` self-tests `#[ignore]`):
+  `internal-share-pricing-rounding` (flooded — 52 FPs on every internal `a*b/c`: reward-index/points/penalty math) and
+  `checkpoint-hint-trust` (over-fires on cert verifiers AND misses the real `Checkpoints.sol`). **Key lesson: novel
+  detectors must be tuned against REAL target code, not minimal fixtures** — the 3 "tight" shipped ones fire 0 on the
+  real Vault.onSlash/withdrawal-queue/pop(call) shapes (overfit to fixtures). 212 tests + 2 ignored, 0 warnings,
+  corpus 20/20 + 8/8. _done._
+
+### Round 8 — novel-detector REAL-CODE tuning (via parallel worktree-isolated agents)
+Per [[feedback-agent-iteration]]: each agent runs in its OWN git worktree (isolation: "worktree") and does the FULL
+loop itself — edit → `cargo build` → `./target/release/sluice scan` the real Symbiotic source + the 4 prior codebases →
+iterate until its detector fires on the TRUE target with ~0 FPs → run the gate → copy ONLY its detector file back to the
+main repo (the parent wires mod.rs registration once). Targets (real Symbiotic Core source under
+symbiotic-audit/symbiotic-core/src/contracts):
+- **WF1 (re-activate the 2 quarantined):** tighten `internal-share-pricing-rounding` to fire ONLY on genuine share/stake
+  pricing that yields a user-withdrawable amount (exclude reward-index/points/penalty/ratio — kill the 52 FPs), and
+  `checkpoint-hint-trust` to match the real `Checkpoints.upperLookupRecent(self,key,hint)` (fire there, drop the cert-
+  verifier FPs). Re-activate each only if it fires on its real target with ~0 FPs on the 4 codebases.
+- **WF2 (make the 3 fixture-only detectors fire on real code):** `proportional-split-residual` on real `Vault.onSlash`,
+  `pooled-shares-reprice-desync` on the real withdrawal-queue (`withdrawals[epoch]` mutated, `withdrawalShares[epoch]`
+  stale), `silenced-privileged-callback` on real `BaseDelegator.onSlash`/`BaseSlasher._burnerOnSlash` `pop(call(...))`;
+  and cut `epoch-boundary-staleness`'s prior-codebase FPs (olympus rebase/unstake, eigenlayer sweep).
+- **WF3 (research + full dogfood):** fresh novel-bug research on a NEW target (karak/renzo) for the R9 backlog, + a full
+  dogfood re-measure of the tuned detector set.
+- Core: shared SCIR primitives (caller-supplied-`hint` taint query; pooled-assets-vs-per-key-shares co-update query) so
+  these detectors stop being one-off string matching — the architecture/extensibility thrust. _status: pending._
 - **Result:** 50 detectors; corpus 20/20 recall + 8/8 clean; **R4 hacks now 8/8** (TempleDAO caught by the
   new `untrusted-call-target` detector — the R4 MISS, closed). 153 tests, 0 warnings. Delivered:
   - **WF1 cast precision:** integer-issues width-bit suppression (`uintN(address)`/`uintN(bytesM)`/narrower-int

@@ -93,6 +93,13 @@ pub enum Category {
     SignedCast,
     UntrustedCallTarget,
     MintCallbackReentrancy,
+    // ---- Round 7: novel / under-publicised classes (restaking, checkpoints, slashing) ----
+    CheckpointHintTrust,
+    EpochBoundaryStaleness,
+    ProportionalSplitResidual,
+    PooledSharesRepriceDesync,
+    InternalSharePricingRounding,
+    SilencedPrivilegedCallback,
     Other,
 }
 
@@ -161,6 +168,12 @@ impl Category {
             SignedCast => "signed-cast",
             UntrustedCallTarget => "untrusted-call-target",
             MintCallbackReentrancy => "erc721-mint-reentrancy",
+            CheckpointHintTrust => "checkpoint-hint-trust",
+            EpochBoundaryStaleness => "epoch-boundary-staleness",
+            ProportionalSplitResidual => "proportional-split-residual",
+            PooledSharesRepriceDesync => "pooled-shares-reprice-desync",
+            InternalSharePricingRounding => "internal-share-pricing-rounding",
+            SilencedPrivilegedCallback => "silenced-privileged-callback",
             Other => "other",
         }
     }
@@ -211,6 +224,12 @@ impl Category {
             SignedCast => &["CWE-196", "CWE-681"],
             UntrustedCallTarget => &["CWE-345", "CWE-20", "CWE-863"],
             MintCallbackReentrancy => &["SWC-107", "CWE-841"],
+            CheckpointHintTrust => &["CWE-20", "CWE-345"],
+            EpochBoundaryStaleness => &["CWE-672", "CWE-367"],
+            ProportionalSplitResidual => &["CWE-682", "CWE-191"],
+            PooledSharesRepriceDesync => &["CWE-682", "CWE-841"],
+            InternalSharePricingRounding => &["CWE-682"],
+            SilencedPrivilegedCallback => &["CWE-252", "CWE-754"],
             _ => &[],
         }
     }
