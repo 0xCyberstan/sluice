@@ -372,6 +372,33 @@ Bridge-verification is the highest-payout exploit class in DeFi (Wormhole $325M,
 7. **l1-to-l2-alias-trust-on-eoa-shortcut** — privileged L2 handler trusts an aliased L1 sender with the alias applied conditionally.
 8. **unset-peer-eid-default-trust** — OApp/OFT receive treats an unconfigured peer (bytes32(0)) / unconfigured-EID as trusted.
 R16 = the highest-payout round yet (bridges); items 1–3 have concrete production targets. Full signatures in the R15 WF3 transcript.
+
+### Round 16 — 6 L2/cross-chain bridge detectors — opens the 8th domain + the 100-DETECTOR milestone
+- **Result:** +6 → **100 active detectors** (56 novel classes across 8 DeFi domains; L2/bridge infra = the #1 DeFi loss
+  category). Authored by 6 worktree agents via the prelude. Independent dogfood: **all 6 fire on real production targets** —
+  OP Stack 2 (interop-no-source-binding on SuperchainETHBridge, prove-finalize-game-substitution on OptimismPortal2),
+  LayerZero 6 (dvn-quorum-conflation = the Wormhole-class $325M ULN M-of-N verification shape; unset-peer-default-trust ×3;
+  lzreceive-failure-silent; oft-decimal-supply-leak); **0 R16 FPs on all 5 non-bridge codebases** (olympus 92 / pendle 107 /
+  etherfi 126 / ethena 31 / symbiotic 41 — unchanged). 511 tests, 0 warnings, corpus 20/20 + 8/8. (Cleaned a stray
+  `scratch_dump` debug module an R16 worktree agent had copied into main.) Sluice now spans restaking, LST, cross-chain,
+  synthetic-dollar, yield-tokenization, lending, governance, and L2/bridge infra — the top DeFi exploit-impact categories.
+
+#### R17 backlog (R16 WF3 — OP-Stack fault-proof classes + next-domain corpus assessment)
+PART A — OP fault-proof (real targets in optimism/.../src/dispute + L1; non-overlapping with R16's LayerZero/messaging shapes):
+1. **RefundCreditPreVerdict** — a bond/stake credited to a participant on the action that POSTS it, paid out by a later
+   resolve branch gated only on a status/mode flag (REFUND/finalized) WITHOUT a per-claim did-win/counteredBy predicate.
+   `FaultDisputeGame.sol:552,311` + claimCredit `984,1003-1007,1069-1073`. (Suppress: two credit-maps or a mode enum + missing win-predicate.)
+2. **ConditionalSenderAliasing** — L1→L2 sender alias (`±0x1111…`) applied CONDITIONALLY on a code-shape/EOA heuristic
+   (incl. the EIP-7702 delegated-EOA branch) so two senders collide / a contract presents un-aliased. `OptimismPortal2.sol:709-711` + `EOA.sol:9-26`.
+3. **ClockExtensionDepthBranch** — a chess-clock/deadline extended by a depth-branched amount including an externally-mutable
+   `challengePeriod()`, with the resolve-time "expired" gate comparing vs MAX. `FaultDisputeGame.sol:503-522,745`. (loosest — tighten to depth-branch + external-call term.)
+4. **RespectedGameTypeSnapshotSwap** — authorization decides on a FROZEN `wasRespectedGameTypeWhenCreated` snapshot while a
+   Guardian can later swap the live respected type with no re-validation of in-flight games. `FaultDisputeGame.sol:318-319` + `AnchorStateRegistry.sol:153-160,231-236`.
+PART B — corpus availability: **AA/ERC-4337 = NEEDS-CORPUS** (only a Safe `Test4337ModuleAndHandler` mock on disk, no canonical EntryPoint);
+**concentrated-liquidity AMM = NEEDS-CORPUS** (no TickMath/SwapMath/SqrtPriceMath/FullMath on disk). Per the R7 lesson, do NOT build either
+fixture-only — add a public EntryPoint/UniswapV3-core (or v4) repo first. R17 should build PART A (real OP targets) + tune any R16 dormant detectors.
+
+_NOTE: an R16 worktree agent left a stray debug `detectors/scratch_dump.rs` + `pub mod scratch_dump;` in main mod.rs — DELETE both at R16 integration._
   WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
   eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
   migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector

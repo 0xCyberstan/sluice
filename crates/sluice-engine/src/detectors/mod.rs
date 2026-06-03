@@ -117,6 +117,16 @@ pub mod feegrowth_accounting;
 pub mod tstore_guard_misscope;
 pub mod batch_verify_skip;
 pub mod uninitialized_storage_pointer;
+// Round 16 — L2 / cross-chain infrastructure (LayerZero OApp).
+pub mod unset_peer_default_trust;
+// Round 16 — bridge M-of-N verification (Wormhole / LayerZero ReceiveUlnBase).
+pub mod dvn_quorum_conflation;
+// Round 16 — interop cross-domain source-binding (Optimism SuperchainETHBridge).
+pub mod interop_no_source_binding;
+// Round 16 — remaining bridge classes (OptimismPortal2 + LayerZero OFT/Endpoint).
+pub mod prove_finalize_game_substitution;
+pub mod lzreceive_failure_silent;
+pub mod oft_decimal_supply_leak;
 
 use crate::detector::Detector;
 
@@ -245,6 +255,16 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(tstore_guard_misscope::TstoreGuardMisscopeDetector),
         Box::new(batch_verify_skip::BatchVerifySkipDetector),
         Box::new(uninitialized_storage_pointer::UninitializedStoragePointerDetector),
+        // Round 16 — LayerZero OApp unset-peer default-trust.
+        Box::new(unset_peer_default_trust::UnsetPeerDefaultTrustDetector),
+        // Round 16 — bridge M-of-N verification (DVN quorum conflation).
+        Box::new(dvn_quorum_conflation::DvnQuorumConflationDetector),
+        // Round 16 — interop cross-domain source-binding (SuperchainETHBridge.relayETH).
+        Box::new(interop_no_source_binding::InteropNoSourceBindingDetector),
+        // Round 16 — remaining bridge classes.
+        Box::new(prove_finalize_game_substitution::ProveFinalizeGameSubstitutionDetector),
+        Box::new(lzreceive_failure_silent::LzReceiveFailureSilentDetector),
+        Box::new(oft_decimal_supply_leak::OftDecimalSupplyLeakDetector),
     ]
 }
 
