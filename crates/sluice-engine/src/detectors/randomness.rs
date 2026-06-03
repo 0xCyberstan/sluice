@@ -42,7 +42,7 @@ impl Detector for RandomnessDetector {
             if !f.has_body {
                 continue;
             }
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
 
             // FP suppression: a proper randomness source is in use. Applies to
             // both branches — VRF/commit-reveal designs legitimately read block

@@ -146,7 +146,7 @@ impl Detector for UncheckedAbiDecodeDetector {
 /// source (mirrors the signature detector's `span_text` approach): we look for
 /// `.length` adjacent to a comparison operator anywhere in the body.
 fn validates_bytes_length(cx: &AnalysisContext, f: &Function) -> bool {
-    let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+    let src = cx.source_text(f.span);
     // Find every occurrence of ".length" and check whether a comparison operator
     // sits nearby (either side), i.e. the length participates in a bound check.
     let bytes = src.as_bytes();

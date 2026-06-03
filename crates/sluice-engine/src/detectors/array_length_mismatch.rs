@@ -84,7 +84,7 @@ impl Detector for ArrayLengthMismatchDetector {
 
             // (3) FP suppression: a length-equality guard (or a LengthMismatch
             //     revert) is present in the source.
-            if source_requires_equal_lengths(cx.scir.span_text(f.span)) {
+            if source_requires_equal_lengths(&cx.source_text(f.span)) {
                 continue;
             }
 

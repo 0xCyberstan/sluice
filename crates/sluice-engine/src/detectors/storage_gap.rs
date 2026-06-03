@@ -112,8 +112,8 @@ fn is_upgradeable_like(cx: &AnalysisContext, c: &Contract) -> bool {
         .any(|f| cx.is_initializer(f) || f.name.to_ascii_lowercase().contains("initialize"))
 }
 
-fn contract_source<'a>(cx: &'a AnalysisContext, c: &Contract) -> &'a str {
-    cx.scir.span_text(c.span)
+fn contract_source(cx: &AnalysisContext, c: &Contract) -> String {
+    cx.source_text(c.span)
 }
 
 #[cfg(test)]

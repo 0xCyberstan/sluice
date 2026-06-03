@@ -82,7 +82,7 @@ impl Detector for PriceBoundsDetector {
                 continue;
             }
 
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
 
             // Must actually read a Chainlink-style robust feed.
             let uses_feed = src.contains("latestrounddata")
@@ -101,7 +101,7 @@ impl Detector for PriceBoundsDetector {
                 continue;
             }
             if let Some(c) = cx.contract_of(f.id) {
-                let csrc = cx.scir.span_text(c.span).to_ascii_lowercase();
+                let csrc = cx.source_text(c.span);
                 if has_marker(&csrc) {
                     continue;
                 }

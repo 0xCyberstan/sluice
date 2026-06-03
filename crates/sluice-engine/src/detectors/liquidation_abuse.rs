@@ -124,7 +124,7 @@ impl Detector for LiquidationAbuseDetector {
                 continue;
             }
 
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
 
             // (B) and it must apply a liquidation-incentive / close-factor
             //     multiplier to the seize math — that is the quantity that, left

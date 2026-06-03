@@ -125,7 +125,7 @@ impl Detector for GovernanceTimelockDetector {
                 continue;
             }
             // Scan the contract source once for an in-contract timelock pattern.
-            let src_lc = cx.scir.span_text(contract.span).to_ascii_lowercase();
+            let src_lc = cx.source_text(contract.span);
             if has_timelock_evidence(&src_lc) {
                 continue;
             }

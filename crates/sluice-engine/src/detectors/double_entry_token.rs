@@ -260,7 +260,7 @@ fn excludes_main_token(cx: &AnalysisContext, f: &Function, token: &str) -> bool 
 
     // (2) Textual fallback: the source plainly rejects sweeping the core token
     //     (covers custom-error reverts and phrasings the structural pass misses).
-    let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+    let src = cx.source_text(f.span);
     let mentions_core = name_is_core_asset(&src) || src.contains("underlying") || src.contains("reserve");
     let rejects = src.contains("cannot sweep")
         || src.contains("can not sweep")

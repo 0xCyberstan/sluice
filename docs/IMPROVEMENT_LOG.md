@@ -76,4 +76,41 @@ cross-contract linking → path-sensitivity → performance/caching → PoC comp
 - Validation: +8 hacks (Deus, Saddle, Sturdy2, UwU, Prisma, JimboLong, Gamma, KyberSwap).
 - Dogfood: re-scan olympus-contracts/eigenlayer/pendle to confirm, + a fresh target.
 - Core: route all keyword-suppression detectors (signature/randomness/price_bounds/twap/oracle/governance/...) through cx.source_text so comments never trip suppression.
-- _status: launched._
+- **Result:** 49 detectors; corpus 20/20 recall + 8/8 clean; 42 hack fixtures across 5 harnesses, R4 caught 7/8
+  (Orion/DEUS/Saddle/KyberSwap/Gamma/Jimbo/Midas; **TempleDAO MISS** — see R5). 108 tests, 0 warnings.
+  Core delivered: **27 keyword-suppression sites** migrated from raw `span_text(...).to_ascii_lowercase()` to
+  comment-stripped `cx.source_text(...)` across 25 detectors (signature/randomness/price_bounds/twap/oracle_staleness/
+  governance_timelock/bridge/fee_on_transfer/decimals/integer_issues/liquidation/double_entry/dos/reward_debt/
+  cached_domain/unchecked_abi_decode/rounding/missing_zero/block_number/sig_malleability/flashloan + helper-based
+  storage_gap/vault + case-sensitive upgradeable `_disableInitializers` + sub-span gas_griefing/slippage/erc721/
+  array_length). Sub-expression numeric spans (forced_ether normalize, decimals normalize_num) correctly left raw.
+  4 new detectors authored: l2-sequencer-uptime, lp-slippage, unchecked-erc1155-receiver, signed-cast. _done._
+
+### Round 5 — core: per-call-target trust resolution + parser robustness (`layout at`)
+Driven by the R4 four-codebase dogfood (olympus / eigenlayer / pendle / etherfi — all exit 0, sub-150ms, <36MB,
+zero crashes; the bug surface is **precision/labeling**, plus one parser gap). Three workflows:
+- **WF1 — cast/integer precision** (the noisiest detector: integer-issues fired 48× on etherfi, 8× on eigenlayer, ~7/8 FP):
+  suppress width-safe casts — `uintN(address)` for N≥160, `uintN(bytesM)` for N≥8·M, operand a same-or-narrower
+  fixed-width type (`int128(uint128(uint64))`), `uintN(_min(x, type(uintN).max))`/`Math.min` clamps, `uintN(x / CONST)`
+  division-down, and a dominating `require/if(v > type(uintN).max) revert`. Fix the location bug (finding lands on the
+  function-declaration line, not the cast). Tighten signed-cast the same way. Regression fixtures from the cited cases.
+- **WF2 — reentrancy precision** (olympus 9/14 FP; etherfi F-006/F-013): read-only-reentrancy must require a real
+  external call on the path to the storage read (F-013 fired on a getter with **zero** calls — a true bug); classic CEI
+  must require a storage *write* strictly *after* the external call (F-006 write-precedes-call, F-046 `executed=true`
+  set first); down-rank trusted/immutable/owner-set callees (distributor/treasury/veFXS); suppress when no post-call
+  write. Regression fixtures: olympus harvest pattern, etherfi getter, governor execute.
+- **WF3 — labeling/trust precision + new detector + parser:** (a) centralization-risk: require an actual fund-flow
+  (transfer/`call{value}`/mint/approval/withdrawal-address reassignment) for the "move user funds" title, else a softer
+  "privileged parameter setter (no timelock)"; down-rank rescue/`recover*`/`sweep*` to a fixed recipient. (b) erc721-safety:
+  exclude explicit `IERC20(...)` casts / `ERC20`-typed handles (etherfi F-110/F-115 were ERC-20 3-arg transfers); route
+  5-arg form to the erc1155 detector. (c) gas-griefing & arbitrary-call: exclude compile-time `constant`/`immutable`
+  address callees (eigenlayer EIP-7002/7251 predeploys). (d) selector-collision: count an arg dynamic only if its static
+  type is string/bytes/dyn-array AND not length-pinned by a preceding `require(x.length==K)`; allowlist the `"\x19\x01"`
+  EIP-712 digest prefix. (e) access-control: recognize inline `require(msg.sender == authority.X())` / `permissions[..][msg.sender]`
+  guards (olympus Treasury.disable FP) and exempt `receive()`/empty fallback. (f) **NEW detector `untrusted-call-target`**:
+  caller-supplied address parameter used as an external **call target** whose return/side-effect drives a balance/state
+  credit with no validation/whitelist — catches the **TempleDAO** $2.3M migrateStake hack (the R4 MISS) → its regression.
+- Core: a per-call-site trust classifier (constant/immutable/param/storage/return-derived) shared by gas-griefing,
+  arbitrary-transfer, reentrancy, and the new untrusted-call-target detector; + a parse-layer pre-pass that strips the
+  Solidity 0.8.29 `contract X layout at <slot> is ...` directive solang 0.3.5 rejects (eigenlayer AllocationManagerView.sol
+  silently dropped). _status: launching._

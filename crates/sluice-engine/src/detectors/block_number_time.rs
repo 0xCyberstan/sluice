@@ -68,7 +68,7 @@ impl Detector for BlockNumberTimeDetector {
                 continue;
             }
 
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
             // Does the surrounding code frame this as a *time/duration* concern?
             // Used both to widen case (c) and to lift confidence slightly.
             let time_context = src_has_time_context(&src);

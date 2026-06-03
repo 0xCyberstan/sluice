@@ -48,7 +48,7 @@ impl Detector for MissingZeroCheckDetector {
             }
 
             // The function's source text, lowercased once, for zero-check suppression.
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
 
             // Walk the body for `<critical_state_var> = <address_param>` assignments.
             // We require the target to be a critical/privileged *state* variable

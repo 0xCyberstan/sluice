@@ -87,6 +87,10 @@ pub enum Category {
     UncheckedAbiDecode,
     HardcodedGasStipend,
     CachedDomainSeparator,
+    SequencerUptime,
+    LpSlippage,
+    Erc1155Safety,
+    SignedCast,
     Other,
 }
 
@@ -149,6 +153,10 @@ impl Category {
             UncheckedAbiDecode => "unchecked-abi-decode",
             HardcodedGasStipend => "hardcoded-gas-stipend",
             CachedDomainSeparator => "cached-domain-separator",
+            SequencerUptime => "l2-sequencer-uptime",
+            LpSlippage => "lp-slippage",
+            Erc1155Safety => "unchecked-erc1155-receiver",
+            SignedCast => "signed-cast",
             Other => "other",
         }
     }
@@ -193,6 +201,10 @@ impl Category {
             UncheckedAbiDecode => &["CWE-20", "SWC-128"],
             HardcodedGasStipend => &["SWC-134"],
             CachedDomainSeparator => &["SWC-117", "CWE-347"],
+            SequencerUptime => &["CWE-672"],
+            LpSlippage => &["CWE-682"],
+            Erc1155Safety => &["CWE-20"],
+            SignedCast => &["CWE-196", "CWE-681"],
             _ => &[],
         }
     }

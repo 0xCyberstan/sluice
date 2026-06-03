@@ -120,8 +120,8 @@ fn is_vault_like(cx: &AnalysisContext, c: &Contract) -> bool {
     has_deposit && has_redeem && has_shares
 }
 
-fn contract_source<'a>(cx: &'a AnalysisContext, c: &Contract) -> &'a str {
-    cx.scir.span_text(c.span)
+fn contract_source(cx: &AnalysisContext, c: &Contract) -> String {
+    cx.source_text(c.span)
 }
 
 /// Detect `(a / b) * c` — division feeding a multiplication.

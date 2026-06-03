@@ -109,7 +109,7 @@ impl Detector for UpgradeableDetector {
             // (`constructor() initializer {}` — an equally valid, common idiom).
             let disables = ctor
                 .map(|f| {
-                    cx.scir.span_text(f.span).contains("_disableInitializers")
+                    cx.source_text(f.span).contains("_disableinitializers")
                         || cx.is_initializer(f)
                         || f.has_modifier_like("initializer")
                 })

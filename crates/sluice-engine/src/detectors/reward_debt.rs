@@ -123,7 +123,7 @@ impl Detector for RewardDebtDetector {
                 // Source-level checks: a settle routine called through a path the
                 // effect summary didn't resolve as an internal call, OR the
                 // function re-baselines `rewardDebt` (the step-4 write) itself.
-                let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+                let src = cx.source_text(f.span);
                 if SETTLE_MARKERS.iter().any(|m| src.contains(m)) {
                     continue;
                 }

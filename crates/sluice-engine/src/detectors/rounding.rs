@@ -147,7 +147,7 @@ fn contains_mul(e: &Expr) -> bool {
 ///   - `mulDivUp` / `mulDivDown` / `ceilDiv` / `floorDiv` helpers,
 ///   - the `+ denominator - 1` (or `+ ... - 1`) ceil-division idiom.
 fn uses_explicit_rounding(cx: &AnalysisContext, f: &Function) -> bool {
-    let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+    let src = cx.source_text(f.span);
     if src.contains("rounding.up")
         || src.contains("rounding.ceil")
         || src.contains("rounding.down")

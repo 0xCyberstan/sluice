@@ -137,13 +137,13 @@ fn uses_decimals(cx: &AnalysisContext, f: &Function, c: &Contract) -> bool {
     {
         return true;
     }
-    let fsrc = cx.scir.span_text(f.span).to_ascii_lowercase();
+    let fsrc = cx.source_text(f.span);
     if fsrc.contains(".decimals(") || fsrc.contains("decimals()") {
         return true;
     }
     // A contract-level decimals read (cached in a state var / set in the
     // constructor) also scales by the real value.
-    let csrc = cx.scir.span_text(c.span).to_ascii_lowercase();
+    let csrc = cx.source_text(c.span);
     csrc.contains(".decimals(") || csrc.contains("decimals()")
 }
 

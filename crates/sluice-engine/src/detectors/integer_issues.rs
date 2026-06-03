@@ -40,7 +40,7 @@ impl Detector for IntegerIssuesDetector {
             // SafeCast-style libraries make truncation revert; if the source
             // leans on them we suppress the downcast/division noise for this
             // function entirely (precision over recall).
-            let src_lc = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src_lc = cx.source_text(f.span);
             let uses_safecast = src_lc.contains("safecast")
                 || src_lc.contains("touint")
                 || src_lc.contains("toint")

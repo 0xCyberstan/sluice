@@ -189,7 +189,7 @@ fn uncapped_calls_in_loops(f: &Function) -> std::collections::HashSet<Span> {
 /// `returndatacopy`), which neutralizes the return-bomb vector. Conservative
 /// substring check on the call's own span.
 fn call_handles_returndata(cx: &AnalysisContext, span: Span) -> bool {
-    let src = cx.scir.span_text(span).to_ascii_lowercase();
+    let src = cx.source_text(span);
     src.contains("returndatasize") || src.contains("returndatacopy")
 }
 

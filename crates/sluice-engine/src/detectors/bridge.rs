@@ -46,7 +46,7 @@ impl Detector for BridgeDetector {
                 continue;
             }
 
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
 
             // ---- (a) Nomad zero-root: validates against a root/store but no zero guard.
             if mentions_root_store(&src) && !has_nonzero_root_guard(&src) {

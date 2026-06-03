@@ -56,7 +56,7 @@ impl Detector for OracleStalenessDetector {
                 continue;
             }
 
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
 
             // Which robust feed accessor(s) does this function call?
             let uses_latest_answer = src.contains("latestanswer");
@@ -74,7 +74,7 @@ impl Detector for OracleStalenessDetector {
                 continue;
             }
             if let Some(c) = cx.contract_of(f.id) {
-                let csrc = cx.scir.span_text(c.span).to_ascii_lowercase();
+                let csrc = cx.source_text(c.span);
                 if has_freshness(&csrc) {
                     continue;
                 }

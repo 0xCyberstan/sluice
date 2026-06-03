@@ -41,7 +41,7 @@ impl Detector for FeeOnTransferDetector {
             }
 
             // 3. Suppress when the function measures the real balance delta.
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
             if measures_balance_delta(&src) {
                 continue;
             }

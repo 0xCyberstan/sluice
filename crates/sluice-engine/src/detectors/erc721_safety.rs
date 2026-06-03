@@ -158,7 +158,7 @@ fn find_nft_pull_in(cx: &AnalysisContext, c: &Contract) -> Option<PullIn> {
     // the token handle's type isn't locally resolvable to an NFT type). Matched on
     // the contract source so an `IERC721`/`ERC721`/`nft` mention counts, while a
     // plainly-ERC20 contract (no such mention) is not pulled in via this path.
-    let contract_is_nfty = source_is_nfty(cx.scir.span_text(c.span));
+    let contract_is_nfty = source_is_nfty(&cx.source_text(c.span));
 
     let mut found: Option<PullIn> = None;
     for f in cx.scir.functions_of(c.id) {

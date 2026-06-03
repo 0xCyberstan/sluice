@@ -68,7 +68,7 @@ impl Detector for TwapManipulationDetector {
                 continue;
             }
 
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
 
             // --- (1) Does this function read a Uniswap-V3-style price at all? ---
             let uses_slot0 = src.contains("slot0");
@@ -110,7 +110,7 @@ impl Detector for TwapManipulationDetector {
                 continue;
             }
             if let Some(c) = cx.contract_of(f.id) {
-                let csrc = cx.scir.span_text(c.span).to_ascii_lowercase();
+                let csrc = cx.source_text(c.span);
                 if has_meaningful_window_constant(&csrc) {
                     continue;
                 }

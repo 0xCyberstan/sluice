@@ -65,7 +65,7 @@ impl Detector for SignatureMalleabilityDetector {
                 continue;
             }
 
-            let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+            let src = cx.source_text(f.span);
             if !src.contains("ecrecover") {
                 continue;
             }

@@ -52,6 +52,11 @@ pub mod decimals_assumption;
 pub mod erc721_safety;
 pub mod hardcoded_gas_stipend;
 pub mod unchecked_abi_decode;
+// Round 4 (perpetual loop) detectors.
+pub mod erc1155_receiver;
+pub mod l2_sequencer;
+pub mod lp_slippage;
+pub mod signed_cast;
 
 use crate::detector::Detector;
 
@@ -108,6 +113,11 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(unchecked_abi_decode::UncheckedAbiDecodeDetector),
         Box::new(hardcoded_gas_stipend::HardcodedGasStipendDetector),
         Box::new(cached_domain_separator::CachedDomainSeparatorDetector),
+        // Round 4 (perpetual loop).
+        Box::new(l2_sequencer::L2SequencerDetector),
+        Box::new(lp_slippage::LpSlippageDetector),
+        Box::new(erc1155_receiver::Erc1155ReceiverDetector),
+        Box::new(signed_cast::SignedCastDetector),
     ]
 }
 

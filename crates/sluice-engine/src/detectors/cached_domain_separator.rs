@@ -206,7 +206,7 @@ fn contract_handles_chainid(cx: &AnalysisContext, c: &sluice_ir::Contract, var: 
         if name_l.contains("builddomainseparator") || name_l == "_domainseparatorv4" {
             return true;
         }
-        let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+        let src = cx.source_text(f.span);
         let rebuilds_separator = src.contains("_builddomainseparator")
             || src.contains("eip712domain")
             // an assignment that recomputes the separator (`sep = keccak256(...)`).
@@ -239,7 +239,7 @@ fn contract_verifies_with_separator(cx: &AnalysisContext, c: &sluice_ir::Contrac
         if !f.has_body {
             continue;
         }
-        let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+        let src = cx.source_text(f.span);
         let is_sig_path = src.contains("ecrecover")
             || src.contains(".recover(")
             || f.name.to_ascii_lowercase().contains("permit");

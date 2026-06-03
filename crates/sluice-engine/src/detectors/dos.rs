@@ -328,7 +328,7 @@ fn storage_growth_in_loop(body: &[Stmt]) -> Option<Span> {
 /// `withdraw`/`claim` idiom as pull-style. Conservative: only suppress when the
 /// source clearly mentions a pull idiom together with a credit write.
 fn uses_pull_payment(cx: &AnalysisContext, f: &Function) -> bool {
-    let src = cx.scir.span_text(f.span).to_ascii_lowercase();
+    let src = cx.source_text(f.span);
     let pull_name = {
         let n = f.name.to_ascii_lowercase();
         n.contains("withdraw") || n.contains("claim")

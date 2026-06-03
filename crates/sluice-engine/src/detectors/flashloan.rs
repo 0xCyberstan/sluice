@@ -158,12 +158,12 @@ fn uses_snapshot_or_timelock(cx: &AnalysisContext, f: &Function, contract: Optio
         "erc20snapshot",
         "timelock",
     ];
-    let fsrc = cx.scir.span_text(f.span).to_ascii_lowercase();
+    let fsrc = cx.source_text(f.span);
     if MARKERS.iter().any(|m| fsrc.contains(m)) {
         return true;
     }
     if let Some(c) = contract {
-        let csrc = cx.scir.span_text(c.span).to_ascii_lowercase();
+        let csrc = cx.source_text(c.span);
         if MARKERS.iter().any(|m| csrc.contains(m)) {
             return true;
         }

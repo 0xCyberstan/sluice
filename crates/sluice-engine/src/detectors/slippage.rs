@@ -223,7 +223,7 @@ fn has_noop_deadline(cx: &AnalysisContext, c: &Call) -> bool {
     // span and to swap-like calls only, so it cannot broaden false positives.
     let span = call_span_hint(c);
     if let Some(sp) = span {
-        let txt = cx.scir.span_text(sp).to_ascii_lowercase().replace(' ', "");
+        let txt = cx.source_text(sp).replace(' ', "");
         if txt.contains("deadline:block.timestamp") || txt.contains("type(uint256).max") || txt.contains("type(uint).max")
         {
             return true;
