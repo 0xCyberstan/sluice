@@ -57,8 +57,11 @@
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
-use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
+use crate::report;
+use sluice_findings::{Category, Dimension, Finding, Severity};
 use sluice_ir::{BinOp, Expr, ExprKind, Function};
+
+use super::prelude::*;
 
 pub struct PooledSharesRepriceDesyncDetector;
 
@@ -123,12 +126,12 @@ impl Detector for PooledSharesRepriceDesyncDetector {
 
                 for pair in &pairs {
                     // The function must write the pooled-assets var of this pair.
-                    if !writes_var(f, &pair.assets_var) {
+                    if !f.effects.writes_var(&pair.assets_var) {
                         continue;
                     }
                     // SUPPRESS the safe co-update: a function that also writes the
                     // paired share-supply var is keeping the two in lockstep.
-                    if writes_var(f, &pair.shares_var) {
+                    if f.effects.writes_var(&pair.shares_var) {
                         continue;
                     }
                     // Don't report a function that *is* a repricing site for this
@@ -139,12 +142,12 @@ impl Detector for PooledSharesRepriceDesyncDetector {
                     }
 
                     let span = assets_write_span(f, &pair.assets_var).unwrap_or(f.span);
-                    let b = FindingBuilder::new(self.id(), Category::PooledSharesRepriceDesync)
-                        .title("Pooled assets mutated without updating paired per-key share supply")
-                        .severity(Severity::Medium)
-                        .confidence(0.5)
-                        .dimension(Dimension::Invariant)
-                        .message(format!(
+                    let b = report!(self, Category::PooledSharesRepriceDesync,
+                        title = "Pooled assets mutated without updating paired per-key share supply",
+                        severity = Severity::Medium,
+                        confidence = 0.5,
+                        dimensions = [Dimension::Invariant],
+                        message = format!(
                             "`{fname}` writes the pooled-asset balance `{assets}` for a key but never \
                              writes the paired per-key share supply `{shares}`. Elsewhere this contract \
                              prices a claim proportionally as `{assets}[k] * shares / {shares}[k]` \
@@ -158,8 +161,8 @@ impl Detector for PooledSharesRepriceDesyncDetector {
                             fname = f.name,
                             assets = pair.assets_var,
                             shares = pair.shares_var,
-                        ))
-                        .recommendation(format!(
+                        ),
+                        recommendation = format!(
                             "Keep the pooled-asset and share-supply mappings in lockstep for the same \
                              key: whenever `{assets}[k]` changes, update `{shares}[k]` correspondingly \
                              (burn/mint shares for the same key, or route a slashing loss through a \
@@ -167,8 +170,9 @@ impl Detector for PooledSharesRepriceDesyncDetector {
                              `{assets}[k] * s / {shares}[k]` stays invariant for existing holders.",
                             assets = pair.assets_var,
                             shares = pair.shares_var,
-                        ));
-                    out.push(cx.finish(b, f.id, span));
+                        ),
+                    );
+                    out.push(finish_at(cx, b, f.id, span));
                     // One finding per writer is enough — a writer that desyncs one
                     // pair is the report; avoid stacking near-duplicate messages.
                     break;
@@ -398,20 +402,6 @@ fn render_key(e: &Expr) -> String {
     } else {
         String::new()
     }
-}
-
-/// Root identifier of an lvalue/member/index chain (`a.b[c]` -> `a`).
-fn root_ident(e: &Expr) -> Option<String> {
-    match &e.kind {
-        ExprKind::Ident(n) => Some(n.clone()),
-        ExprKind::Member { base, .. } | ExprKind::Index { base, .. } => root_ident(base),
-        _ => None,
-    }
-}
-
-/// Does `f` write the state variable `var` (per its effect summary)?
-fn writes_var(f: &Function, var: &str) -> bool {
-    f.effects.storage_writes.iter().any(|w| w.var == var)
 }
 
 /// Span of the first write to `var` (for a precise report location).

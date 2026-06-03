@@ -60,8 +60,11 @@
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
-use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
+use crate::report;
+use sluice_findings::{Category, Dimension, Finding, Severity};
 use sluice_ir::{CallKind, Contract, Function, Span, StmtKind};
+
+use super::prelude::*;
 
 pub struct SilencedPrivilegedCallbackDetector;
 
@@ -137,28 +140,28 @@ impl SilencedPrivilegedCallbackDetector {
         } else {
             ""
         };
-        let b = FindingBuilder::new(self.id(), Category::SilencedPrivilegedCallback)
-            .title("Fire-and-forget privileged callback to a settable hook, then state is finalized regardless")
-            .severity(Severity::Medium)
-            .confidence(0.5)
-            .dimension(Dimension::Frontier)
-            .message(format!(
+        let b = report!(self, Category::SilencedPrivilegedCallback,
+            title = "Fire-and-forget privileged callback to a settable hook, then state is finalized regardless",
+            severity = Severity::Medium,
+            confidence = 0.5,
+            dimensions = [Dimension::Frontier],
+            message = format!(
                 "`{}` makes a fire-and-forget low-level call to `{}` — a settable hook reached through the \
                  mutable state variable `{}` (not `constant`/`immutable`) — {how}.{tail} A hook that silently \
                  reverts, runs out of gas, or no-ops still lets the protocol record the action as completed: the \
                  side-effect (burn / forward / notify) never happened, yet the accounting says it did. This is the \
                  Symbiotic Core `BaseDelegator.onSlash` / `BaseSlasher._burnerOnSlash` swallowed-callback shape.",
                 f.name, hit.target, hit.root,
-            ))
-            .recommendation(
+            ),
+            recommendation =
                 "Capture and check the callback result before finalizing — `(bool ok, ) = hook.call(data); \
                  require(ok);` (or check the returned status word of the assembly `call` instead of `pop`-ing it) — \
                  so a failed hook reverts the whole privileged action instead of being booked as done. If the call \
                  is intentionally best-effort, do not write accounting state or emit a completion event on the \
                  strength of it; record the outcome so off-chain consumers can reconcile, and prefer a fixed \
                  (`immutable`) or vetted callback target.",
-            );
-        cx.finish(b, f.id, hit.span)
+        );
+        finish_at(cx, b, f.id, hit.span)
     }
 }
 
@@ -188,7 +191,7 @@ fn first_silenced_hook_call(f: &Function, contract: &Contract) -> Option<Silence
         .filter(|cs| cs.kind == CallKind::LowLevelCall && !cs.return_checked)
         .find_map(|cs| {
             let root = root_of_target(&cs.target);
-            if !is_settable_hook(contract, root) {
+            if !is_settable_state_var(contract, root) {
                 return None;
             }
             Some(SilencedCall {
@@ -352,7 +355,7 @@ fn resolve_settable_root(contract: &Contract, f: &Function, cx: &AnalysisContext
         return None;
     }
     // (1) direct settable state var.
-    if is_settable_hook(contract, op_root) {
+    if is_settable_state_var(contract, op_root) {
         return Some(op_root.to_string());
     }
     // (2) a local var of this name whose initializer touches a settable state var.
@@ -443,21 +446,6 @@ fn root_of_target(target: &str) -> &str {
         .find(|c: char| c == '.' || c == '[' || c == '(' || c.is_whitespace())
         .unwrap_or(t.len());
     t[..end].trim()
-}
-
-/// True when `root` names a state variable of `contract` that is a **settable**
-/// hook — declared without `constant` or `immutable`, so governance / an admin
-/// can repoint it at an arbitrary contract. A `constant`/`immutable` callee, or a
-/// name that is not a state var at all (a local, a bare parameter, a literal
-/// address), is *not* a settable hook and suppresses.
-fn is_settable_hook(contract: &Contract, root: &str) -> bool {
-    if root.is_empty() {
-        return false;
-    }
-    contract
-        .state_vars
-        .iter()
-        .any(|v| v.name == root && !(v.constant || v.immutable))
 }
 
 /// True if an `emit` statement begins lexically after the call at `call_span`

@@ -58,8 +58,11 @@
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
-use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
+use crate::report;
+use sluice_findings::{Category, Dimension, Finding, Severity};
 use sluice_ir::{AssignOp, BinOp, Expr, ExprKind, Function, Span, StmtKind};
+
+use super::prelude::*;
 
 pub struct ProportionalSplitResidualDetector;
 
@@ -106,12 +109,12 @@ impl Detector for ProportionalSplitResidualDetector {
                 continue;
             }
 
-            let b = FindingBuilder::new(self.id(), Category::ProportionalSplitResidual)
-                .title("Proportional split forces rounding remainder onto one bucket")
-                .severity(Severity::Medium)
-                .confidence(0.45)
-                .dimension(Dimension::Invariant)
-                .message(format!(
+            let b = report!(self, Category::ProportionalSplitResidual,
+                title = "Proportional split forces rounding remainder onto one bucket",
+                severity = Severity::Medium,
+                confidence = 0.45,
+                dimensions = [Dimension::Invariant],
+                message = format!(
                     "`{}` splits an amount across two or more buckets with integer (floor) division \
                      and then force-assigns the leftover via a `total - a - b` residual to a single \
                      bucket. Because each `amount * weight / total` truncates toward zero, the summed \
@@ -123,14 +126,14 @@ impl Detector for ProportionalSplitResidualDetector {
                      `require(a + b + r == amount)` does not fix this — that equality holds by \
                      construction of the residual.",
                     f.name
-                ))
-                .recommendation(
+                ),
+                recommendation =
                     "Round the proportional buckets in a single, fair direction with an explicit \
                      rounding-mode helper (`mulDivUp` / `ceilDiv` / OpenZeppelin \
                      `Math.mulDiv(.., Rounding.Up)`), or distribute the remainder pro-rata across all \
                      buckets, instead of dumping the entire floor-division dust onto one chosen bucket.",
-                );
-            out.push(cx.finish(b, f.id, span));
+            );
+            out.push(finish_at(cx, b, f.id, span));
         }
         out
     }
@@ -260,7 +263,7 @@ fn scan_expr_for_residual(e: &Expr, hit: &mut Option<Span>) {
 /// chain with **two or more** subtractions sharing a common left root, return the
 /// span of the outermost `Sub`. Otherwise `None`.
 fn residual_span(e: &Expr) -> Option<Span> {
-    let e = unwrap_casts(e);
+    let e = peel_casts(e);
     if let ExprKind::Binary { op: BinOp::Sub, .. } = &e.kind {
         if count_sub_spine(e) >= 2 {
             return Some(e.span);
@@ -277,22 +280,6 @@ fn count_sub_spine(e: &Expr) -> usize {
     match &e.kind {
         ExprKind::Binary { op: BinOp::Sub, lhs, .. } => 1 + count_sub_spine(lhs),
         _ => 0,
-    }
-}
-
-/// Peel single-argument type casts / parenthesizing calls (`uint256(x)`,
-/// `(x)` modeled as a cast), so a wrapped residual is still recognized.
-fn unwrap_casts(e: &Expr) -> &Expr {
-    let mut cur = e;
-    loop {
-        match &cur.kind {
-            ExprKind::Call(c)
-                if c.kind == sluice_ir::CallKind::TypeCast && c.args.len() == 1 =>
-            {
-                cur = &c.args[0];
-            }
-            _ => return cur,
-        }
     }
 }
 
@@ -340,10 +327,6 @@ fn has_ceil_idiom(f: &Function) -> bool {
         });
     }
     found
-}
-
-fn is_one(e: &Expr) -> bool {
-    matches!(&e.kind, ExprKind::Lit(sluice_ir::Lit::Number(n)) if n.trim() == "1")
 }
 
 #[cfg(test)]

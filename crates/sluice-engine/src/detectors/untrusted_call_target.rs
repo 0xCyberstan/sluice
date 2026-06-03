@@ -27,10 +27,11 @@
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
-use sluice_findings::{Category, Dimension, Finding, FindingBuilder, Severity};
+use crate::report;
+use sluice_findings::{Category, Dimension, Finding, Severity};
 use sluice_ir::{CallKind, Expr, ExprKind, Function};
 
-use super::is_accounting_name;
+use super::prelude::*;
 
 pub struct UntrustedCallTargetDetector;
 
@@ -70,13 +71,12 @@ impl Detector for UntrustedCallTargetDetector {
             // unvalidated parameter of this function.
             let Some(span) = first_untrusted_param_call(f) else { continue };
 
-            let b = FindingBuilder::new(self.id(), Category::UntrustedCallTarget)
-                .title("Untrusted caller-supplied call target drives a balance credit")
-                .severity(Severity::High)
-                .confidence(0.6)
-                .dimension(Dimension::Frontier)
-                .dimension(Dimension::ValueFlow)
-                .message(format!(
+            let b = report!(self, Category::UntrustedCallTarget,
+                title = "Untrusted caller-supplied call target drives a balance credit",
+                severity = Severity::High,
+                confidence = 0.6,
+                dimensions = [Dimension::Frontier, Dimension::ValueFlow],
+                message = format!(
                     "`{}` makes an external call on a caller-supplied address parameter that is never \
                      validated (no whitelist / equality check) and is not an immutable/constant address, \
                      then credits an accounting balance keyed by `msg.sender`. An attacker can pass a \
@@ -84,14 +84,14 @@ impl Detector for UntrustedCallTargetDetector {
                      balance credit and later withdraw genuine funds — the untrusted-call-target / \
                      unvalidated-external-contract class (e.g. the TempleDAO STAX migrateStake drain).",
                     f.name
-                ))
-                .recommendation(
+                ),
+                recommendation =
                     "Validate the caller-supplied target against an owner-curated allowlist of trusted \
                      contracts (`require(isTrusted[target])`), or derive the source contract from \
                      immutable/governance-set state rather than a call parameter. Never credit a balance \
                      on the strength of a call to an address the caller chose.",
-                );
-            out.push(cx.finish(b, f.id, span));
+            );
+            out.push(finish_at(cx, b, f.id, span));
         }
         out
     }
@@ -100,64 +100,23 @@ impl Detector for UntrustedCallTargetDetector {
 /// The span of the first external/low-level/delegate call whose receiver
 /// root-resolves to an unvalidated parameter of `f`, if any.
 fn first_untrusted_param_call(f: &Function) -> Option<sluice_ir::Span> {
-    let mut hit: Option<sluice_ir::Span> = None;
-    for s in &f.body {
-        s.visit_exprs(&mut |e| {
-            if hit.is_some() {
-                return;
-            }
-            let ExprKind::Call(call) = &e.kind else { return };
-            // Only calls that hand control to an external party.
-            if !matches!(
-                call.kind,
-                CallKind::External | CallKind::LowLevelCall | CallKind::DelegateCall
-            ) {
-                return;
-            }
-            let Some(recv) = &call.receiver else { return };
-            let Some(root) = root_ident(unwrap_casts(recv)) else { return };
-            // The receiver root must be a parameter of this function, and that
-            // parameter must not be validated anywhere in the body.
-            if !is_param(f, &root) {
-                return;
-            }
-            if param_is_validated(f, &root) {
-                return;
-            }
-            hit = Some(e.span);
-        });
-        if hit.is_some() {
-            break;
+    first_call_where(f, |call| {
+        // Only calls that hand control to an external party.
+        if !matches!(
+            call.kind,
+            CallKind::External | CallKind::LowLevelCall | CallKind::DelegateCall
+        ) {
+            return false;
         }
-    }
-    hit
-}
-
-/// Peel single-argument type casts (`IOldStaking(x)`, `address(x)`, `payable(x)`).
-fn unwrap_casts(e: &Expr) -> &Expr {
-    let mut cur = e;
-    loop {
-        match &cur.kind {
-            ExprKind::Call(c) if c.kind == CallKind::TypeCast && c.args.len() == 1 => {
-                cur = &c.args[0];
-            }
-            _ => return cur,
-        }
-    }
-}
-
-/// Root identifier of an lvalue/member/index chain (`a.b[c]` -> `a`).
-fn root_ident(e: &Expr) -> Option<String> {
-    match &e.kind {
-        ExprKind::Ident(n) => Some(n.clone()),
-        ExprKind::Member { base, .. } | ExprKind::Index { base, .. } => root_ident(base),
-        _ => None,
-    }
-}
-
-/// Is `name` a parameter of `f`?
-fn is_param(f: &Function, name: &str) -> bool {
-    f.params.iter().any(|p| p.name.as_deref() == Some(name))
+        let Some(recv) = &call.receiver else { return false };
+        // The receiver root must be a parameter of this function, and that
+        // parameter must not be validated in the body. We peel the top-level
+        // `IFoo(x)` cast and take the root ident — exactly the original
+        // `root_ident(unwrap_casts(recv))` composition (a member/index base that
+        // is itself a cast is NOT peeled, preserving the prior behavior).
+        let Some(root) = root_ident(peel_casts(recv)) else { return false };
+        is_param(f, &root) && !param_is_validated(f, &root)
+    })
 }
 
 /// Best-effort: does the parameter `name` get validated somewhere in the body —
@@ -215,42 +174,12 @@ fn expr_validates_ident(e: &Expr, name: &str) -> bool {
             return;
         }
         if let ExprKind::Call(c) = &sub.kind {
-            if matches!(
-                c.kind,
-                CallKind::Builtin(sluice_ir::Builtin::Require) | CallKind::Builtin(sluice_ir::Builtin::Assert)
-            ) && c.args.iter().any(|a| expr_mentions_ident(a, name))
-            {
+            if is_require_or_assert(c) && c.args.iter().any(|a| expr_mentions_ident(a, name)) {
                 found = true;
             }
         }
         if let ExprKind::Index { index: Some(idx), .. } = &sub.kind {
             if matches!(&idx.kind, ExprKind::Ident(n) if n == name) {
-                found = true;
-            }
-        }
-    });
-    found
-}
-
-/// Any `base[name]` index where `name` is the bare index (a whitelist lookup).
-fn expr_indexes_ident(e: &Expr, name: &str) -> bool {
-    let mut found = false;
-    e.visit(&mut |sub| {
-        if let ExprKind::Index { index: Some(idx), .. } = &sub.kind {
-            if matches!(&idx.kind, ExprKind::Ident(n) if n == name) {
-                found = true;
-            }
-        }
-    });
-    found
-}
-
-/// Does `name` appear as an identifier anywhere in `e`?
-fn expr_mentions_ident(e: &Expr, name: &str) -> bool {
-    let mut found = false;
-    e.visit(&mut |sub| {
-        if let ExprKind::Ident(n) = &sub.kind {
-            if n == name {
                 found = true;
             }
         }

@@ -2,6 +2,11 @@
 //! [`crate::detector::Detector`]. New detectors only need to (a) implement the
 //! trait and (b) be added to [`builtin_detectors`].
 
+/// Shared SCIR-query + FP-suppression helpers for detector authors. A new
+/// detector should `use super::prelude::*;` rather than re-deriving the common
+/// `root_ident` / `peel_casts` / call-walk / FindingBuilder boilerplate.
+pub mod prelude;
+
 pub mod accounting;
 pub mod access_control;
 pub mod oracle;

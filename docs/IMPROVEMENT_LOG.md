@@ -251,7 +251,29 @@ R7–R9 were all novel-detector rounds; the roadmap says interleave the optimiza
 - **WF2 architecture/extensibility:** extract shared SCIR query primitives (the call-target trust map, ordered effect
   stream, taint/hint queries, name-classifiers) into a `detectors/prelude` + a `detector!{}` authoring macro to kill the
   per-detector boilerplate (measure "lines/concepts to add a detector" before/after); migrate 3-4 detectors onto it as proof.
-- **WF3:** R11 novel-bug research on a fresh target (karak/morpho) + a full dogfood re-measure of all 64 detectors. _status: pending._
+- **WF3:** R11 novel-bug research on a fresh target (karak/morpho) + a full dogfood re-measure of all 64 detectors.
+- _status: **WF2 (architecture) + WF3 done & integrated**; WF1 (performance) still benchmarking._
+  WF2 result: new `detectors/prelude.rs` (~25 reusable SCIR-query/FP-suppression helpers + a `report!{}` macro)
+  eliminating the copy-pasted boilerplate (root_ident ×11, peel_casts ×9, the call-walk idiom ×~40 files); 4 detectors
+  migrated as proof (−110 lines net), **findings byte-identical (MD5-verified)**, 285 tests, 0 warnings. A new detector
+  now costs `use super::prelude::*;` + a `report!{}` block instead of ~120 lines of re-derived helpers. (Note: the
+  worktree agent's copy-back was mangled by a file-watcher — main got a broken `pub use` prelude + unmigrated detectors;
+  recovered by pulling the 5 correct files from the worktree.)
+
+#### R10 WF3 outputs (done)
+**Full 64-detector dogfood baseline** (current binary, 6 repos): all exit 0, no crashes; 657 .sol scanned in 0.06–0.45s
+each, 11–37 MB RSS; 413 findings total (2 Crit / 35 High / 213 Med / 103 Low / 60 Info); 50/64 detectors fired.
+Noisiest (precision targets for a future round): centralization-risk 94, reentrancy 46, integer-issues 27,
+upgradeable 24, access-control 19, unchecked-return 17, denial-of-service 16, missing-zero-check 14, price-bounds 14.
+
+**R11 candidate backlog (mined from Karak V2 — all map to real Karak/C4 audit findings; non-overlapping with the 64):**
+1. shares-escrowed-queue-repriced-live — request escrows SHARE units, claim repays at LIVE price (slash-leak); Vault.sol:137/168. (≠ snapshot-redeem-asymmetry: no clamp/reserve.)
+2. percent-slash-on-live-aggregate — finalize computes `storedPct × totalAssets()` at settle, not a request-time snapshot; SlasherLib.sol:81/133. (≠ epoch-boundary-staleness: no `*At` accessor exists.)
+3. hash-gated-struct-replay — `mapping[keccak256(abi.encode(s))]` authenticates the tuple but unhashed/derived fields then index MUTATED live state (K-C-01 revival); SlasherLib.sol:116-137.
+4. clamp-then-recompute-burn-sink — residual after a clamp is routed to a burn/void sink (asymmetric value destruction).
+5. beacon-proof-admission-only — a credential/prefix proof checked only at admission, never re-validated on the value-update path.
+6. eip4788-caller-timestamp — external/beacon root resolved from a caller-controlled timestamp with no recency floor.
+7. zero-margin-timing-window — finalize/veto window constants with no margin → same-block race between competing finalizers.
 - **Result:** 50 detectors; corpus 20/20 recall + 8/8 clean; **R4 hacks now 8/8** (TempleDAO caught by the
   new `untrusted-call-target` detector — the R4 MISS, closed). 153 tests, 0 warnings. Delivered:
   - **WF1 cast precision:** integer-issues width-bit suppression (`uintN(address)`/`uintN(bytesM)`/narrower-int
