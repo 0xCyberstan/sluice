@@ -189,6 +189,26 @@ pub fn compatible_categories(bug_class: &str) -> &'static [&'static str] {
         // `oracle-data-corruption` labels (which tag unrelated findings) so this
         // detector cannot spuriously "catch" those.
         "spot-priced-share-value" => &["SpotPricedShareValue"],
+        // A withdrawal/claim/unstake/redeem that pushes the principal ETH to a
+        // caller- or recipient-controlled address via a low-level
+        // `call{value:..}("")`/`transfer`/`send` and then hard-`require`s the push
+        // succeeded — a contract caller whose `receive` reverts permanently blocks
+        // the withdrawal even though every upstream step succeeded (asymmetry M-06,
+        // `SafEth.unstake`). Mapped to the modeled `DenialOfService` detector (the
+        // new Pattern-4 push-payment arm in `dos.rs`) so the catch scores as recall.
+        // NOTE: orthogonal to the per-finding `in_class` flag — M-06 stays
+        // `in_class: false` (the corpus tags it as a protocol-specific
+        // DoS-on-revert), so catching it moves *out-of-class* recall, exactly like
+        // `value-source-discipline` / `spot-priced-share-value`. This is a PRECISE
+        // sub-label of the coarse `dos-on-revert` class: only M-06 carries it, so
+        // the mapping cannot spuriously credit the sibling `dos-on-revert` findings
+        // (H-03, the no-way-to-remove-a-broken-derivative loop revert), which keep
+        // their coarse `dos-on-revert` label and remain match-able only by location.
+        // Mapped to `DenialOfService` ALONE (not `UnboundedLoop`) so the catch is
+        // genuinely driven by the new Pattern-4 push-payment arm at the exact push
+        // line, and is not spuriously credited by the unrelated M-08 unbounded-loop
+        // finding that also sits in `unstake`.
+        "push-payment-dos" => &["DenialOfService"],
         // ---- out-of-class (protocol-specific): no modeled category ----
         // accounting / economic / logic invariants the pattern set does not model.
         // Listed explicitly (rather than only via the `_` arm) so the corpus's

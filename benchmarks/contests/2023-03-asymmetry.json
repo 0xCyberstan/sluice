@@ -80,9 +80,9 @@
       "function": "unstake",
       "file": "contracts/SafEth/SafEth.sol",
       "line": 124,
-      "bug_class": "dos-on-revert",
+      "bug_class": "push-payment-dos",
       "in_class": false,
-      "summary": "unstake() sends the withdrawn ETH with a single address(msg.sender).call{value:...} and requires success; a contract caller whose receive reverts (or a push-payment failure) blocks the withdrawal even though every derivative withdraw succeeded (M-06). Protocol-specific DoS-on-revert, no modeled detector."
+      "summary": "unstake() sends the withdrawn ETH with a single address(msg.sender).call{value:...} and requires success; a contract caller whose receive reverts (or a push-payment failure) blocks the withdrawal even though every derivative withdraw succeeded (M-06). Protocol-specific DoS-on-revert (precise sub-label push-payment-dos, modeled by the dos.rs Pattern-4 push-payment arm); stays in_class:false."
     },
     {
       "id": "M-08",

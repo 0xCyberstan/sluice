@@ -53,6 +53,29 @@
 //! A genuine push-payment loop that sends native value and reverts the whole
 //! batch on a single failure (`require(success)` / bubbled `if (!success) revert`)
 //! is still reported.
+//!
+//! 4. **Single-recipient push-payment that requires success** — a withdrawal /
+//!    claim / unstake / redeem-shaped, state-mutating, externally-reachable
+//!    function that pushes native ETH to a **caller- or recipient-controlled**
+//!    address (`address(msg.sender).call{value:..}("")`, `payable(to).transfer(..)`,
+//!    a `to`/`recipient`/`receiver`/`beneficiary` parameter) and then **requires
+//!    the push succeeded** (`require(sent, ...)` / `if (!sent) revert`). A contract
+//!    caller whose `receive`/`fallback` reverts — or any push failure — permanently
+//!    blocks that withdrawal even though all the upstream accounting/derivative
+//!    work already succeeded (Asymmetry M-06: `SafEth.unstake` ends with
+//!    `(bool sent,) = address(msg.sender).call{value: ...}(""); require(sent, ...)`).
+//!    The fix is pull-payment (credit a withdrawable balance) or to not hard-require
+//!    the push. Emitted as [`Category::DenialOfService`]. Three conservative gates
+//!    keep this quiet on real protocols:
+//!      * SUPPRESS pull-payment shapes — a function that zeroes/credits a mapping
+//!        balance for the recipient before pushing is the *correct* withdraw idiom,
+//!        not the bug (the bricked party is only itself, and re-tryable).
+//!      * SUPPRESS calls to trusted/immutable protocol addresses (the target is a
+//!        state/immutable var, not `msg.sender` / a recipient parameter).
+//!      * SUPPRESS the "refund excess to msg.sender" tail of a `payable` function —
+//!        that is a refund of the caller's own overpayment, not the principal
+//!        withdrawal, so a self-griefing caller only hurts itself on a refund it
+//!        controls. Requires a withdrawal/claim/unstake/redeem-shaped name.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -255,6 +278,46 @@ impl Detector for DosDetector {
                             );
                         out.push(cx.finish(b, f.id, ls.span));
                     }
+                }
+            }
+
+            // ---- Pattern 4: single-recipient push-payment that requires success
+            // (Asymmetry M-06 / SafEth `unstake`). A withdrawal/claim/unstake/redeem-
+            // shaped, state-mutating, externally-reachable function pushes native ETH
+            // to a caller- or recipient-controlled address and then REQUIRES the push
+            // succeeded. A contract caller whose `receive`/`fallback` reverts bricks
+            // the withdrawal even though all the upstream work already succeeded. The
+            // fix is pull-payment or not hard-requiring the push. Independent of the
+            // loop patterns above, so M-06 and M-08 both fire on `unstake`.
+            if f.is_state_mutating()
+                && f.is_externally_reachable()
+                && is_withdrawal_shaped(&f.name)
+                && !uses_pull_payment(cx, f)
+            {
+                if let Some(call_span) = push_payment_requiring_success(cx, f) {
+                    let b = FindingBuilder::new(self.id(), Category::DenialOfService)
+                        .title("Withdrawal pushes ETH to a caller-controlled address and requires the push to succeed")
+                        .severity(Severity::Medium)
+                        .confidence(0.5)
+                        .dimension(Dimension::Frontier)
+                        .dimension(Dimension::ValueFlow)
+                        .message(format!(
+                            "`{}` sends the withdrawn ETH to a caller- or recipient-controlled address with a \
+                             low-level `call{{value:}}`/`transfer`/`send` and then `require`s the push \
+                             succeeded. A contract caller whose `receive`/`fallback` reverts (or any push \
+                             failure) permanently blocks this withdrawal even though every upstream step \
+                             (burning shares, withdrawing from each derivative) already succeeded — a \
+                             push-payment denial-of-service. If the recipient is shared or looped, one \
+                             griefing party can brick the path for everyone.",
+                            f.name
+                        ))
+                        .recommendation(
+                            "Use the pull-payment pattern: credit a withdrawable balance the recipient \
+                             claims in a separate call, so a reverting recipient only blocks itself. \
+                             Alternatively do not hard-`require` the push to succeed (record the failure \
+                             and let the recipient retry), or restrict pushes to addresses you trust.",
+                        );
+                    out.push(cx.finish(b, f.id, call_span));
                 }
             }
         }
@@ -812,6 +875,136 @@ fn loop_bound_reads_state(loop_stmt: &Stmt, state: &std::collections::HashSet<St
     hit
 }
 
+/// True if the function name is withdrawal/claim/unstake/redeem-shaped — the
+/// principal-payout idioms where a hard-required push to a caller-controlled
+/// address is a DoS. We deliberately exclude generic names (so a `pay`/`send`
+/// refund helper, or a `payable` constructor, does not light up) and require one
+/// of these payout verbs, matching the M-06 `unstake` shape.
+fn is_withdrawal_shaped(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("withdraw")
+        || n.contains("unstake")
+        || n.contains("redeem")
+        || n.contains("claim")
+        || n.contains("exit")
+        || n.contains("cashout")
+        || n.contains("cash_out")
+}
+
+/// Find a single-recipient push-payment that requires success in `f`'s **top-level**
+/// body (not inside a loop — that is Pattern 2). Returns the span of the value-
+/// bearing call when:
+///   * the call sends native ETH (`{value:}` present, `.transfer`, or `.send`),
+///   * its target address is caller- or recipient-controlled (`msg.sender`,
+///     `payable(msg.sender)`, `address(msg.sender)`, or a recipient-shaped
+///     parameter such as `to`/`recipient`/`receiver`/`dst`/`beneficiary`), and
+///   * the function `require`s/`assert`s the push succeeded, or reverts on its
+///     failure (`if (!sent) revert`) — i.e. a failed push aborts the withdrawal.
+///
+/// A call to a state/immutable protocol address (not the caller/recipient) is not
+/// matched. Calls lexically inside a loop are skipped (the loop is Pattern 2's job).
+fn push_payment_requiring_success(cx: &AnalysisContext, f: &Function) -> Option<Span> {
+    // Collect the spans of all loop bodies so we can exclude in-loop calls.
+    let loop_spans: Vec<Span> = loops_in(f).iter().map(|ls| ls.span).collect();
+    let in_a_loop = |sp: Span| {
+        loop_spans
+            .iter()
+            .any(|ls| sp.start >= ls.start && sp.end <= ls.end && sp != *ls)
+    };
+
+    let mut hit: Option<Span> = None;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if hit.is_some() {
+                return;
+            }
+            if let ExprKind::Call(c) = &e.kind {
+                let sends_native =
+                    c.value.is_some() || matches!(c.kind, CallKind::Transfer | CallKind::Send);
+                if !sends_native {
+                    return;
+                }
+                if in_a_loop(e.span) {
+                    return;
+                }
+                if call_target_is_caller_controlled(c) {
+                    hit = Some(e.span);
+                }
+            }
+        });
+        if hit.is_some() {
+            break;
+        }
+    }
+    let span = hit?;
+    // The push must be hard-required to succeed (otherwise a failed push is
+    // tolerated and there is no DoS). Recognized syntactically over the function's
+    // comment-stripped source: a `require(`/`assert(` of the success bit, or a
+    // bubbled `if (!ok) revert`. SafEth's tail is `require(sent, "Failed...")`.
+    let src = cx.source_text(f.span);
+    let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+    let requires_success = compact.contains("require(")
+        || compact.contains("assert(")
+        || compact.contains(")revert")
+        || compact.contains("{revert")
+        || compact.contains(";revert");
+    if requires_success {
+        Some(span)
+    } else {
+        None
+    }
+}
+
+/// True if a value-bearing call's **target address** is caller- or recipient-
+/// controlled: `msg.sender` (incl. `payable(msg.sender)` / `address(msg.sender)`),
+/// or a recipient-shaped identifier (a `to`/`recipient`/`receiver`/`dst`/
+/// `beneficiary`/`account`/`user` parameter). A call to a state/immutable protocol
+/// address (e.g. `address(weth).call{value:..}`, `treasury.transfer(..)`) is NOT
+/// caller-controlled and stays silent.
+fn call_target_is_caller_controlled(c: &sluice_ir::Call) -> bool {
+    // The address the value is sent to is the call's receiver (`recv.transfer(..)`,
+    // `recv.call{value:..}(..)`). For `address(msg.sender).call{...}` the receiver
+    // is the `address(msg.sender)` cast.
+    let target = c.receiver.as_deref().unwrap_or(&c.callee);
+    expr_is_caller_controlled(target)
+}
+
+/// Recursively decide whether an address expression denotes the caller or a
+/// recipient parameter. Unwraps `payable(x)` / `address(x)` casts and `.member`
+/// chains down to a root identifier or a `msg.sender` access.
+fn expr_is_caller_controlled(e: &Expr) -> bool {
+    match &e.kind {
+        // `msg.sender`
+        ExprKind::Member { base, member } => {
+            if member == "sender" {
+                if let ExprKind::Ident(b) = &base.kind {
+                    if b == "msg" {
+                        return true;
+                    }
+                }
+            }
+            // unwrap `something.field` — still inspect the base for a recipient root
+            expr_is_caller_controlled(base)
+        }
+        // `payable(x)` / `address(x)` casts wrap the real target in args[0].
+        ExprKind::Call(c) if matches!(c.kind, CallKind::TypeCast) => {
+            c.args.first().map(expr_is_caller_controlled).unwrap_or(false)
+        }
+        ExprKind::Ident(n) => is_recipient_name(n),
+        _ => false,
+    }
+}
+
+/// A parameter/identifier name that denotes a payment recipient (so a push to it
+/// is caller-influenced). Conservative list of the common recipient idioms.
+fn is_recipient_name(n: &str) -> bool {
+    let n = n.trim_start_matches('_').to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "to" | "recipient" | "receiver" | "dst" | "destination" | "beneficiary" | "account" | "user"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{analyze_sources, Config};
@@ -1192,6 +1385,156 @@ mod tests {
                 f.detector == "denial-of-service" && f.category == sluice_findings::Category::UnboundedLoop
             }),
             "fixed-bound external-call loop must not fire as UnboundedLoop: {:?}",
+            fs
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 4: single-recipient push-payment that requires success
+    // (Asymmetry-M-06 / SafEth `unstake`).
+    // ------------------------------------------------------------------
+
+    // POSITIVE: the SafEth-`unstake` shape — burns shares, then pushes the ETH to
+    // `address(msg.sender).call{value:..}("")` and `require`s success. A contract
+    // caller whose `receive` reverts bricks its own withdrawal. Must FIRE as
+    // DenialOfService (and is independent of the M-08 unbounded-loop catch).
+    #[test]
+    fn fires_on_push_payment_requiring_success() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            interface IDerivative { function balance() external view returns (uint256); function withdraw(uint256 a) external; }
+            contract SafEth {
+                uint256 public derivativeCount;
+                mapping(uint256 => IDerivative) public derivatives;
+                function burn(address, uint256) internal {}
+                function unstake(uint256 _safEthAmount) external {
+                    uint256 ethBefore = address(this).balance;
+                    for (uint256 i = 0; i < derivativeCount; i++) {
+                        derivatives[i].withdraw(_safEthAmount);
+                    }
+                    uint256 toSend = address(this).balance - ethBefore;
+                    (bool sent, ) = address(msg.sender).call{value: toSend}("");
+                    require(sent, "Failed to send Ether");
+                }
+            }
+        "#);
+        assert!(
+            fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::DenialOfService
+                    && f.function == "unstake"
+            }),
+            "push-payment-requiring-success unstake must fire as DenialOfService: {:?}",
+            fs
+        );
+    }
+
+    // POSITIVE: a `claim`/`redeem` to a recipient PARAMETER (`to`) with a hard
+    // `require(ok)`. Recipient-controlled target, so a reverting `to` bricks it.
+    #[test]
+    fn fires_on_push_to_recipient_param() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract Vault {
+                mapping(address => uint256) public shares;
+                function redeem(uint256 amt, address to) external {
+                    shares[msg.sender] -= amt;
+                    (bool ok, ) = payable(to).call{value: amt}("");
+                    require(ok, "send failed");
+                }
+            }
+        "#);
+        assert!(
+            fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::DenialOfService
+                    && f.function == "redeem"
+            }),
+            "push to recipient param requiring success must fire: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: pull-payment withdraw — the recipient's credited balance is zeroed
+    // before the push. A reverting recipient only blocks ITSELF and the call is
+    // re-tryable; not the M-06 DoS class. Must stay SILENT for Pattern 4.
+    #[test]
+    fn silent_on_pull_payment_withdraw() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract PullVault {
+                mapping(address => uint256) public credits;
+                function withdraw() external {
+                    uint256 amt = credits[msg.sender];
+                    credits[msg.sender] = 0;
+                    (bool ok, ) = msg.sender.call{value: amt}("");
+                    require(ok, "transfer failed");
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::DenialOfService
+            }),
+            "pull-payment withdraw must not fire Pattern 4: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: a `payable` `deposit` that refunds excess to `msg.sender` at the
+    // tail and requires success. Not a withdrawal-shaped name, so Pattern 4 must
+    // stay SILENT (refund-excess is the caller's own overpayment).
+    #[test]
+    fn silent_on_payable_refund_excess_tail() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract Sale {
+                uint256 public price;
+                mapping(address => uint256) public bought;
+                function buy(uint256 qty) external payable {
+                    uint256 cost = qty * price;
+                    require(msg.value >= cost, "underpaid");
+                    bought[msg.sender] += qty;
+                    uint256 refund = msg.value - cost;
+                    if (refund > 0) {
+                        (bool ok, ) = msg.sender.call{value: refund}("");
+                        require(ok, "refund failed");
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::DenialOfService
+            }),
+            "payable refund-excess tail must not fire Pattern 4: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: a withdrawal that pushes to a TRUSTED state/immutable protocol
+    // address (a treasury), not to msg.sender / a recipient param. Not caller-
+    // controlled, so Pattern 4 must stay SILENT.
+    #[test]
+    fn silent_on_push_to_trusted_address() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract Fees {
+                address public treasury;
+                function withdrawFees(uint256 amt) external {
+                    (bool ok, ) = treasury.call{value: amt}("");
+                    require(ok, "send failed");
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::DenialOfService
+            }),
+            "push to trusted treasury address must not fire Pattern 4: {:?}",
             fs
         );
     }

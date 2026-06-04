@@ -976,3 +976,33 @@ codebase). 2 detector landings + 1 disciplined rejection:
 - **SCOREBOARD (8 contests): in-class 90% (28/31), out-of-class 7% (3/41), Crit/High 27 (19 unmatched — UNCHANGED, precision
   held).** asymmetry 80%→100% in-class, 0%→25% out-of-class. Both landings independently verified real catches at the right
   loci. _done._
+
+### NORTH STAR — wave 5 (out-of-class push + real-bug found): out-of-class 7%→10%
+3 agents: 1 detector (worktree) + 2 deep novel hunts (read-only).
+- **E — dos.rs push-payment-DoS arm → asymmetry M-06** (out-of-class): a withdrawal/claim/unstake/redeem
+  function that pushes ETH via `addr.call{value:}("")` to a caller/recipient-controlled address AND `require`s
+  success (grief-able by a reverting receiver → permanent DoS). Reused `DenialOfService` (no new Category).
+  Suppressed: pull-payment (credit-balance) idioms, trusted/immutable targets, payable refund-excess tails. Precise
+  manifest label `push-payment-dos => [DenialOfService]` (M-06 relabeled from `dos-on-revert`; H-03 left as
+  `dos-on-revert` so the channel can't spuriously credit it). **0 findings on morpho/lido/universal-router.** M-06 + M-08
+  both fire. asymmetry out-of-class 25%→50% (2/4), in-class 100%.
+- **F — EtherFi deep hunt (oracle-lock coupling): REAL BUG FOUND (Low/Medium).** Traced
+  `ethAmountLockedForWithdrawal` end-to-end. Confirmed: a request **finalized then later invalidated** leaks its claim
+  value into the lock permanently — the only decrement is via `claimWithdraw`, unreachable for an invalidated request
+  (`_claimWithdraw` requires `isValid`). The priority-queue path *does* decrement on cancel-after-finalize
+  (`PriorityWithdrawalQueue._cancelWithdrawRequest:549-555`); the legacy NFT `invalidateRequest`
+  (`WithdrawRequestNFT.sol:221-226`) is missing that symmetric decrement. Over-lock only (strands liquidity,
+  monotonic) — no theft/under-lock (capped-claim math + per-claim guard `LiquidityPool.sol:228`). Full writeup +
+  fix in `docs/dogfood-findings/etherfi-2026-06-04.md`. This is the first genuine, confirmable, fix-ready defect the
+  hunt has produced — reported at honest severity, not inflated.
+- **G — LayerZero core messaging (v1+v2) hunt:** no confirmable high-sev bug. Verified the Nomad-zero-state,
+  optional-DVN-threshold, replay/re-verify, receive-library-swap, DVN-multisig, and fee-over-withdraw classes are all
+  correctly defended. Residual lead: `AddressCast` 32→20 truncation + `PacketV1Codec` non-EVM (Solana/Aptos/Sui)
+  sender encodings — the one place attacker-chosen remote bytes meet the EVM "trim 32→20" assumption (sender-spoof
+  surface). Honest negative; LZ deliberately delegates config trust to the oapp/owner.
+- **Integration:** disjoint (E = dos.rs + manifest.rs + asymmetry.json; reused DenialOfService so no finding.rs/mod.rs).
+  One authoritative gate: build 0 warnings, **944 engine tests / 0 fail**, full workspace green, corpus + real_hacks green.
+  135 detectors.
+- **SCOREBOARD (8 contests): in-class 90% (28/31), out-of-class 10% (4/41), Crit/High 27 (19 unmatched — UNCHANGED,
+  precision held).** out-of-class 7%→10% this wave (B1 LoopFi H-01, B2-class none, spot-priced asymmetry H-04,
+  push-payment asymmetry M-06, + Stader M-12). asymmetry fully solved (100% in / 50% out). _done._
