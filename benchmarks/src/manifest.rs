@@ -175,6 +175,20 @@ pub fn compatible_categories(bug_class: &str) -> &'static [&'static str] {
         // label for these two genuine accounting bugs (no other corpus finding uses
         // it), so this mapping cannot spuriously credit an unrelated class.
         "accounting-error" => &["Conservation"],
+        // A price-per-share / exchange-rate getter that derives the share value from
+        // a manipulable on-chain SPOT source (a Curve `price_oracle()` pool read, an
+        // AMM `get_dy`/`getReserves` quote, a Uni-v3 `slot0`) with no TWAP window, no
+        // Chainlink-with-staleness cross-check, and no min/max bound — the value then
+        // drives mint/redeem share pricing (asymmetry H-04, `SfrxEth.ethPerDerivative`
+        // over Curve `price_oracle`). Mapped to the modeled `SpotPricedShareValue`
+        // detector so the catch scores as recall. NOTE: orthogonal to the per-finding
+        // `in_class` flag — H-04 stays `in_class: false` (the corpus tags it as a
+        // protocol-specific accounting/price-formula bug), so catching it moves
+        // *out-of-class* recall, exactly like `value-source-discipline` /
+        // `accounting-error`. Kept distinct from the coarse `accounting-logic` /
+        // `oracle-data-corruption` labels (which tag unrelated findings) so this
+        // detector cannot spuriously "catch" those.
+        "spot-priced-share-value" => &["SpotPricedShareValue"],
         // ---- out-of-class (protocol-specific): no modeled category ----
         // accounting / economic / logic invariants the pattern set does not model.
         // Listed explicitly (rather than only via the `_` arm) so the corpus's

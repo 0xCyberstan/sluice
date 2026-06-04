@@ -36,7 +36,7 @@
       "function": "ethPerDerivative",
       "file": "contracts/SafEth/derivatives/SfrxEth.sol",
       "line": 115,
-      "bug_class": "accounting-logic",
+      "bug_class": "spot-priced-share-value",
       "in_class": false,
       "summary": "SfrxEth.ethPerDerivative returns (10**18 * frxAmount) / price_oracle() — the price_oracle multiplication is inverted (should be frxAmount * price_oracle / 10**18), so the sfrxETH derivative is valued incorrectly, mispricing stake/unstake (H-04). Protocol-specific price-formula bug, no modeled detector."
     },

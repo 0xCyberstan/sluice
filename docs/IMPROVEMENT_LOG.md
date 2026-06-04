@@ -938,3 +938,41 @@ preserved its file's prior catches + held 0 new Crit/High on the 6-repo dogfood 
 - **SCOREBOARD: in-class 71% → 87% (27/31)**; out-of-class held 5% (2/41). asymmetry 0%→80% (4/5; M-12 slippage left for a
   future round), **Basin 67%→100% (3/3)**. Unmatched Crit/High 18→19 (the one new = Basin `shift`, a real sibling). Round
   wound down here at user request. _done._
+
+### NORTH STAR — wave 4 (out-of-class frontier + first novel-bug hunt): in-class 87%→90%, out-of-class 5%→7%
+Diagnostic: location-ceiling showed out-of-class at 56% (23/41) vs actual 5% — Sluice fires *at* most
+out-of-class loci but with an incompatible class, so the frontier is "build the right invariant detector + map
+it." 4 agents launched (A/B/C worktree-isolated detector edits; D a read-only novel-bug hunt on a fresh, non-corpus
+codebase). 2 detector landings + 1 disciplined rejection:
+- **B — slippage.rs → asymmetry M-12** (in-class, the wave-3 leftover): new arm fires on a `payable` function that
+  `_mint`s shares from on-chain-read values via a `{value:}` deposit/swap call with **no min-shares/min-out param and
+  no output bound**. Own narrow output-side suppressor (`minOut`/`minShares`/`amountOutMin`/…, NOT input floors like
+  `minAmount`) so `require(msg.value>=minAmount)` doesn't false-silence it. 0 added on universal-router/balancer-v2.
+- **C — NEW detector `SpotPricedShareValue` → asymmetry H-04** (out-of-class): a price-per-share / exchange-rate
+  getter (`ethPerDerivative`/`*PerShare`/`exchangeRate`/`*ToAssets`) that returns a value derived from a *manipulable
+  spot source* (Curve `price_oracle()`, `get_dy`, `getReserves`, `slot0`, …) with no TWAP/Chainlink-staleness/redemption
+  basis and no bound clamp. New Category (slug `spot-priced-share-value`, CWE-840/682) + manifest arm + H-04 relabel
+  (stays `in_class:false`). **0 findings on aave-v3 / morpho-blue / balancer-v2** (all price via Chainlink-with-staleness
+  → suppressed). This closes the exact gap the `oracle-manipulation` detector left (it excludes bare `price_oracle()`).
+- **A — conservation.rs → Stader M-06: REJECTED (ground-truth discipline).** Agent A extended Conservation with a
+  `clamped = min(obligation, balance); state -= clamped; recovery(clamped)` arm and fired it on `SDCollateral.slashSD`.
+  But the **real M-06** (verified against the report summary) is *`slashValidatorSD` slashing `poolThreshold.minThreshold`
+  instead of the actual penalty* — a fixed-threshold-vs-real-penalty bug, a different mechanism in a different function.
+  A's `slashSD` firing is also a borderline FP: the in-branch external call (`createLot`) **disposes** the slashed amount,
+  it is not a shortfall-*recovery* (the M-12 case where `slashValidatorSD` genuinely makes-whole). So A neither hit its
+  target nor produced a clean positive → reverted. M-12 conservation catch preserved by the pre-existing arm. (This is
+  the [[feedback-verify-benchmark-ground-truth]] lesson working: don't relabel the manifest to manufacture a catch.)
+- **D — first novel-bug hunt (EtherFi liquid-staking, ~/Data/etherfi-audit, read-only, non-corpus).** Depth-first trace
+  of the eETH/weETH share math, redemption manager, withdrawal-NFT queue, priority queue, staking manager. **No
+  confidently-exploitable High/Critical found** (hardened: protocol-favoring ceiling-division, post-burn share-conservation
+  asserts, CEI on ETH sends). Honest result, not inflated. Strongest residual lead: `StakingManager.confirmAndFundBeaconValidators`
+  lacks an idempotency/state-machine guard (unlike `createBeaconValidators`) — but it's a *trusted* (approver-role) path and
+  funds go to ether.fi's own withdrawal credentials, so it's defense-in-depth, not attacker fund-loss. Best next-pass target:
+  the `EtherFiOracle`→`ethAmountLockedForWithdrawal` solvency coupling and EigenLayer node-withdrawal accounting (cross the
+  off-chain oracle boundary, unresolvable from Solidity alone this pass). Leads preserved in `docs/dogfood-findings/etherfi-2026-06-04.md`.
+- **Integration:** disjoint merge (B=slippage.rs; C=finding.rs+mod.rs+new detector+manifest.rs+asymmetry.json; A reverted),
+  one authoritative gate. **Build 0 warnings**, workspace **942 engine tests / 0 fail** (then A revert → M-12 arm intact),
+  corpus + real_hacks green. 135 detectors (+1: SpotPricedShareValue).
+- **SCOREBOARD (8 contests): in-class 90% (28/31), out-of-class 7% (3/41), Crit/High 27 (19 unmatched — UNCHANGED, precision
+  held).** asymmetry 80%→100% in-class, 0%→25% out-of-class. Both landings independently verified real catches at the right
+  loci. _done._

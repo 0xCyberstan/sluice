@@ -194,6 +194,8 @@ pub enum Category {
     ValueSourceDiscipline,
     // ---- PHASE B2: invariant engine — conservation / accounting-invariant ----
     Conservation,
+    // ---- Spot-priced exchange-rate / price-per-share (asymmetry H-04 class) ----
+    SpotPricedShareValue,
     Other,
 }
 
@@ -346,6 +348,7 @@ impl Category {
             MarkVsIndexPriceInconsistency => "mark-vs-index-price-inconsistency",
             ValueSourceDiscipline => "value-source-discipline",
             Conservation => "conservation",
+            SpotPricedShareValue => "spot-priced-share-value",
             Other => "other",
         }
     }
@@ -480,6 +483,7 @@ impl Category {
             MarkVsIndexPriceInconsistency => &["CWE-682", "CWE-840"],
             ValueSourceDiscipline => &["CWE-840", "CWE-682"],
             Conservation => &["CWE-840", "CWE-682"],
+            SpotPricedShareValue => &["CWE-840", "CWE-682"],
             _ => &[],
         }
     }

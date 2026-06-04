@@ -16,6 +16,19 @@
 //!    the caller front-run for the full slippage. This is the same MEV class as a
 //!    `minOut: 0` router swap, but the priced operation *is* the function rather
 //!    than a downstream router call, so the arg-level check in (1) never sees it.
+//!
+//! 3. **Payable share-minting deposit with no min-shares bound** — a
+//!    public/external **payable** function that takes the caller's native ETH,
+//!    routes it through one or more external `deposit`/swap calls (each of which
+//!    itself incurs AMM slippage), then computes a share amount from the values
+//!    those calls *report back* and `_mint`s it to the caller — with **no**
+//!    `minShares`/`minOut` parameter and no `require` bounding the minted amount.
+//!    This is the Asymmetry `SafEth.stake()` shape: the per-derivative
+//!    `deposit{value:}()` slippage is fully borne by the caller, the realized
+//!    share count is unbounded, and a searcher can sandwich the deposit. It is the
+//!    same value-leak as (2), but the price here is read implicitly from the
+//!    return values of downstream value-bearing deposits rather than from a named
+//!    curve/spot helper, so arm (2)'s curated-pricing gate never matches it.
 
 use crate::context::AnalysisContext;
 use crate::detector::Detector;
@@ -112,6 +125,14 @@ impl Detector for SlippageDetector {
             if let Some(finding) = self_priced_mint_redeem(cx, f) {
                 out.push(finding);
             }
+
+            // Class 3: payable share-minting deposit whose minted amount is sized
+            // from downstream value-bearing deposit/swap returns, with no
+            // min-shares bound (the Asymmetry `SafEth.stake()` shape). Suppressed
+            // if Class 2 already covered the function.
+            else if let Some(finding) = payable_mint_no_min_shares(cx, f) {
+                out.push(finding);
+            }
         }
         out
     }
@@ -182,6 +203,120 @@ fn self_priced_mint_redeem(cx: &AnalysisContext, f: &Function) -> Option<Finding
              without a user-enforced bound.",
         );
     Some(cx.finish(b, f.id, f.span))
+}
+
+/// Class 3 — a **payable** share-minting deposit that bounds nothing on the
+/// minted amount (the Asymmetry `SafEth.stake()` shape). Returns at most one
+/// finding for the function (anchored at its span).
+///
+/// Requires *all* of:
+///   (a) the function is `payable` (it takes the caller's native ETH directly),
+///   (b) the body mints shares (`_mint`/`mint`),
+///   (c) the caller's ETH is routed through at least one external value-bearing
+///       deposit/swap call (`deposit{value:}` / `swap{value:}` / a `deposit`-named
+///       call), each of which itself incurs AMM slippage the caller fully bears,
+///   (d) the function neither takes nor enforces any min-out / min-shares /
+///       deadline-style protection (the same suppressor as arm 2).
+///
+/// The `payable` + value-bearing-deposit gate is what keeps this tight: a plain
+/// ERC4626 `deposit(assets, ...)` is non-payable (fails (a)); a router swap does
+/// not `_mint` shares to the caller (fails (b)); a bounded staking deposit that
+/// takes `minShares` is suppressed by (d). Arm 2 already fires when the price is
+/// read from a *named* curve/spot helper — this arm covers the case where the
+/// price is read implicitly from the deposits' return values, which arm 2 misses.
+fn payable_mint_no_min_shares(cx: &AnalysisContext, f: &Function) -> Option<Finding> {
+    if !f.is_payable() {
+        return None;
+    }
+    let (mints, _redeems) = mint_or_redeem_action(f);
+    if !mints {
+        return None;
+    }
+    if !routes_value_through_deposit(f) {
+        return None;
+    }
+    if has_mint_output_bound(cx, f) {
+        return None;
+    }
+
+    let b = FindingBuilder::new("slippage", Category::Slippage)
+        .title("Payable share-minting deposit with no minimum-shares bound")
+        .severity(Severity::Medium)
+        .confidence(0.55)
+        .dimension(Dimension::ValueFlow)
+        .message(format!(
+            "`{}` is `payable`: it takes the caller's native ETH, routes it through one or more \
+             external value-bearing `deposit`/swap calls (each of which itself incurs AMM \
+             slippage), then mints shares whose amount is derived from the values those calls \
+             report back — but it takes no `minShares`/`minOut` parameter and enforces no \
+             `require` on the minted amount. The caller has no way to bound how few shares the \
+             deposit returns, so a searcher can sandwich it: move the underlying pool price just \
+             before the victim's transaction and back after it, forcing the downstream deposits \
+             to mint at a worse rate and capturing the slippage as MEV. This is the same value-leak \
+             class as a `minOut: 0` router swap.",
+            f.name
+        ))
+        .recommendation(
+            "Add a caller-supplied `minShares`/`minOut` (computed off-chain with a slippage \
+             tolerance) and `require` the realized minted amount meets it before `_mint`; a real \
+             future `deadline` further bounds how long the quote stays valid. Never mint shares \
+             off the result of value-bearing deposits without a user-enforced lower bound.",
+        );
+    Some(cx.finish(b, f.id, f.span))
+}
+
+/// Arm-3-specific suppressor: true if the function bounds the *minted output*
+/// amount. Deliberately narrower than [`has_slippage_protection`]: it does **not**
+/// treat an input floor (`minAmount`/`minPrice` on the incoming ETH, as in
+/// `require(msg.value >= minAmount)`) as a min-shares guard, because that bounds
+/// the deposit *input*, not how few shares the caller receives. Only a bound that
+/// names the *output* — `minShares`/`minOut`/`minReturn`/`minReceived`/
+/// `minProceeds`/`minTokens`/`amountOutMin`/`slippage`/`maxSlippage` — counts.
+fn has_mint_output_bound(cx: &AnalysisContext, f: &Function) -> bool {
+    if f.params.iter().any(|p| {
+        p.name
+            .as_deref()
+            .map(|n| MINT_OUTPUT_TOKENS.iter().any(|t| n.to_ascii_lowercase().contains(t)))
+            .unwrap_or(false)
+    }) {
+        return true;
+    }
+    let body = cx.source_text(f.span);
+    MINT_OUTPUT_TOKENS.iter().any(|t| body.contains(t))
+}
+
+/// Output-bound substrings for arm 3. A subset of [`PROTECTION_TOKENS`] minus the
+/// input-floor tokens (`minamount`, `minprice`) and the standalone `deadline`,
+/// which on a share mint does not bound the share count.
+const MINT_OUTPUT_TOKENS: &[&str] = &[
+    "minout",
+    "minamountout",
+    "amountoutmin",
+    "minshares",
+    "mintokens",
+    "minreturn",
+    "minreceived",
+    "minproceeds",
+    "maxslippage",
+    "slippage",
+];
+
+/// True if the body routes the caller's value through an external deposit/swap
+/// call site that itself moves native ETH (`{value:}`), or whose method name is a
+/// deposit/swap primitive. This is the slippage-incurring leg whose return value
+/// the mint is sized from. Requiring a `sends_value` deposit (rather than just any
+/// transfer) keeps this distinct from arm 2's broader value-movement check and
+/// matches the `derivative.deposit{value: ethAmount}()` shape exactly.
+fn routes_value_through_deposit(f: &Function) -> bool {
+    f.effects.call_sites.iter().any(|c| {
+        // A value-bearing (`{value:}`) external call into a deposit/swap-style
+        // primitive — the slippage-incurring leg whose return the mint sizes from.
+        c.sends_value
+            && matches!(
+                c.func_name.as_deref().map(str::to_ascii_lowercase).as_deref(),
+                Some("deposit" | "swap" | "swapexactethfortokens" | "mint" | "stake" | "wrap")
+            )
+    })
 }
 
 /// `(mints, redeems)` — does the body invoke a mint and/or a burn primitive?
@@ -661,6 +796,82 @@ mod tests {
             !fs.iter()
                 .any(|f| f.detector == "slippage" && f.function == "deposit"),
             "a deposit that enforces minShares must not fire: {:?}",
+            fs
+        );
+    }
+
+    // ---- Class 3: payable share-minting deposit with no min-shares bound ----
+
+    // Asymmetry `SafEth.stake()` shape: a payable function routes the caller's ETH
+    // through per-derivative `deposit{value:}()` calls (each incurring slippage),
+    // then mints shares sized from the reported values, with no `minShares` bound.
+    const STAKE_VULN: &str = r#"
+        interface IDerivative {
+            function deposit() external payable returns (uint256);
+            function ethPerDerivative(uint256 amount) external view returns (uint256);
+        }
+        contract SafEth {
+            uint256 public totalSupply;
+            uint256 public derivativeCount;
+            mapping(uint256 => IDerivative) public derivatives;
+            mapping(uint256 => uint256) public weights;
+            uint256 public totalWeight;
+            function _mint(address to, uint256 amt) internal { totalSupply += amt; }
+            function stake() external payable {
+                uint256 preDepositPrice = 10 ** 18;
+                uint256 totalStakeValueEth = 0;
+                for (uint256 i = 0; i < derivativeCount; i++) {
+                    uint256 ethAmount = (msg.value * weights[i]) / totalWeight;
+                    uint256 depositAmount = derivatives[i].deposit{value: ethAmount}();
+                    totalStakeValueEth +=
+                        (derivatives[i].ethPerDerivative(depositAmount) * depositAmount) / 10 ** 18;
+                }
+                uint256 mintAmount = (totalStakeValueEth * 10 ** 18) / preDepositPrice;
+                _mint(msg.sender, mintAmount);
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_payable_mint_no_min_shares() {
+        let fs = run(STAKE_VULN);
+        assert!(
+            fs.iter()
+                .any(|f| f.detector == "slippage" && f.function == "stake"),
+            "expected a slippage finding on the payable share-minting stake: {:?}",
+            fs
+        );
+    }
+
+    // Same stake, but it now takes and enforces a caller `minOut` on the minted
+    // amount — the operation is bounded, so it must stay silent.
+    #[test]
+    fn silent_on_payable_mint_with_min_shares() {
+        let src = r#"
+            interface IDerivative {
+                function deposit() external payable returns (uint256);
+            }
+            contract SafEth {
+                uint256 public totalSupply;
+                uint256 public derivativeCount;
+                mapping(uint256 => IDerivative) public derivatives;
+                function _mint(address to, uint256 amt) internal { totalSupply += amt; }
+                function stake(uint256 minOut) external payable {
+                    uint256 totalStakeValueEth = 0;
+                    for (uint256 i = 0; i < derivativeCount; i++) {
+                        totalStakeValueEth += derivatives[i].deposit{value: msg.value}();
+                    }
+                    uint256 mintAmount = totalStakeValueEth;
+                    require(mintAmount >= minOut, "slippage");
+                    _mint(msg.sender, mintAmount);
+                }
+            }
+        "#;
+        let fs = run(src);
+        assert!(
+            !fs.iter()
+                .any(|f| f.detector == "slippage" && f.function == "stake"),
+            "a stake that enforces minOut must not fire: {:?}",
             fs
         );
     }

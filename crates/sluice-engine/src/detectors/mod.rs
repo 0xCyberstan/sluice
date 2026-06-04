@@ -174,6 +174,8 @@ pub mod mark_vs_index_price_inconsistency;
 pub mod value_source_discipline;
 // PHASE B2 — invariant engine: conservation / accounting-invariant (Stader M-12 class).
 pub mod conservation;
+// Spot-priced exchange-rate / price-per-share value getter (asymmetry H-04 class).
+pub mod spot_priced_share_value;
 
 use crate::detector::Detector;
 
@@ -358,6 +360,8 @@ pub fn builtin_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(value_source_discipline::ValueSourceDisciplineDetector),
         // PHASE B2 — invariant engine: conservation / accounting-invariant (Stader M-12 class).
         Box::new(conservation::ConservationDetector),
+        // Spot-priced exchange-rate / price-per-share value getter (asymmetry H-04 class).
+        Box::new(spot_priced_share_value::SpotPricedShareValueDetector),
     ]
 }
 
