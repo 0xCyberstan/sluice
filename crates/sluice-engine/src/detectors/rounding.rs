@@ -63,6 +63,27 @@ impl Detector for RoundingDetector {
                 }
             }
 
+            // ---- Arm 4: caller-supplied price gated by a collateral check ----
+            // A state-mutating entry point takes a caller-supplied `price`
+            // parameter and passes it *unrounded* into a collateral-check helper
+            // (`checkCollateral(collateralBalance(), newPrice)`) whose invariant is
+            // `collateralReserve * price < minted * ONE_DEC18 => revert`. The
+            // minimum acceptable price is `minted * ONE_DEC18 / collateral`, which
+            // must be rounded *up*; a caller that computes it off-chain with the
+            // ordinary truncating division supplies a price one wei too low and the
+            // legitimate adjustment reverts (Frankencoin `adjustPrice`, M-09). Unlike
+            // Arm 2, the division is off-chain — the on-chain hazard is the bare
+            // comparison gating a parameter, so this arm anchors on the structural
+            // shape rather than an in-body `/`.
+            if f.is_externally_reachable() && f.is_state_mutating() {
+                if let Some(span) = find_unrounded_price_collateral_gate(cx, f) {
+                    if !uses_explicit_rounding(cx, f) {
+                        out.push(self.price_gate_finding(cx, f, span));
+                        continue;
+                    }
+                }
+            }
+
             // ---- Arm 3: sqrt-based reserve recovery ----
             // A reserve/invariant value recovered through an integer square root
             // (`LibMath.sqrt(..)`, `x.sqrt()`) or its inverse `s ** 2 / b`. Integer
@@ -156,6 +177,30 @@ impl RoundingDetector {
                  reserve *up* (and the forward LP-supply *down*) so the constant-product invariant can \
                  never be satisfied by a value that over-credits the swapper — e.g. add 1 to the floored \
                  sqrt when it is not exact, or use a ceil variant on the reserve side.",
+            );
+        cx.finish(b, f.id, span)
+    }
+
+    fn price_gate_finding(&self, cx: &AnalysisContext, f: &Function, span: sluice_ir::Span) -> Finding {
+        let b = FindingBuilder::new(self.id(), Category::RoundingDirection)
+            .title("Caller-supplied price gated by a truncating collateral check (legitimate adjustment reverts)")
+            .severity(Severity::Medium)
+            .confidence(0.5)
+            .dimension(Dimension::ValueFlow)
+            .message(format!(
+                "`{}` passes a caller-supplied price parameter, unrounded, into a collateral check of \
+                 the form `collateralReserve * price >= minted * ONE_DEC18` (revert otherwise). The \
+                 minimum price that satisfies the invariant is `minted * ONE_DEC18 / collateral`, which \
+                 must be rounded *up*; a caller computing it off-chain with ordinary truncating division \
+                 supplies a value one wei too low, so the collateral check fails and a legitimate, \
+                 well-collateralized adjustment reverts.",
+                f.name
+            ))
+            .recommendation(
+                "Do not require callers to hit an exact rounded-up price. Either compute the minimum \
+                 acceptable price on-chain with a ceil division (round the required price *up*) before \
+                 comparing, or relax the collateral check to tolerate the truncation (e.g. compare \
+                 against `minted * ONE_DEC18` with a >= that accounts for the rounding direction).",
             );
         cx.finish(b, f.id, span)
     }
@@ -356,6 +401,90 @@ fn first_bare_div_span(e: &Expr) -> Option<sluice_ir::Span> {
         }
     });
     found
+}
+
+// ---------------------------------------------------------------------------
+// Arm 4: caller-supplied price gated by a collateral check
+// ---------------------------------------------------------------------------
+
+/// Find a caller-supplied `price` parameter that is passed, unrounded, into a
+/// collateral-check helper whose invariant is `collateral * price >= minted * X`.
+///
+/// Conservative gating, all required:
+///   1. the function declares a parameter whose name contains `price`;
+///   2. the body calls a collateral-check function (callee name contains
+///      `collateral`, e.g. `checkCollateral`) passing that price parameter as a
+///      direct simple-name argument (so the caller-controlled price reaches the
+///      check verbatim, not via an on-chain ceil);
+///   3. the enclosing contract actually contains the `collateral * price < minted`
+///      revert invariant (the `coll * price` product compared against a
+///      `minted`/`debt` product), so we only flag where the truncation can bite.
+///
+/// Returns the span of the gating call. This is the M-09 `adjustPrice` shape; the
+/// truncating division is performed off-chain by the caller, so unlike Arm 2 there
+/// is no in-body `/` to anchor on — the call passing an unrounded price into the
+/// product-comparison invariant is the signal.
+fn find_unrounded_price_collateral_gate(
+    cx: &AnalysisContext,
+    f: &Function,
+) -> Option<sluice_ir::Span> {
+    // (1) a caller-supplied price parameter.
+    let price_param = f.params.iter().find_map(|p| {
+        p.name
+            .as_deref()
+            .filter(|n| n.to_ascii_lowercase().contains("price"))
+            .map(|n| n.to_ascii_lowercase())
+    })?;
+
+    // (3) the contract must hold the `collateral * price < minted * X` invariant.
+    let contract = cx.contract_of(f.id)?;
+    if !contract_has_collateral_product_invariant(cx, contract) {
+        return None;
+    }
+
+    // (2) a collateral-check call that receives the price parameter directly.
+    let mut found = None;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found.is_some() {
+                return;
+            }
+            if let ExprKind::Call(c) = &e.kind {
+                let is_coll_check = c
+                    .func_name
+                    .as_deref()
+                    .map(|n| {
+                        let l = n.to_ascii_lowercase();
+                        l.contains("collateral") || l.contains("solven")
+                    })
+                    .unwrap_or(false);
+                if is_coll_check
+                    && c.args.iter().any(|a| {
+                        a.simple_name()
+                            .map(|n| n.to_ascii_lowercase() == price_param)
+                            .unwrap_or(false)
+                    })
+                {
+                    found = Some(e.span);
+                }
+            }
+        });
+    }
+    found
+}
+
+/// True if the contract source contains the `collateral * price < minted * X`
+/// solvency invariant: a `<`/`<=` ordering comparison whose source text mentions a
+/// collateral product on one side and a `minted`/`debt` product on the other. The
+/// comparison usually lives in a `checkCollateral` helper (the callee), so we scan
+/// every function of the contract rather than just the gated entry point.
+fn contract_has_collateral_product_invariant(cx: &AnalysisContext, contract: &sluice_ir::Contract) -> bool {
+    let src = cx.source_text(contract.span);
+    // Cheap textual co-occurrence prefilter: the product invariant references
+    // collateral, a price, and a minted/debt quantity together.
+    src.contains("collateral")
+        && src.contains("price")
+        && (src.contains("minted") || src.contains("debt") || src.contains("borrow"))
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +818,108 @@ mod tests {
     #[test]
     fn silent_on_rounded_sqrt_reserve() {
         let fs = run(SQRT_SAFE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "rounding-direction"),
+            "{:?}",
+            fs
+        );
+    }
+
+    // ---- Arm 4: caller-supplied price gated by a collateral check (M-09) ----
+    // `adjustPrice` passes a caller-supplied `newPrice` straight into
+    // `checkCollateral(collateralBalance(), newPrice)`, whose invariant is
+    // `collateralReserve * atPrice < minted * ONE_DEC18 => revert`. A caller that
+    // computes the minimum price with truncating division supplies a value one wei
+    // low and a legitimate adjustment reverts.
+    const PRICE_GATE_VULN: &str = r#"
+        contract Position {
+            uint256 public price;
+            uint256 public minted;
+            address public collateral;
+            uint256 constant ONE_DEC18 = 1e18;
+            function adjustPrice(uint256 newPrice) public {
+                if (newPrice > price) {
+                    revert();
+                } else {
+                    checkCollateral(collateralBalance(), newPrice);
+                }
+                price = newPrice;
+            }
+            function collateralBalance() internal view returns (uint256) {
+                return IERC20(collateral).balanceOf(address(this));
+            }
+            function checkCollateral(uint256 collateralReserve, uint256 atPrice) internal view {
+                if (collateralReserve * atPrice < minted * ONE_DEC18) revert();
+            }
+        }
+    "#;
+
+    // Same shape but the entry point rounds the required price up on-chain via a
+    // ceil helper before gating, so honest callers are never rejected — no finding.
+    const PRICE_GATE_SAFE: &str = r#"
+        contract Position {
+            uint256 public price;
+            uint256 public minted;
+            address public collateral;
+            uint256 constant ONE_DEC18 = 1e18;
+            function adjustPrice(uint256 newPrice) public {
+                uint256 floorPrice = ceilDiv(minted * ONE_DEC18, collateralBalance());
+                if (newPrice < floorPrice) revert();
+                checkCollateral(collateralBalance(), newPrice);
+                price = newPrice;
+            }
+            function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+                return (a + b - 1) / b;
+            }
+            function collateralBalance() internal view returns (uint256) {
+                return IERC20(collateral).balanceOf(address(this));
+            }
+            function checkCollateral(uint256 collateralReserve, uint256 atPrice) internal view {
+                if (collateralReserve * atPrice < minted * ONE_DEC18) revert();
+            }
+        }
+    "#;
+
+    // A generic price setter with no collateral invariant in the contract must NOT
+    // trip Arm 4 — there is no `collateral * price >= minted` product to revert on.
+    const PRICE_GATE_NO_INVARIANT: &str = r#"
+        contract Oracle {
+            uint256 public price;
+            function setPrice(uint256 newPrice) public {
+                checkBounds(newPrice);
+                price = newPrice;
+            }
+            function checkBounds(uint256 p) internal pure {
+                if (p == 0) revert();
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_unrounded_price_collateral_gate() {
+        let fs = run(PRICE_GATE_VULN);
+        assert!(
+            fs.iter().any(|f| f.detector == "rounding-direction"
+                && f.function == "adjustPrice"),
+            "{:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_onchain_rounded_price_gate() {
+        let fs = run(PRICE_GATE_SAFE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "rounding-direction"
+                && f.function == "adjustPrice"),
+            "{:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_price_setter_without_collateral_invariant() {
+        let fs = run(PRICE_GATE_NO_INVARIANT);
         assert!(
             !fs.iter().any(|f| f.detector == "rounding-direction"),
             "{:?}",

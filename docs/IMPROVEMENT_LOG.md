@@ -1006,3 +1006,29 @@ codebase). 2 detector landings + 1 disciplined rejection:
 - **SCOREBOARD (8 contests): in-class 90% (28/31), out-of-class 10% (4/41), Crit/High 27 (19 unmatched — UNCHANGED,
   precision held).** out-of-class 7%→10% this wave (B1 LoopFi H-01, B2-class none, spot-priced asymmetry H-04,
   push-payment asymmetry M-06, + Stader M-12). asymmetry fully solved (100% in / 50% out). _done._
+
+### NORTH STAR — wave 6 (in-class to 97% + more real bugs): in-class 90%→97%
+2 detector agents (worktree) + 1 deep hunt (read-only).
+- **H — centralization.rs → Stader M-03** (in-class): new tightly-gated arm for the operator-role-gated
+  validator-lifecycle state advance (`markValidator*`/`*ReadyToDeposit` + inline `only*Role(msg.sender,…)` guard, no
+  timelock). Fires at `PermissionlessNodeRegistry.markValidatorReadyToDeposit:183` (+ a true-positive sibling in
+  PermissionedNodeRegistry). **0 change to dogfood Crit/High** (all six repos identical). **ROOT-CAUSE NOTED for a
+  future wave:** `effects.rs` only records `MsgSenderCheck` guards for `require`/`assert`/`if-revert`/modifiers — NOT for
+  bare library-call guards like `UtilLib.onlyOperatorRole(msg.sender,…)`, so `has_access_control` is false for that whole
+  guard idiom (affects every access-control-gated detector). H worked around it in-file; a root fix in effects.rs would
+  lift access-control recognition globally.
+- **I — rounding.rs → Frankencoin M-09** (in-class): new Arm 4 for a `price`-named param passed *verbatim, unrounded*
+  into a collateral-product gate (`collateral*price >= minted*X`) where the required ceil-rounding happens off-chain →
+  legit adjustments revert. Fires at `Position.adjustPrice:163`; existing frankencoin rounding catches preserved; **0
+  added on aave/morpho/balancer**.
+- **J — EtherFi node/EigenLayer accounting deep hunt:** 2 more confirmed Low defects (permissionless `receive()`
+  in/out-split corruption + underflow griefing; `min(balance,outOfLp)` sweep-cap stranding) + 1 latent
+  negative-slash `uint128` rebase-wrap risk guarded only by a soon-to-be-removed off-chain APR bound. All honest Low /
+  borderline-Med (no theft/share-inflation on-chain); EL double-count reduces to off-chain oracle trust. Appended to
+  `docs/dogfood-findings/etherfi-2026-06-04.md`.
+- **Integration:** disjoint (H=centralization.rs, I=rounding.rs). One authoritative gate: build 0 warnings, **949 engine
+  tests / 0 fail**, full workspace green, corpus + real_hacks green. 135 detectors.
+- **SCOREBOARD (8 contests): in-class 97% (30/31), out-of-class 10% (4/41), Crit/High 27 (19 unmatched — UNCHANGED,
+  precision held).** Frankencoin + Stader now 100% in-class; asymmetry 100%/50%. Only in-class miss left = reserve M-02
+  (share-inflation, StRSR.stake). North-star recall target (≥80% in-class) comfortably exceeded; out-of-class is the
+  standing frontier. _done._

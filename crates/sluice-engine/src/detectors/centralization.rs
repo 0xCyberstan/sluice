@@ -119,6 +119,8 @@ pub struct CentralizationDetector;
 const STRONG_TITLE: &str = "Privileged admin can move/re-route user funds with no timelock";
 const SOFT_TITLE: &str = "Privileged parameter setter (no timelock)";
 const RESCUE_TITLE: &str = "Privileged token-rescue to a fixed recipient";
+const VALIDATOR_TITLE: &str =
+    "Single privileged role unilaterally advances validator lifecycle (no appeal / second party)";
 
 impl Detector for CentralizationDetector {
     fn id(&self) -> &'static str {
@@ -135,6 +137,39 @@ impl Detector for CentralizationDetector {
         let mut out = Vec::new();
 
         for f in cx.entry_points() {
+            // ---- Single-role-gated validator-lifecycle state advance ----------
+            // A distinct centralization shape that the generic fund-flow arms miss:
+            // a function gated *only* by an inline discretionary-role library check
+            // — `UtilLib.onlyOperatorRole(msg.sender, …)` (a bare call statement, not
+            // a `require`/modifier, so `cx.has_access_control` never sees it) — that
+            // unilaterally **advances a validator lifecycle state machine**
+            // (`markValidatorReadyToDeposit`: a single OPERATOR moves validators from
+            // INITIALIZE → PRE_DEPOSIT, flags front-runs, marks invalid signatures).
+            // This is a single-point-of-failure on a privileged role: one operator
+            // validates validators with no second party / appeal path (Stader M-03).
+            // Gated tightly — the function must (a) be a validator-lifecycle advance
+            // by name AND (b) carry an inline `only*Role(msg.sender, …)` discretionary
+            // guard — so it cannot fire on ordinary admin setters or protocol-internal
+            // (`onlyStaderContract`) plumbing. Handled before the generic gates
+            // because the guard shape is invisible to `has_access_control`.
+            if is_validator_lifecycle_advance(&f.name)
+                && has_inline_role_guard_call(f)
+                && !f.is_view_or_pure()
+            {
+                if let Some(contract) = cx.contract_of(f.id) {
+                    if !contract_has_timelock(cx, contract) {
+                        out.push(self.finding(
+                            cx,
+                            f,
+                            VALIDATOR_TITLE,
+                            Severity::Medium,
+                            validator_msg(&contract.name, &f.name),
+                        ));
+                        continue;
+                    }
+                }
+            }
+
             // Core gate: the function must be access-controlled. A privileged
             // admin operation is the whole subject of this class; a
             // permissionless function is covered by other detectors
@@ -461,6 +496,20 @@ fn soft_msg(contract: &str, func: &str) -> String {
     )
 }
 
+fn validator_msg(contract: &str, func: &str) -> String {
+    format!(
+        "`{}.{}` is gated by a single discretionary role (an inline \
+         `only*Role(msg.sender, …)` operator check) and unilaterally **advances a \
+         validator lifecycle state machine** — one operator alone marks validators \
+         ready to deposit / flags them as front-run / marks signatures invalid, with \
+         no second party, multisig, or appeal path. A single compromised or malicious \
+         operator key can therefore validate (or block) validators and steer the \
+         protocol's deposit flow in one transaction — a centralization / \
+         single-point-of-failure on a security-critical trust action.",
+        contract, func
+    )
+}
+
 // (The former `fixed_dest_msg` / FIXED_DEST_TITLE preset-destination Info
 // sub-class was removed: that tier is now suppressed entirely — see the
 // fund-flow arm in `run`.)
@@ -493,6 +542,57 @@ fn is_fund_routing_setter(name: &str) -> bool {
     // Bulk sweep / migration of held funds. (`rescue` is handled by the dedicated
     // recover-name path, which runs first.)
     l.contains("withdrawall") || l.contains("migrate")
+}
+
+/// A validator-lifecycle **state-advance** function by name: a privileged action
+/// that moves validators through the protocol's deposit/validation state machine.
+/// Deliberately narrow — only the `markValidator*` / `markKeyReadyToDeposit` /
+/// `markValidatorReadyToDeposit` family (a single operator declaring validators
+/// ready / front-run / invalid). This is a trust-critical advance with no second
+/// party, distinct from ordinary admin setters; matching it by an exact-ish name
+/// shape keeps the new arm from firing on unrelated `mark*` helpers.
+fn is_validator_lifecycle_advance(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    // Must be a `mark*` action that touches the validator/key/deposit lifecycle.
+    l.starts_with("mark")
+        && (l.contains("validator") || l.contains("readytodeposit") || l.contains("keyready"))
+}
+
+/// True if the function body contains an **inline discretionary-role guard call** —
+/// a bare statement `<Lib>.only*Role(msg.sender, …)` (e.g.
+/// `UtilLib.onlyOperatorRole(msg.sender, staderConfig)`). This is an access-control
+/// check that the effects pass does NOT record as a `MsgSenderCheck` guard (it is
+/// neither a `require`/`assert`, an `if-revert`, nor a modifier), so
+/// `cx.has_access_control` is blind to it. We require the callee name to denote a
+/// **discretionary role** (`only*Role` — operator / manager / admin role), NOT a
+/// fixed-contract pin (`onlyStaderContract` / `only*Contract`), and its first
+/// argument to be `msg.sender`, so this recognizes exactly the single-role gate and
+/// never protocol-internal plumbing.
+fn has_inline_role_guard_call(f: &Function) -> bool {
+    let mut found = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            let ExprKind::Call(call) = &e.kind else { return };
+            let Some(name) = call.func_name.as_deref() else { return };
+            let l = name.to_ascii_lowercase();
+            // Discretionary role guard: `only…Role` (operator/manager/admin role).
+            // Exclude fixed-contract pins (`onlyStaderContract`, `only*Contract`).
+            if !(l.starts_with("only") && l.ends_with("role")) {
+                return;
+            }
+            // First argument must be the caller, so this is a `msg.sender` gate.
+            if call.args.first().map(|a| mentions_msg_sender(unwrap_casts(a))).unwrap_or(false) {
+                found = true;
+            }
+        });
+        if found {
+            break;
+        }
+    }
+    found
 }
 
 /// Token-rescue / recovery / sweep helpers, by name. These conventionally move
@@ -2413,6 +2513,76 @@ mod tests {
             c.iter().any(|f| f.severity >= Severity::Medium
                 && f.title.contains("move/re-route user funds")),
             "an admin transfer to a caller-supplied recipient must be Medium+: {:?}",
+            c
+        );
+    }
+
+    // ===== Stader M-03: single-role validator-lifecycle advance ===============
+
+    // Real shape (`PermissionlessNodeRegistry.markValidatorReadyToDeposit`): a
+    // single OPERATOR role, gated by an inline `UtilLib.onlyOperatorRole(msg.sender,
+    // …)` library call (NOT a require/modifier, so the effects pass records no
+    // MsgSenderCheck guard), unilaterally advances validators through the deposit
+    // state machine with no second party / appeal path. Must fire Medium with the
+    // validator-lifecycle title.
+    const VALIDATOR_LIFECYCLE_ADVANCE: &str = r#"
+        pragma solidity ^0.8.0;
+        library UtilLib {
+            function onlyOperatorRole(address a, address cfg) internal view {}
+        }
+        contract PermissionlessNodeRegistry {
+            address public staderConfig;
+            function markKeyReadyToDeposit(uint256 id) internal {}
+            function markValidatorReadyToDeposit(
+                bytes[] calldata _readyToDepositPubkey,
+                bytes[] calldata _frontRunPubkey,
+                bytes[] calldata _invalidSignaturePubkey
+            ) external {
+                UtilLib.onlyOperatorRole(msg.sender, staderConfig);
+                markKeyReadyToDeposit(1);
+            }
+        }
+    "#;
+
+    #[test]
+    fn validator_lifecycle_advance_is_medium() {
+        let fs = run(VALIDATOR_LIFECYCLE_ADVANCE);
+        let c = central(&fs);
+        assert!(
+            c.iter().any(|f| f.function == "markValidatorReadyToDeposit"
+                && f.severity == Severity::Medium
+                && f.title.contains("validator lifecycle")),
+            "markValidatorReadyToDeposit gated by a single operator role must fire \
+             Medium with the validator-lifecycle title: {:?}",
+            c
+        );
+    }
+
+    // Over-suppression / noise guard: a function gated by a **fixed-contract** pin
+    // (`onlyStaderContract` — protocol-internal plumbing, not a discretionary role)
+    // must NOT trip the new validator arm, even if its name mentions a validator.
+    const VALIDATOR_OP_CONTRACT_GATED: &str = r#"
+        pragma solidity ^0.8.0;
+        library UtilLib {
+            function onlyStaderContract(address a, address cfg, address x) internal view {}
+        }
+        contract Registry {
+            address public staderConfig;
+            // contract-gated, not a discretionary role -> not the M-03 shape
+            function markValidatorDeposited(uint256 id) external {
+                UtilLib.onlyStaderContract(msg.sender, staderConfig, address(0));
+            }
+        }
+    "#;
+
+    #[test]
+    fn validator_advance_contract_gated_is_not_validator_finding() {
+        let fs = run(VALIDATOR_OP_CONTRACT_GATED);
+        let c = central(&fs);
+        assert!(
+            c.iter().all(|f| !f.title.contains("validator lifecycle")),
+            "a fixed-contract-gated (onlyStaderContract) advance must not trip the \
+             single-role validator arm: {:?}",
             c
         );
     }

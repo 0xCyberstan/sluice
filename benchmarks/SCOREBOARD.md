@@ -12,11 +12,11 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 | `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 87 |
 | `2023-03-asymmetry` | 100% (5/5) | 50% (2/4) | 3 | 1 | 25 |
 | `2023-04-caviar` | 100% (1/1) | 0% (0/4) | 0 | 0 | 41 |
-| `2023-04-frankencoin` | 88% (7/8) | 0% (0/13) | 2 | 1 | 66 |
-| `2023-06-stader` | 67% (2/3) | 8% (1/12) | 3 | 2 | 31 |
+| `2023-04-frankencoin` | 100% (8/8) | 0% (0/13) | 2 | 1 | 67 |
+| `2023-06-stader` | 100% (3/3) | 8% (1/12) | 3 | 2 | 33 |
 | `2023-07-basin` | 100% (3/3) | 0% (0/2) | 2 | 1 | 44 |
 | `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 4 |
-| **AGGREGATE** | **90% (28/31)** | **10% (4/41)** | **27** | **19** | **453** |
+| **AGGREGATE** | **97% (30/31)** | **10% (4/41)** | **27** | **19** | **456** |
 
 ## Per-finding detail
 
@@ -95,7 +95,7 @@ Repo `code-423n4/2023-04-frankencoin` @ `0761a287999fa3efac5c9fa9b70fcef5eeecc21
 | M-06 | Medium | `griefing-collusion` | no | 🟡 near (class mismatch) | — | Colluding challenger+bidder repeatedly launch and avert minimal challenges to keep the position under the 1-day minting restriction, griefing the owner. |
 | M-07 | Medium | `dos-on-revert` | no | 🟡 near (class mismatch) | — | The serial ZCHF/collateral transfers in end() can revert (zero-amount transfer or blacklisted recipient), locking all challenge funds; needs a pull / postpone … |
 | M-08 | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ position.sol:80 | Clone price = _mint*1e18/_coll rounds down; the rounded-down price can fail the collateral invariant and revert valid clone mints (should round up). |
-| M-09 | Medium | `rounding-direction` | yes | ❌ missed | — | Rounding/precision loss in the collateral-vs-price check can make legitimate position adjustments revert. |
+| M-09 | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ position.sol:163 | Rounding/precision loss in the collateral-vs-price check can make legitimate position adjustments revert. |
 | M-10 | Medium | `slippage` | yes | ✅ caught | Slippage @ equity.sol:241 | FPS mint (onTokenTransfer) and redeem provide no minimum-out / slippage bound, so users can be sandwiched on the bonding-curve price. |
 | M-11 | Medium | `frontrunning-ordering` | no | 🟡 near (class mismatch) | — | A later challenger can bid on an earlier challenge to bump its end time, ordering their own challenge to settle first and claim the reward. |
 | M-12 | Medium | `design-economic` | no | 🟡 near (class mismatch) | — | Fixed challenge period ignores network congestion / volatility, so auctions can settle at unfair prices. |
@@ -112,7 +112,7 @@ Repo `code-423n4/2023-06-stader` @ `86c27eb6b1fb6e0928aaa906614a2d1c6e7543e3`.
 | H-01 | High | `unprotected-initializer` | yes | ✅ caught | UnprotectedInitializer @ vaultproxy.sol:20 | initialise() has no access control (only an isInitialized flag); an attacker can initialise a fresh proxy and, because the proxy delegatecalls the vault implem… |
 | M-01 | Medium | `logic-role-revoke` | no | ❌ missed | — | updateAdmin revokes DEFAULT_ADMIN_ROLE then grants it; setting the same address loses admin access (protocol-specific role lifecycle). |
 | M-02 | Medium | `missing-implementation` | no | ❌ missed | — | Several Pausable contracts (SocializingPool, StaderOracle, OperatorRewardsCollector, Auction) never expose pause()/unpause(), so pausing is impossible. |
-| M-03 | Medium | `centralization` | yes | ❌ missed | — | A single Stader OPERATOR unilaterally validates validators (markValidatorReadyToDeposit) with no appeal path — a centralization / single-point-of-failure on a … |
+| M-03 | Medium | `centralization` | yes | ✅ caught | Centralization @ permissionlessnoderegistry.sol:183 | A single Stader OPERATOR unilaterally validates validators (markValidatorReadyToDeposit) with no appeal path — a centralization / single-point-of-failure on a … |
 | M-04 | Medium | `logic-conflicting-require` | no | ❌ missed | — | updatePoolAddress always reverts for an existing poolId due to mutually exclusive validation conditions. |
 | M-05 | Medium | `consensus-quorum-logic` | no | ❌ missed | — | Consensus uses strict-equal submission counting vs a threshold that can never be met after trusted nodes are removed. |
 | M-06 | Medium | `accounting-error` | no | ❌ missed | — | slashValidatorSD slashes only poolThreshold.minThreshold rather than the actual penalty, under-slashing larger penalties. |
