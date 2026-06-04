@@ -15,8 +15,9 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 | `2023-04-frankencoin` | 100% (8/8) | 0% (0/13) | 2 | 1 | 67 |
 | `2023-06-stader` | 100% (3/3) | 8% (1/12) | 1 | 0 | 32 |
 | `2023-07-basin` | 100% (3/3) | 0% (0/2) | 2 | 1 | 44 |
+| `2023-10-wildcat` | 0% (0/1) | 0% (0/14) | 1 | 1 | 41 |
 | `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 4 |
-| **AGGREGATE** | **100% (31/31)** | **10% (4/41)** | **25** | **17** | **456** |
+| **AGGREGATE** | **97% (31/32)** | **7% (4/55)** | **26** | **18** | **497** |
 
 ## Per-finding detail
 
@@ -136,6 +137,28 @@ Repo `code-423n4/2023-07-basin` @ `73f7133b380ea027048f0b9aaa284b14f3ce43b4`.
 | M-01 | Medium | `accounting-logic` | no | ❌ missed | — | getBytes32FromBytes bounds-checks with `index > data.length` instead of `>=`, allowing an out-of-bounds memory read of the last word, which can return corrupte… |
 | M-06 | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ constantproduct2.sol:53 | calcLpTokenSupply computes the LP supply as sqrt(reserves[0]*reserves[1]*EXP_PRECISION); the integer sqrt loses precision asymmetrically versus the division us… |
 | M-08 | Medium | `block-number-as-time` | yes | ✅ caught | TimestampDependence @ multiflowpump.sol:121 | The pump treats the immutable BLOCK_TIME as a permanent constant (blocksPassed = deltaTimestamp / BLOCK_TIME in _capReserve), so if average block time changes … |
+
+### `2023-10-wildcat`
+
+Repo `code-423n4/2023-10-wildcat` @ `1f4422eb6ce844622a29cac6300472e3ab74705a`.
+
+| Known | Sev | Class | In-class | Result | Matched by | Summary |
+|---|---|---|---|---|---|---|
+| H-01 | High | `accounting-logic` | no | ❌ missed | — | closeMarket() pays only the debt snapshot at close time: `if (currentlyHeld < totalDebts) asset.safeTransferFrom(borrower, ..., totalDebts - currentlyHeld)`, w… |
+| H-02 | High | `logic` | no | 🟡 near (class mismatch) | — | deployMarket()'s collision guard is `if (market.codehash != bytes32(0)) revert MarketAlreadyDeployed();` (same pattern in deployController() factory L294). An … |
+| H-03 | High | `missing-implementation` | no | ❌ missed | — | Market.setMaxTotalSupply (and closeMarket) are `onlyController`, but WildcatMarketController exposes NO wrapper that forwards to setMaxTotalSupply or closeMark… |
+| H-04 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | When withdrawalBatchDuration == 0, queueWithdrawal sets pendingWithdrawalExpiry = block.timestamp (L95), and executeWithdrawal's only gate is `if (expiry > blo… |
+| H-05 | High | `logic` | no | ❌ missed | — | updateAccountAuthorization sets `account.approval = AuthRole.WithdrawOnly` for ANY account when _isAuthorized is false (L121), even one that was never a lender… |
+| H-06 | High | `logic` | no | 🟡 near (class mismatch) | — | executeWithdrawal escrows a sanctioned lender's funds via `createEscrow(accountAddress, borrower, address(asset))` but the sentinel signature is createEscrow(a… |
+| M-01 | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | _getUpdatedState accrues interest up to the batch expiry only `if (expiry != state.lastInterestAccruedTimestamp)` (L365) before _processExpiredWithdrawalBatch;… |
+| M-02 | Medium | `accounting-logic` | no | ❌ missed | — | _blockAccount moves a sanctioned account's scaled balance into a normal escrow account via `_accounts[escrow].scaledBalance += scaledBalance` (L178). Because b… |
+| M-03 | Medium | `accounting-logic` | no | ❌ missed | — | totalAssets() returns the live `IERC20(asset).balanceOf(address(this))` and all reserve/liquidity/borrowable math is derived from it; with a rebasing underlyin… |
+| M-04 | Medium | `rounding-direction` | yes | ❌ missed | — | _applyWithdrawalBatchPayment computes `normalizedAmountPaid = state.normalizeAmount(scaledAmountBurned).toUint128()` where normalizeAmount -> rayMul rounds HAL… |
+| M-05 | Medium | `accounting-logic` | no | ❌ missed | — | collectFees() calls `_writeState(state)` (L106) BEFORE `asset.safeTransfer(feeRecipient, withdrawableFees)` (L107). _writeState recomputes isDelinquent from th… |
+| M-06 | Medium | `missing-implementation` | no | ❌ missed | — | create2WithStoredInitCode performs `deployment := create2(...)` in assembly and returns it without checking `iszero(deployment)` (L106-117), unlike deployInitC… |
+| M-07 | Medium | `logic` | no | ❌ missed | — | removeMarket() (onlyOwner) deletes a market from _markets (L199). The sentinel's createEscrow requires `isRegisteredMarket(msg.sender)` (WildcatSanctionsSentin… |
+| M-08 | Medium | `economic-invariant` | no | ❌ missed | — | Controller.setAnnualInterestBips forces a 90% (9000 bip) reserve ratio for 2 weeks whenever the borrower LOWERS the rate (L474-485), and resetReserveRatio only… |
+| M-10 | Medium | `logic` | no | 🟡 near (class mismatch) | — | Controller.setAnnualInterestBips forwards `WildcatMarket(market).setAnnualInterestBips(annualInterestBips)` (L487) without calling assertValueInRange against M… |
 
 ### `2024-05-loop`
 

@@ -1059,3 +1059,29 @@ codebase). 2 detector landings + 1 disciplined rejection:
   2 spurious Stader access-control Crit/High (Stader unmatched 2→0). Strictly better on every axis. North-star in-class
   recall target maxed; out-of-class (10%) is the standing frontier and the remaining gaps are genuinely protocol-specific
   one-off logic bugs (Frankencoin 13 / Reserve / Stader logic), where bespoke detectors risk overfitting. _done._
+
+### NORTH STAR — wave 8 (corpus expansion + fresh-protocol hunt): 8→9 contests
+Pivot: in-class recall is maxed (100%) on the 8-contest corpus and the remaining out-of-class gaps are one-off
+protocol logic (overfitting risk), so the highest-leverage move is to GROW the benchmark with a fresh, untuned protocol —
+both to keep the metric honest (guard against 8-contest overfitting) and to hunt real bugs. Cloned **2023-10-wildcat**
+(Wildcat credit-market protocol, C4, READ-ONLY, commit 1f4422e, 33 non-test files) into `~/Data/bench/`.
+- **N — verified manifest `benchmarks/contests/2023-10-wildcat.json`:** fetched the official C4 report (6 High / 11
+  Medium), pinned 15 findings (6H/9M) each verified to a real `(contract, function, file, line)` in source; **honestly
+  DROPPED M-09 (no single pinnable locus) and M-11 (no real unchecked-transfer to pin)** rather than guess — the
+  ground-truth discipline ([[feedback-verify-benchmark-ground-truth]]). 1 in-class (M-04 rounding-direction), 14
+  out-of-class (protocol-specific accounting/logic).
+- **O — deep hunt on Wildcat:** no novel High found (accounting is tight, conservatively rounded in protocol's favor).
+  The Sluice-flagged **`resetReserveRatio` reentrancy High is a CONFIRMED FALSE POSITIVE** (trusted protocol-deployed
+  market target + `onlyController nonReentrant` callee with no callback + idempotent reset; the delete-after-call is
+  cosmetic). Best residual lead: `WildcatSanctionsEscrow.releaseEscrow` raw `transfer()` ignores return (Low/QA, only
+  affects a sanctioned account recovering its own escrow). Honest negative.
+- **SCOREBOARD (now 9 contests, 497 findings): in-class 97% (31/32), out-of-class 7% (4/55), Crit/High 26 (18
+  unmatched).** Wildcat untuned baseline = 0% recall (expected — 14/15 findings are protocol-specific out-of-class), with
+  **5 location-near matches (H-02/H-04/H-06/M-01/M-10) = the class-mismatch uplift surface** for a future Wildcat
+  detector wave, + M-04 (in-class rounding) as a tractable in-class target.
+- **KNOWN FP logged (precision backlog):** Sluice's Reentrancy detector fires a false High on
+  `WildcatMarketController.resetReserveRatio:490` (delete-after-external-call where the callee is a known `nonReentrant`
+  protocol contract). A future precision wave should suppress delete/state-after-call when the external target is a
+  registered protocol-deployed contract whose callee is `nonReentrant`.
+- This wave added NO code changes (corpus + report only); no gate needed beyond confirming the scoreboard loads & scores
+  the 9th contest cleanly (it does). _done._

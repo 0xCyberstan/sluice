@@ -1,0 +1,176 @@
+{
+  "name": "2023-10-wildcat",
+  "repo": "code-423n4/2023-10-wildcat",
+  "commit": "1f4422eb6ce844622a29cac6300472e3ab74705a",
+  "local_path": "~/Data/bench/2023-10-wildcat",
+  "scope_dirs": ["src"],
+  "audit_url": "https://code4rena.com/reports/2023-10-wildcat",
+  "note": "The Wildcat Protocol — an on-chain undercollateralized credit/lending market (factory -> controller -> per-borrower market, scaled-balance interest accrual, sanctions escrow). Official C4 report: 6 High / 11 Medium. This manifest pins a conservative, high-confidence subset of those findings, each verified to a real (contract, function, file, line) in src at commit 1f4422e. Most are protocol-specific accounting/logic bugs (out-of-class for Sluice's modeled detector set); only the rounding-direction finding is marked in_class. IDs carry the report's H-/M- number.",
+  "known_findings": [
+    {
+      "id": "H-01",
+      "severity": "High",
+      "contract": "WildcatMarket",
+      "function": "closeMarket",
+      "file": "src/market/WildcatMarket.sol",
+      "line": 152,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "closeMarket() pays only the debt snapshot at close time: `if (currentlyHeld < totalDebts) asset.safeTransferFrom(borrower, ..., totalDebts - currentlyHeld)`, where totalDebts() does not fold in penalty fees that keep accruing while state.timeDelinquent unwinds (FeeMath.updateScaleFactorAndFees). The borrower escapes ~half the remaining penalty fees and the shortfall is silently borne by the last lender to withdraw (H-01). Protocol-specific fee-accounting bug, no modeled detector."
+    },
+    {
+      "id": "H-02",
+      "severity": "High",
+      "contract": "WildcatMarketController",
+      "function": "deployMarket",
+      "file": "src/WildcatMarketController.sol",
+      "line": 351,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "deployMarket()'s collision guard is `if (market.codehash != bytes32(0)) revert MarketAlreadyDeployed();` (same pattern in deployController() factory L294). An address that already holds a balance but no code has codehash == keccak256('') (0xc5d2...), not 0, so the check mis-handles non-empty-but-codeless addresses: the precomputed create2 target can be griefed/blocked and create2WithStoredInitCode behaviour diverges from the intended empty-address assumption (H-02). Protocol-specific codehash-check logic, no modeled detector."
+    },
+    {
+      "id": "H-03",
+      "severity": "High",
+      "contract": "WildcatMarketConfig",
+      "function": "setMaxTotalSupply",
+      "file": "src/market/WildcatMarketConfig.sol",
+      "line": 134,
+      "bug_class": "missing-implementation",
+      "in_class": false,
+      "summary": "Market.setMaxTotalSupply (and closeMarket) are `onlyController`, but WildcatMarketController exposes NO wrapper that forwards to setMaxTotalSupply or closeMarket, so the borrower has no on-chain path to raise/lower maxTotalSupply or close a market (H-03). Pinned to the gated, unreachable entrypoint; the bug is the missing controller forwarder. Out-of-class missing-implementation."
+    },
+    {
+      "id": "H-04",
+      "severity": "High",
+      "contract": "WildcatMarketWithdrawals",
+      "function": "executeWithdrawal",
+      "file": "src/market/WildcatMarketWithdrawals.sol",
+      "line": 141,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "When withdrawalBatchDuration == 0, queueWithdrawal sets pendingWithdrawalExpiry = block.timestamp (L95), and executeWithdrawal's only gate is `if (expiry > block.timestamp) revert WithdrawalBatchNotExpired();` (L141) — `==` passes — so lenders can queue and execute in the same block, repeatedly drawing against batch.normalizedAmountPaid and withdrawing more than the batch's pro-rata share allocated to them (H-04). Protocol-specific batch-accounting bug, no modeled detector."
+    },
+    {
+      "id": "H-05",
+      "severity": "High",
+      "contract": "WildcatMarketConfig",
+      "function": "updateAccountAuthorization",
+      "file": "src/market/WildcatMarketConfig.sol",
+      "line": 121,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "updateAccountAuthorization sets `account.approval = AuthRole.WithdrawOnly` for ANY account when _isAuthorized is false (L121), even one that was never a lender and has never been blocked. A lender who is about to be sanctioned can transfer market tokens to fresh addresses and have each granted WithdrawOnly, then withdraw — escaping the blacklist (H-05). Protocol-specific role-assignment logic, no modeled detector."
+    },
+    {
+      "id": "H-06",
+      "severity": "High",
+      "contract": "WildcatMarketWithdrawals",
+      "function": "executeWithdrawal",
+      "file": "src/market/WildcatMarketWithdrawals.sol",
+      "line": 166,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "executeWithdrawal escrows a sanctioned lender's funds via `createEscrow(accountAddress, borrower, address(asset))` but the sentinel signature is createEscrow(address borrower, address account, address asset) — the borrower/account args are swapped (same swap in WildcatMarketBase._blockAccount L172: createEscrow(accountAddress, borrower, address(this))). The escrow then releases to the borrower instead of the lender, letting the borrower drain a sanctioned lender's balance (H-06). Protocol-specific argument-order logic bug, no modeled detector."
+    },
+    {
+      "id": "M-01",
+      "severity": "Medium",
+      "contract": "WildcatMarketBase",
+      "function": "_getUpdatedState",
+      "file": "src/market/WildcatMarketBase.sol",
+      "line": 365,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "_getUpdatedState accrues interest up to the batch expiry only `if (expiry != state.lastInterestAccruedTimestamp)` (L365) before _processExpiredWithdrawalBatch; when those equal (or the path is skipped) the expired batch is paid/burned without crediting its owed interest, so an expired batch is often underpaid the interest accrued to it (M-01). Protocol-specific interest-accounting bug, no modeled detector."
+    },
+    {
+      "id": "M-02",
+      "severity": "Medium",
+      "contract": "WildcatMarketBase",
+      "function": "_blockAccount",
+      "file": "src/market/WildcatMarketBase.sol",
+      "line": 178,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "_blockAccount moves a sanctioned account's scaled balance into a normal escrow account via `_accounts[escrow].scaledBalance += scaledBalance` (L178). Because balances are scaled and normalized through the ever-growing scaleFactor, the escrowed (blocked) balance keeps accruing interest — contrary to the whitepaper which states blocked funds should stop earning (M-02). Protocol-specific accrual-accounting bug, no modeled detector."
+    },
+    {
+      "id": "M-03",
+      "severity": "Medium",
+      "contract": "WildcatMarketBase",
+      "function": "totalAssets",
+      "file": "src/market/WildcatMarketBase.sol",
+      "line": 239,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "totalAssets() returns the live `IERC20(asset).balanceOf(address(this))` and all reserve/liquidity/borrowable math is derived from it; with a rebasing underlying token the balance drifts independently of the scaled internal accounting, breaking delinquency and withdrawal invariants — the protocol is incompatible with rebasing tokens (M-03). Protocol-specific balance-source assumption, no modeled detector."
+    },
+    {
+      "id": "M-04",
+      "severity": "Medium",
+      "contract": "WildcatMarketBase",
+      "function": "_applyWithdrawalBatchPayment",
+      "file": "src/market/WildcatMarketBase.sol",
+      "line": 511,
+      "bug_class": "rounding-direction",
+      "in_class": true,
+      "summary": "_applyWithdrawalBatchPayment computes `normalizedAmountPaid = state.normalizeAmount(scaledAmountBurned).toUint128()` where normalizeAmount -> rayMul rounds HALF-UP (`div(add(mul(a,b), HALF_RAY), RAY)`). Rounding the lender-credited normalized amount up (instead of down) lets lenders collectively withdraw slightly more than the assets actually reserved for the batch (M-04). Genuine rounding-direction-favoring-user bug; mapped to Sluice's RoundingDirection/PrecisionLoss family (in_class)."
+    },
+    {
+      "id": "M-05",
+      "severity": "Medium",
+      "contract": "WildcatMarket",
+      "function": "collectFees",
+      "file": "src/market/WildcatMarket.sol",
+      "line": 106,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "collectFees() calls `_writeState(state)` (L106) BEFORE `asset.safeTransfer(feeRecipient, withdrawableFees)` (L107). _writeState recomputes isDelinquent from the still-pre-transfer totalAssets(), so the market's delinquency flag is updated against a balance that has not yet been reduced by the fee transfer, mis-recording delinquency (M-05). Protocol-specific state-ordering bug, no modeled detector."
+    },
+    {
+      "id": "M-06",
+      "severity": "Medium",
+      "contract": "LibStoredInitCode",
+      "function": "create2WithStoredInitCode",
+      "file": "src/libraries/LibStoredInitCode.sol",
+      "line": 106,
+      "bug_class": "missing-implementation",
+      "in_class": false,
+      "summary": "create2WithStoredInitCode performs `deployment := create2(...)` in assembly and returns it without checking `iszero(deployment)` (L106-117), unlike deployInitCode which reverts on a zero result. A failed create2 (e.g. address already taken) returns address(0) silently and callers (deployMarket/deployController) proceed as if deployment succeeded (M-06). Protocol-specific unchecked-create-return, no modeled detector."
+    },
+    {
+      "id": "M-07",
+      "severity": "Medium",
+      "contract": "WildcatArchController",
+      "function": "removeMarket",
+      "file": "src/WildcatArchController.sol",
+      "line": 199,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "removeMarket() (onlyOwner) deletes a market from _markets (L199). The sentinel's createEscrow requires `isRegisteredMarket(msg.sender)` (WildcatSanctionsSentinel L100), so once a market is removed, executeWithdrawal/_blockAccount can no longer escrow sanctioned lenders — removed-market lenders gain immunity from sanctions enforcement (M-07). Protocol-specific registry-coupling logic, no modeled detector."
+    },
+    {
+      "id": "M-08",
+      "severity": "Medium",
+      "contract": "WildcatMarketController",
+      "function": "setAnnualInterestBips",
+      "file": "src/WildcatMarketController.sol",
+      "line": 468,
+      "bug_class": "economic-invariant",
+      "in_class": false,
+      "summary": "Controller.setAnnualInterestBips forces a 90% (9000 bip) reserve ratio for 2 weeks whenever the borrower LOWERS the rate (L474-485), and resetReserveRatio only restores it after expiry. By repeatedly nudging the rate down a borrower can perpetually keep / re-arm the 2-week 90% reserve window — but the asymmetry is also abusable to keep a market pinned at the punitive 90% reserve ratio (M-08). Protocol-specific economic-parameter abuse, no modeled detector."
+    },
+    {
+      "id": "M-10",
+      "severity": "Medium",
+      "contract": "WildcatMarketController",
+      "function": "setAnnualInterestBips",
+      "file": "src/WildcatMarketController.sol",
+      "line": 487,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "Controller.setAnnualInterestBips forwards `WildcatMarket(market).setAnnualInterestBips(annualInterestBips)` (L487) without calling assertValueInRange against MinimumAnnualInterestBips/MaximumAnnualInterestBips; the market only checks `> BIP`. So the borrower can set an interest rate outside the factory's configured [min,max] range that enforceParameterConstraints applies at deploy time (M-10). Protocol-specific missing-range-validation logic, no modeled detector."
+    }
+  ]
+}
