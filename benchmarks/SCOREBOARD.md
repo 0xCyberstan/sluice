@@ -9,14 +9,14 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 | Contest | In-class recall | Out-of-class recall | Crit/High | Unmatched C/H | Total findings |
 |---|---|---|---|---|---|
 | `2022-12-tigris` | 100% (4/4) | 0% (0/2) | 3 | 3 | 155 |
-| `2023-01-reserve` | 80% (4/5) | 0% (0/2) | 13 | 11 | 87 |
+| `2023-01-reserve` | 100% (5/5) | 0% (0/2) | 13 | 11 | 88 |
 | `2023-03-asymmetry` | 100% (5/5) | 50% (2/4) | 3 | 1 | 25 |
 | `2023-04-caviar` | 100% (1/1) | 0% (0/4) | 0 | 0 | 41 |
 | `2023-04-frankencoin` | 100% (8/8) | 0% (0/13) | 2 | 1 | 67 |
-| `2023-06-stader` | 100% (3/3) | 8% (1/12) | 3 | 2 | 33 |
+| `2023-06-stader` | 100% (3/3) | 8% (1/12) | 1 | 0 | 32 |
 | `2023-07-basin` | 100% (3/3) | 0% (0/2) | 2 | 1 | 44 |
 | `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 4 |
-| **AGGREGATE** | **97% (30/31)** | **10% (4/41)** | **27** | **19** | **456** |
+| **AGGREGATE** | **100% (31/31)** | **10% (4/41)** | **25** | **17** | **456** |
 
 ## Per-finding detail
 
@@ -41,7 +41,7 @@ Repo `code-423n4/2023-01-reserve` @ `5e89ca44a917c9bd0277d58849c3edbc6181ff9d`.
 |---|---|---|---|---|---|---|
 | M-10 | Medium | `signed-cast` | yes | ✅ caught | SignedCast @ rtoken.sol:167 | issue() performs an unsafe downcast of an issuance amount to uint192 without bounds-checking, which can silently truncate and corrupt the issuance accounting. |
 | M-07 | Medium | `erc777-reentrancy` | yes | ✅ caught | Erc777Reentrancy @ rtoken.sol:359 | redeem() transfers basket collateral that may be an ERC777 token; the receive hook re-enters before state settles, letting a redeemer extract more than their p… |
-| M-02 | Medium | `share-inflation` | yes | 🟡 near (class mismatch) | — | The RSR:stRSR exchange rate can be inflated by a first/early staker (donation / rounding) so later stakers receive fewer shares than fair value — an ERC4626-st… |
+| M-02 | Medium | `share-inflation` | yes | ✅ caught | FirstDepositor @ strsr.sol:224 | The RSR:stRSR exchange rate can be inflated by a first/early staker (donation / rounding) so later stakers receive fewer shares than fair value — an ERC4626-st… |
 | M-14 | Medium | `signed-cast` | yes | ✅ caught | SignedCast @ ctokenfiatcollateral.sol:46 | int8(referenceERC20Decimals) (and the analogous -int8(erc20Decimals) in Asset.bal) casts a uint8 decimals value to int8; a token with >127 decimals wraps negat… |
 | M-18 | Medium | `cached-domain-separator` | yes | ✅ caught | CachedDomainSeparator @ strsr.sol:803 | StRSR caches the EIP-2612 domain separator at init but setName/setSymbol change the token name without recomputing it, so the cached DOMAIN_SEPARATOR no longer… |
 | M-23 | Medium | `economic-reward-accounting` | no | 🟡 near (class mismatch) | — | seizeRSR fails to update rsrRewardsAtLastPayout after seizing RSR, so the next payout computes rewards off a stale base and mis-distributes RSR rewards across … |

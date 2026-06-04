@@ -77,6 +77,21 @@ impl<'a> EffectCollector<'a> {
             StmtKind::Expr(e) => {
                 // A bare call statement: its return value is not consumed.
                 if let ExprKind::Call(c) = &e.kind {
+                    // A standalone call-statement guard, e.g.
+                    // `UtilLib.onlyOperatorRole(msg.sender, staderConfig);` or
+                    // `_checkOwner();` / `onlyRole(ADMIN_ROLE, msg.sender);`. Such a
+                    // call *is* the access-control check, but it is neither a
+                    // `require`/`assert` nor an `if (...) revert` and carries no
+                    // access-control modifier, so it was previously invisible to
+                    // `has_access_control`. Recognize the common idioms and record a
+                    // leading `MsgSenderCheck` guard with the same representation a
+                    // `require(msg.sender == ...)` produces. Claim the order *before*
+                    // walking the call so any nested effect inside its arguments gets
+                    // a later order and cannot push the guard past the leading cutoff.
+                    if let Some(g) = call_stmt_access_guard(c, e.span) {
+                        let ord = self.next();
+                        self.require_candidates.push((ord, g));
+                    }
                     self.walk_call(c, e.span, false);
                 } else {
                     self.walk_expr(e);
@@ -471,6 +486,123 @@ fn mk_guard(cond: &Expr) -> Guard {
     }
 }
 
+/// Unwrap surrounding identity-like casts so `address(msg.sender)` /
+/// `payable(msg.sender)` (or nestings thereof) still expose the `msg.sender`
+/// member access underneath. Only the single-argument `address`/`payable` casts
+/// are unwrapped — an arbitrary call is left intact.
+fn unwrap_caller_casts(e: &Expr) -> &Expr {
+    if let ExprKind::Call(c) = &e.kind {
+        let is_cast = matches!(c.kind, CallKind::TypeCast)
+            || matches!(c.func_name.as_deref(), Some("address") | Some("payable"));
+        if is_cast && c.receiver.is_none() && c.args.len() == 1 {
+            return unwrap_caller_casts(&c.args[0]);
+        }
+    }
+    e
+}
+
+/// True if any argument of the call references the caller (`msg.sender` /
+/// `tx.origin` / the OZ `_msgSender()` accessor), seen through `address(...)` /
+/// `payable(...)` casts and anywhere inside the argument subtree.
+fn args_mention_caller(c: &Call) -> bool {
+    c.args.iter().any(|a| {
+        let mut found = false;
+        unwrap_caller_casts(a).visit(&mut |e| {
+            if expr_is_caller(unwrap_caller_casts(e)) {
+                found = true;
+            }
+        });
+        found
+    })
+}
+
+/// Classify a callee name as an access-control guard shape.
+///
+/// Two tiers, deliberately asymmetric for precision:
+/// * `only`-prefixed names (`onlyOwner`, `onlyOperatorRole`, `onlyRole`,
+///   `onlyGovernor`, …) are a strong, near-unambiguous access-control idiom —
+///   matched on the name alone, mirroring how an `only*` *modifier* is classified
+///   as a `MsgSenderCheck` in `classify_modifier`.
+/// * `check`/`validate`/`require`/`assert`-prefixed names are far more generic
+///   (`checkBalance`, `validateAmount`, `requireGtZero`), so they only qualify
+///   when the name *also* carries a strong authorization token
+///   (`role`/`auth`/`owner`/`admin`/`access`/`caller`/`governor`/`guardian` — a
+///   bare `sender` token is excluded as too weak). These still additionally
+///   require a `msg.sender` argument at the call site (enforced by the caller),
+///   so a name match alone never promotes them.
+///
+/// Returns `true` for tier-1 (`only`-prefixed) names, and for tier-2 names that
+/// pair an auth verb with an auth token. The boolean in the tuple is
+/// `requires_sender_arg`: tier-1 may be recognized without a `msg.sender` arg
+/// (matching modifier behavior); tier-2 must have one.
+fn access_name_shape(name: &str) -> Option<bool> {
+    let l = name.trim_start_matches('_').to_ascii_lowercase();
+    // Tier 1: `only*` — strong on its own, no argument requirement.
+    if l.starts_with("only") {
+        return Some(false);
+    }
+    // Tier 2: an auth *verb* prefix paired with an auth *token*.
+    let has_verb = l.starts_with("check")
+        || l.starts_with("validate")
+        || l.starts_with("require")
+        || l.starts_with("assert")
+        || l.starts_with("enforce")
+        || l.starts_with("verify");
+    // NB: deliberately NOT keyed on a bare `sender` token. An auth verb combined
+    // with `sender` (`_requireSender(addr)`, `assertSenderBalance(...)`) describes
+    // a generic input-validation helper as often as a real authorization check,
+    // so the `sender` token alone is too weak to promote a call to an
+    // access-control guard. The strong access tokens below cover every real
+    // auth-helper idiom (`requireAuth`, `validateCaller`, `checkRole`,
+    // `_checkOwner`); a genuine caller check is still distinguished by its
+    // `msg.sender` *argument*, which is what the call-site check enforces.
+    let has_token = l.contains("role")
+        || l.contains("auth")
+        || l.contains("owner")
+        || l.contains("admin")
+        || l.contains("access")
+        || l.contains("caller")
+        || l.contains("governor")
+        || l.contains("guardian");
+    if has_verb && has_token {
+        return Some(true);
+    }
+    None
+}
+
+/// If a bare call statement is a standalone access-control guard
+/// (`UtilLib.onlyOperatorRole(msg.sender, cfg)`, `onlyRole(ADMIN, msg.sender)`,
+/// `_checkOwner()`, `validateCaller(msg.sender)`), build the corresponding leading
+/// `MsgSenderCheck` guard. Returns `None` for ordinary business calls.
+///
+/// Precision rules:
+/// * The callee name must match an access-control shape (`access_name_shape`).
+/// * `only`-prefixed names match on the name alone (mirroring `only*` modifiers).
+/// * Every other shape additionally requires a `msg.sender`/`tx.origin` argument,
+///   so `transfer(msg.sender, amt)` (no auth name) and `checkBalance(x)` (auth verb
+///   but no auth token / no caller arg) are both left as plain calls.
+/// * Only `Internal`/`External`/`Unknown` call kinds are considered — builtins,
+///   casts, `new`, and value-/gas-bearing calls are never guards.
+fn call_stmt_access_guard(c: &Call, span: Span) -> Option<Guard> {
+    if !matches!(c.kind, CallKind::Internal | CallKind::External | CallKind::Unknown) {
+        return None;
+    }
+    // A guard call neither sends value nor forwards an explicit gas stipend.
+    if c.value.is_some() || c.gas.is_some() {
+        return None;
+    }
+    let name = c.func_name.as_deref()?;
+    let requires_sender_arg = access_name_shape(name)?;
+    if requires_sender_arg && !args_mention_caller(c) {
+        return None;
+    }
+    Some(Guard {
+        kind: GuardKind::MsgSenderCheck,
+        text: format!("{}(…)", ir_text(&c.callee)),
+        span,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +708,177 @@ mod tests {
             kind: CallKind::Internal,
         }));
         assert!(!expr_is_caller(&with_args), "_msgSender(x) with an arg is not the zero-arg accessor");
+    }
+
+    // ------------------------------------------------ bare call-statement guards
+
+    /// `Lib.fn(args...)` — a member call (external/library) named `fn` on `lib`.
+    fn member_call(lib: &str, fn_name: &str, args: Vec<Expr>) -> Call {
+        Call {
+            callee: Box::new(member(lib, fn_name)),
+            receiver: Some(Box::new(ident(lib))),
+            func_name: Some(fn_name.into()),
+            args,
+            value: None,
+            gas: None,
+            kind: CallKind::External,
+        }
+    }
+
+    /// `fn(args...)` — a free / internal call named `fn`.
+    fn free_call(fn_name: &str, args: Vec<Expr>) -> Call {
+        Call {
+            callee: Box::new(ident(fn_name)),
+            receiver: None,
+            func_name: Some(fn_name.into()),
+            args,
+            value: None,
+            gas: None,
+            kind: CallKind::Internal,
+        }
+    }
+
+    fn cast(name: &str, inner: Expr) -> Expr {
+        Expr::dummy(ExprKind::Call(Call {
+            callee: Box::new(ident(name)),
+            receiver: None,
+            func_name: Some(name.into()),
+            args: vec![inner],
+            value: None,
+            gas: None,
+            kind: CallKind::TypeCast,
+        }))
+    }
+
+    #[test]
+    fn lib_only_role_call_is_access_guard() {
+        // `UtilLib.onlyOperatorRole(msg.sender, staderConfig);` — the Stader idiom.
+        let c = member_call("UtilLib", "onlyOperatorRole", vec![member("msg", "sender"), ident("staderConfig")]);
+        let g = call_stmt_access_guard(&c, Span::dummy()).expect("recognized");
+        assert_eq!(g.kind, GuardKind::MsgSenderCheck);
+    }
+
+    #[test]
+    fn only_role_sender_second_arg_is_access_guard() {
+        // `onlyRole(ADMIN_ROLE, msg.sender);` — caller in the *second* position.
+        let c = free_call("onlyRole", vec![ident("ADMIN_ROLE"), member("msg", "sender")]);
+        let g = call_stmt_access_guard(&c, Span::dummy()).expect("recognized");
+        assert_eq!(g.kind, GuardKind::MsgSenderCheck);
+    }
+
+    #[test]
+    fn only_prefixed_call_without_sender_arg_is_access_guard() {
+        // `onlyGovernor();` — a tier-1 `only*` call invoked as a bare statement (some
+        // codebases call a modifier-like internal guard as a plain function). Tier-1
+        // names are recognized on the name alone, mirroring how an `only*` *modifier*
+        // classifies as MsgSenderCheck even with no visible argument.
+        let c = free_call("onlyGovernor", vec![]);
+        let g = call_stmt_access_guard(&c, Span::dummy()).expect("recognized");
+        assert_eq!(g.kind, GuardKind::MsgSenderCheck);
+    }
+
+    #[test]
+    fn check_owner_no_arg_is_access_guard_via_token() {
+        // `_checkOwner();` — tier-2 verb (`check`) + token (`owner`). DESIGN CHOICE:
+        // tier-2 normally requires a `msg.sender` arg, but `_checkOwner()` is the
+        // canonical OZ `Ownable._checkOwner()` accessor that reads `_msgSender()`
+        // internally and takes no argument. We do NOT special-case it: with no
+        // caller argument it is NOT recognized here, to keep tier-2 tight. (The OZ
+        // `onlyOwner` *modifier* path already covers the real usage.)
+        let c = free_call("_checkOwner", vec![]);
+        assert!(
+            call_stmt_access_guard(&c, Span::dummy()).is_none(),
+            "tier-2 _checkOwner() with no caller arg is intentionally not promoted"
+        );
+        // With an explicit caller arg it IS recognized.
+        let c = free_call("_checkOwner", vec![member("msg", "sender")]);
+        assert!(call_stmt_access_guard(&c, Span::dummy()).is_some(), "_checkOwner(msg.sender) recognized");
+    }
+
+    #[test]
+    fn validate_caller_with_sender_is_access_guard() {
+        // `validateCaller(msg.sender);` — verb (`validate`) + token (`caller`) + arg.
+        let c = free_call("validateCaller", vec![member("msg", "sender")]);
+        assert!(call_stmt_access_guard(&c, Span::dummy()).is_some());
+    }
+
+    #[test]
+    fn caller_arg_through_address_cast_is_recognized() {
+        // `requireAuth(address(msg.sender));` — caller wrapped in an `address(...)`
+        // cast must still be seen.
+        let c = free_call("requireAuth", vec![cast("address", member("msg", "sender"))]);
+        assert!(call_stmt_access_guard(&c, Span::dummy()).is_some());
+    }
+
+    #[test]
+    fn require_sender_helper_is_not_guard() {
+        // `_requireSender(msg.sender);` — verb (`require`) + caller arg, but the only
+        // token is `sender`, which is intentionally NOT a strong auth token. Generic
+        // helpers (`_requireSender(addr)`, `assertSenderBalance(...)`) share this
+        // shape, so it is left as a plain call rather than promoted to a guard.
+        let c = free_call("_requireSender", vec![member("msg", "sender")]);
+        assert!(
+            call_stmt_access_guard(&c, Span::dummy()).is_none(),
+            "_requireSender(msg.sender): bare `sender` token is too weak to promote"
+        );
+    }
+
+    #[test]
+    fn business_call_with_sender_is_not_guard() {
+        // `transfer(msg.sender, amt);` — a caller arg but NO access-control name.
+        let c = free_call("transfer", vec![member("msg", "sender"), ident("amt")]);
+        assert!(
+            call_stmt_access_guard(&c, Span::dummy()).is_none(),
+            "transfer(msg.sender, amt) is a business call, not a guard"
+        );
+    }
+
+    #[test]
+    fn check_balance_without_token_is_not_guard() {
+        // `checkBalance(msg.sender);` — verb but no auth token → not a guard.
+        let c = free_call("checkBalance", vec![member("msg", "sender")]);
+        assert!(call_stmt_access_guard(&c, Span::dummy()).is_none());
+    }
+
+    #[test]
+    fn tier2_role_name_without_sender_arg_is_not_guard() {
+        // `checkRole(SOME_ROLE);` — auth name but no caller arg → not promoted.
+        let c = free_call("checkRole", vec![ident("SOME_ROLE")]);
+        assert!(
+            call_stmt_access_guard(&c, Span::dummy()).is_none(),
+            "tier-2 checkRole without a caller arg is not promoted"
+        );
+        // `checkRole(SOME_ROLE, msg.sender);` — with the caller arg it IS.
+        let c = free_call("checkRole", vec![ident("SOME_ROLE"), member("msg", "sender")]);
+        assert!(call_stmt_access_guard(&c, Span::dummy()).is_some());
+    }
+
+    #[test]
+    fn value_or_gas_bearing_call_is_not_guard() {
+        // A call that sends value / forwards gas is an interaction, never a guard,
+        // even if its name happens to start with `only`.
+        let mut c = free_call("onlyOwner", vec![]);
+        c.value = Some(Box::new(Expr::dummy(ExprKind::Lit(Lit::Number("1".into())))));
+        assert!(call_stmt_access_guard(&c, Span::dummy()).is_none());
+    }
+
+    /// End-to-end: a function whose only access check is a bare library call must
+    /// expose a leading `MsgSenderCheck` guard in its computed effects (this is
+    /// exactly what `has_access_control` consumes — the Stader M-03 root cause).
+    #[test]
+    fn bare_lib_guard_yields_leading_msg_sender_check() {
+        let state: FxHashSet<String> = FxHashSet::default();
+        // Statement: `UtilLib.onlyOperatorRole(msg.sender, staderConfig);`
+        let call = member_call("UtilLib", "onlyOperatorRole", vec![member("msg", "sender"), ident("staderConfig")]);
+        let stmt = Stmt {
+            kind: StmtKind::Expr(Expr::dummy(ExprKind::Call(call))),
+            span: Span::dummy(),
+        };
+        let eff = EffectCollector::new(&state).collect(&[stmt]);
+        assert!(
+            eff.guards.iter().any(|g| matches!(g.kind, GuardKind::MsgSenderCheck)),
+            "bare library access-control call must record a leading MsgSenderCheck guard; got {:?}",
+            eff.guards
+        );
     }
 }

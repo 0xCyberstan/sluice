@@ -242,8 +242,188 @@ impl Detector for VaultDetector {
             out.push(cx.finish(b, fid, price_span));
         }
 
+        // Exchange-rate stake idiom (Reserve StRSR M-02).
+        //
+        // The two passes above cover the two ratio shapes where the share price is
+        // computed *inline at mint time* from the running supply: multiply-by-supply
+        // (bonding curve) and divide-by-supply (Asymmetry). A third, very common
+        // staking idiom factors the share/underlying ratio out into a *mutable
+        // exchange-rate state variable* and prices the mint as a plain multiply by
+        // that rate:
+        //
+        //   // Reserve StRSR.stake:
+        //   newStakeRSR   = stakeRSR + rsrAmount;                 // underlying total
+        //   newTotalStakes = (stakeRate * newStakeRSR) / 1e18;    // shares = rate * underlying
+        //   stakeAmount   = newTotalStakes - totalStakes;
+        //   _mint(account, stakeAmount);
+        //
+        // `stakeRate` ( == totalStakes * 1e18 / stakeRSR, set in `_payoutRewards` /
+        // `seizeRSR`) is the shares-per-underlying exchange rate. It is recomputed
+        // from `stakeRSR`, the live RSR backing — which reward payouts and seizures
+        // (and rounding on the genesis stake) can skew. With no virtual-shares /
+        // dead-shares / first-deposit floor, a first/early staker can inflate the
+        // rate so a later staker's `stakeAmount = rate*newStakeRSR/1e18 - totalStakes`
+        // truncates to fewer shares than fair value — the ERC4626-style share-price
+        // inflation class, expressed through a bespoke `stakeRate` rather than a
+        // `totalAssets`/`totalSupply` ratio (so none of the passes above see it).
+        //
+        // Kept tight against the many legitimate vaults in the dogfood set: the
+        // multiplied factor must be a *mutable exchange-rate state variable* (name
+        // contains `rate` and one of `stake`/`share`/`exchange`, e.g. `stakeRate`,
+        // `exchangeRate`, `shareRate`) — standard OZ/Balancer/Morpho vaults price via
+        // `convertToShares(totalSupply,totalAssets)` and carry no such mutable rate
+        // member, so they never match. The full conjunction:
+        //   1. a stake/deposit/mint-named function that mints (`_mint`/`mint*`);
+        //   2. whose body multiplies by an exchange-rate *state variable*;
+        //   3. the contract has a supply reducer (rate is re-derived from the
+        //      shrinking backing, so the channel is live, not a one-way genesis guard);
+        //   4. the minting function does NOT lock dead shares to a burn address; and
+        //   5. no OZ virtual-shares / decimals-offset / dead-shares mitigation.
+        for c in cx.scir.iter_contracts() {
+            // Unlike the passes above, accept abstract implementations too: staking
+            // pools like Reserve's `StRSRP1` are declared `abstract` because they are
+            // deployed behind a proxy, yet they carry the full stake/rate logic. Only
+            // interfaces and libraries are excluded.
+            if c.is_interface() || c.is_library() {
+                continue;
+            }
+            if contract_uses_inflation_mitigation(cx, c) {
+                continue;
+            }
+            if !contract_has_supply_reducer(cx, c) {
+                continue; // rate cannot be pushed back down — one-way genesis guard
+            }
+            let Some((rate_fn, rate_span)) = find_exchange_rate_mint(cx, c) else {
+                continue;
+            };
+            let Some(fid) = floor_fn_id(cx, c, rate_span) else {
+                continue;
+            };
+            let b = FindingBuilder::new(self.id(), Category::FirstDepositor)
+                .title("Exchange-rate share inflation (stake/deposit prices mint by a mutable rate)")
+                .severity(Severity::Medium)
+                .confidence(0.5)
+                .dimension(Dimension::ValueFlow)
+                .message(format!(
+                    "`{}` mints shares by multiplying a deposit/backing total by a mutable exchange-rate \
+                     state variable (`shares ∝ rate * underlying`, e.g. Reserve StRSR's `stakeRate * \
+                     newStakeRSR / 1e18`). That rate is the shares-per-underlying ratio, re-derived from the \
+                     live backing balance, with no virtual-shares / dead-shares / first-deposit floor. \
+                     Because `{}` also lets holders unstake/burn (shrinking the backing the rate is computed \
+                     from), a first/early staker can skew the rate via donation or rounding so a later \
+                     staker's minted amount truncates to fewer shares than fair value — the ERC4626-style \
+                     share-price inflation class, expressed through a bespoke exchange rate rather than a \
+                     `totalAssets`/`totalSupply` ratio.",
+                    rate_fn, c.name
+                ))
+                .recommendation(
+                    "Seed the pool with a permanently locked bootstrap stake (mint dead shares on the first \
+                     stake), add a virtual-shares / decimals-offset term to the rate so it cannot be \
+                     manipulated near an empty pool, or initialize and floor the exchange rate so early \
+                     stakers cannot skew shares-per-underlying for later stakers.",
+                );
+            out.push(cx.finish(b, fid, rate_span));
+        }
+
         out
     }
+}
+
+// ----- exchange-rate stake-idiom detection (Reserve StRSR M-02) -----
+
+/// True if `name` looks like a *mutable exchange-rate* share-pricing factor:
+/// it contains `rate`/`price` and is qualified by `stake`/`share`/`exchange`
+/// (e.g. `stakeRate`, `exchangeRate`, `shareRate`, `sharePrice`). This is
+/// deliberately narrow: it must read as "the shares-per-underlying conversion
+/// rate", not an interest/fee/reward `*rate*` (which carry `interest`/`fee`/
+/// `reward`/`apr`/`borrow`/`util` and are rejected).
+fn is_exchange_rate_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    let blocked = ["interest", "fee", "reward", "apr", "apy", "borrow", "util", "funding", "tax"];
+    if blocked.iter().any(|b| l.contains(b)) {
+        return false;
+    }
+    let rate_like = l.contains("rate") || l.contains("price");
+    rate_like && (l.contains("stake") || l.contains("share") || l.contains("exchange"))
+}
+
+/// True if `e` reads an exchange-rate state variable of `c`: a bare `Ident` (or a
+/// `this.member` access) whose name both passes `is_exchange_rate_name` and is a
+/// declared state variable. Requiring it to be a *state* var keeps pure-local
+/// `rate` arithmetic out.
+fn reads_exchange_rate(e: &Expr, c: &Contract) -> bool {
+    let name = match &e.kind {
+        ExprKind::Ident(n) => n.as_str(),
+        ExprKind::Member { member, .. } => member.as_str(),
+        _ => return false,
+    };
+    is_exchange_rate_name(name)
+        && c.state_vars.iter().any(|v| v.name.eq_ignore_ascii_case(name))
+}
+
+/// True if `e` (transitively) multiplies by an exchange-rate state variable: a
+/// `Mul` with the rate on either side, or a `*mul*` helper whose args include the
+/// rate. This is the `shares ∝ rate * underlying` pricing shape.
+fn multiplies_by_exchange_rate(e: &Expr, c: &Contract) -> bool {
+    let mut found = false;
+    e.visit(&mut |n| {
+        if found {
+            return;
+        }
+        match &n.kind {
+            ExprKind::Binary { op: BinOp::Mul, lhs, rhs } => {
+                if reads_exchange_rate(lhs, c) || reads_exchange_rate(rhs, c) {
+                    found = true;
+                }
+            }
+            ExprKind::Call(call) => {
+                let is_mul_helper = call
+                    .func_name
+                    .as_deref()
+                    .map(|nm| nm.to_ascii_lowercase().contains("mul"))
+                    .unwrap_or(false);
+                if is_mul_helper && call.args.iter().any(|a| reads_exchange_rate(a, c)) {
+                    found = true;
+                }
+            }
+            _ => {}
+        }
+    });
+    found
+}
+
+/// Scan `c` for a stake/deposit/mint-named minting function whose body prices the
+/// minted amount by multiplying by a mutable exchange-rate state variable, and that
+/// does not lock dead shares to a burn address. Returns `(function_name, span)`.
+fn find_exchange_rate_mint(cx: &AnalysisContext, c: &Contract) -> Option<(String, sluice_ir::Span)> {
+    for f in cx.scir.functions_of(c.id) {
+        if !f.has_body || !function_mints(f) {
+            continue;
+        }
+        let n = f.name.to_ascii_lowercase();
+        if !(n.contains("stake") || n.contains("deposit") || n.contains("mint")) {
+            continue;
+        }
+        // A dead-shares lock anywhere in the minting function closes the channel.
+        if stmts_mint_to_burn_address(&f.body) {
+            continue;
+        }
+        let mut hit = None;
+        for s in &f.body {
+            s.visit_exprs(&mut |e| {
+                if hit.is_none() && multiplies_by_exchange_rate(e, c) {
+                    hit = Some(e.span);
+                }
+            });
+            if hit.is_some() {
+                break;
+            }
+        }
+        if let Some(span) = hit {
+            return Some((f.name.clone(), span));
+        }
+    }
+    None
 }
 
 /// OZ virtual-shares / decimals-offset / dead-shares inflation defense (or an OZ
@@ -1054,6 +1234,100 @@ mod tests {
         assert!(
             !fires_floor(&fs),
             "no supply reducer => zero-guard not bypassable; must stay silent; got {:?}",
+            fs
+        );
+    }
+
+    // Reserve StRSR M-02: shares minted by multiplying the new backing total by a
+    // mutable exchange-rate state variable (`stakeRate * newStakeRSR / 1e18`). The
+    // rate is the shares-per-underlying ratio, re-derived from the live `stakeRSR`
+    // backing; with no virtual/dead shares and an `unstake` (burn) path, an early
+    // staker can skew the rate so later stakers mint fewer shares — must fire.
+    const STRSR_EXCHANGE_RATE: &str = r#"
+        contract StRSR {
+            uint256 internal totalStakes;
+            uint256 internal stakeRSR;
+            uint192 public stakeRate;
+            uint256 constant FIX_ONE = 1e18;
+            function _mint(address to, uint256 amount) internal {}
+            function _burn(address from, uint256 amount) internal {}
+            function stake(uint256 rsrAmount) external {
+                require(rsrAmount > 0, "Cannot stake zero");
+                uint256 newStakeRSR = stakeRSR + rsrAmount;
+                uint256 newTotalStakes = (stakeRate * newStakeRSR) / FIX_ONE;
+                uint256 stakeAmount = newTotalStakes - totalStakes;
+                stakeRSR += rsrAmount;
+                _mint(msg.sender, stakeAmount);
+            }
+            function unstake(uint256 stakeAmount) external {
+                _burn(msg.sender, stakeAmount);
+            }
+        }
+    "#;
+
+    // A legitimate ERC4626-style vault that prices via convertToShares using
+    // totalSupply/totalAssets (no mutable exchange-rate state var) — must NOT match
+    // the exchange-rate pass even though it lacks a virtual-offset keyword (it is
+    // already covered/not covered by the donation pass on its own merits; the rate
+    // pass specifically must not light it up).
+    const VAULT_NO_RATE_VAR: &str = r#"
+        contract PlainVault {
+            uint256 public totalSupply;
+            uint256 public totalAssets;
+            mapping(address => uint256) public shares;
+            function convertToShares(uint256 assets) public view returns (uint256) {
+                return totalSupply == 0 ? assets : assets * totalSupply / totalAssets;
+            }
+            function deposit(uint256 assets) external returns (uint256 s) {
+                s = convertToShares(assets);
+                totalSupply += s; totalAssets += assets;
+            }
+        }
+    "#;
+
+    // An interest/reward-rate multiply inside a mint must NOT fire: the rate name is
+    // blocked (`rewardRate`), so this lending-style accrual is not mistaken for a
+    // share exchange rate.
+    const REWARD_RATE_MINT: &str = r#"
+        contract Lender {
+            uint256 public rewardRate;
+            uint256 public totalSupply;
+            function _mint(address to, uint256 amount) internal {}
+            function _burn(address from, uint256 amount) internal {}
+            function deposit(uint256 amount) external {
+                uint256 accrued = amount * rewardRate / 1e18;
+                _mint(msg.sender, amount + accrued);
+            }
+            function withdraw(uint256 amount) external { _burn(msg.sender, amount); }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_strsr_exchange_rate_inflation() {
+        let fs = run(STRSR_EXCHANGE_RATE);
+        assert!(
+            fires_floor(&fs),
+            "expected FirstDepositor on StRSR stakeRate share inflation (M-02), got {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_vault_without_rate_var() {
+        let fs = run(VAULT_NO_RATE_VAR);
+        assert!(
+            !fires_floor(&fs),
+            "convertToShares vault has no mutable exchange-rate var; rate pass must stay silent; got {:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_reward_rate_mint() {
+        let fs = run(REWARD_RATE_MINT);
+        assert!(
+            !fires_floor(&fs),
+            "rewardRate is a blocked interest/reward rate, not a share exchange rate; must stay silent; got {:?}",
             fs
         );
     }

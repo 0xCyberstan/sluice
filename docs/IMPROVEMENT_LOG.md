@@ -1032,3 +1032,30 @@ codebase). 2 detector landings + 1 disciplined rejection:
   precision held).** Frankencoin + Stader now 100% in-class; asymmetry 100%/50%. Only in-class miss left = reserve M-02
   (share-inflation, StRSR.stake). North-star recall target (≥80% in-class) comfortably exceeded; out-of-class is the
   standing frontier. _done._
+
+### NORTH STAR — wave 7 (in-class 100% + core precision lift): in-class 97%→100%, unmatched C/H 19→17
+2 worktree agents (1 core-engine root-fix + 1 detector) + 1 deep hunt. Both detector changes gated on the COMBINED state
+(K touches the core effects pass, which feeds every detector — individual self-gates are necessary but not sufficient).
+- **K — `sluice-parse/src/effects.rs` ROOT FIX (the Stader M-03 root cause):** the effects pass now records a leading
+  `MsgSenderCheck` guard for a **bare call-statement access guard** (`UtilLib.onlyOperatorRole(msg.sender, cfg);`,
+  `onlyRole(ADMIN, msg.sender);`, `validateCaller(msg.sender);`). Two tiers: tier-1 `only*` names match on the name alone
+  (mirroring `only*` modifiers); tier-2 (`check`/`validate`/`require`/`assert`/`enforce`/`verify` + a strong auth token
+  `role`/`auth`/`owner`/`admin`/`access`/`caller`/`governor`/`guardian`) additionally requires a `msg.sender` argument
+  (seen through `address()`/`payable()` casts). Bare `sender` token deliberately excluded (too weak). This lifts
+  `has_access_control` for that idiom GLOBALLY — a capability + precision improvement, not overfitting.
+- **L — `vault.rs` 4th pass (exchange-rate stake idiom) → reserve M-02:** a `stake`/`deposit`/`mint`-named minter that
+  prices the mint by multiplying by a **mutable exchange-rate state var** (`shares ∝ rate*underlying`, the StRSR
+  `stakeRate` idiom) with a supply reducer and no dead-shares lock. Interest/fee/reward rates blocklisted; requires a
+  declared state var (OZ/Balancer/Morpho/Aave vaults price via `convertToShares`, carry no such member → never match).
+  Accepts abstract contracts (StRSRP1 is abstract-behind-proxy). **0 dogfood noise**; asymmetry H-01 preserved.
+- **M — LayerZero AddressCast/PacketV1Codec sender-spoof hunt:** confirmed NO spoof (HIGH confidence). The 32→20 trim
+  exists but `senderAddressB20` has ZERO on-chain consumers; every trust point (`OAppReceiver.lzReceive:106` peer check,
+  guid, nonce/payload-hash keys) compares the FULL 32-byte sender; `_assertHeader` (len==81 + version + dstEid==localEid)
+  gates every consumer that reaches `endpoint.verify`/`_execute`. Documented cross-VM assumption, correctly defended.
+- **Integration:** disjoint (K=effects.rs, L=vault.rs). COMBINED authoritative gate: build 0 warnings, **952 engine tests /
+  0 fail**, full workspace green, corpus + real_hacks green. 135 detectors.
+- **SCOREBOARD (8 contests): in-class 100% (31/31), out-of-class 10% (4/41), Crit/High 25 (17 unmatched — DOWN from 19,
+  precision IMPROVED).** Every in-class finding across all 8 contests is now caught; K's guard-recognition fix suppressed
+  2 spurious Stader access-control Crit/High (Stader unmatched 2→0). Strictly better on every axis. North-star in-class
+  recall target maxed; out-of-class (10%) is the standing frontier and the remaining gaps are genuinely protocol-specific
+  one-off logic bugs (Frankencoin 13 / Reserve / Stader logic), where bespoke detectors risk overfitting. _done._
