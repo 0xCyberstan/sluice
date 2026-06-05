@@ -458,6 +458,89 @@ fn has_qualifying_post_call_write(
     })
 }
 
+/// True iff the arming call is a PLAIN, NON-value, NON-token-transfer `External`
+/// method call (`market.setReserveRatioBips(x)`) — NOT a value-bearing or low-level
+/// (`.call{value:}`) call and NOT a token-transfer-named method (`transfer`,
+/// `safeTransferFrom`, …). Such a call hands control to another contract but moves
+/// no native value through this call site and does not invoke an ERC-20/777/721
+/// transfer hook from here, so re-entering it cannot directly extract funds via the
+/// call itself. It is the weakest re-entry surface — the precondition for the
+/// benign cleanup-delete suppression below.
+fn is_plain_nonvalue_call(cs: &CallSite) -> bool {
+    cs.kind == CallKind::External
+        && !cs.sends_value
+        && !is_token_transfer_name(cs.func_name.as_deref())
+}
+
+/// True iff a post-call storage write is a `delete` / in-place RESET of the SAME
+/// slot — a cleanup, not a value-bearing mutation an attacker could profit from by
+/// re-entering. The robust structural signature (the IR does not tag `delete`
+/// explicitly) is: the written PATH is also READ at the IDENTICAL path immediately
+/// before the write (a `delete X[k]` lowers to a read of `X[k]` followed by a write
+/// of `X[k]`; an in-place `X[k] = X[k] - n` / `X[k] -= n` shares the same shape, but
+/// those are gated out by `is_plain_nonvalue_call` — a real `-=` drain always pairs
+/// with a value/transfer call, never a plain method call). A genuine drain writes
+/// either a *fresh-computed* value (`balances[u] = bal - amt`, where the write path
+/// is NOT read just before) or zeroes a slot via a plain `= 0` assign (xsurge), and
+/// xsurge's call is low-level+value — so neither matches this read-then-write-same-
+/// path-after-plain-call shape.
+fn is_same_slot_reset(reads: &[sluice_ir::StorageAccess], write: &sluice_ir::StorageAccess) -> bool {
+    // The delete/in-place-reset signature: a read of the EXACT same access path,
+    // positioned immediately before the write (one slot earlier in source order).
+    reads
+        .iter()
+        .any(|r| r.order + 1 == write.order && r.path == write.path)
+}
+
+/// True iff the classic post-call write surface of `f` is the BENIGN
+/// cleanup-delete-after-a-trusted-plain-call shape and must be suppressed:
+///   (b) the FIRST arming call is a plain, non-value, non-token-transfer `External`
+///       method call (`WildcatMarket(market).setReserveRatioBips(...)`), AND
+///   (a) EVERY value-state write strictly after that call is a `delete` / in-place
+///       reset of the same slot (a cleanup of a per-key temporary record), with at
+///       least one such post-call write present.
+/// This is the WildcatMarketController `resetReserveRatio` shape: a plain guarded
+/// call into a protocol market followed by `delete temporaryExcessReserveRatio[market]`.
+/// Re-entry cannot profit — the call moves no value and the only after-effect zeroes
+/// an idempotent temporary slot. Kept tight: ANY value-bearing / low-level / token-
+/// transfer arming call, or ANY post-call value write that is NOT a same-slot reset
+/// (a fresh-computed balance update — the real drain), defeats the suppression.
+fn is_benign_cleanup_delete(
+    f: &Function,
+    trusted: &rustc_hash::FxHashSet<String>,
+    state_vars: &rustc_hash::FxHashSet<String>,
+    facts: &ContractCallFacts,
+) -> bool {
+    // The arming calls and the first (earliest) one.
+    let arming: Vec<&CallSite> = f
+        .effects
+        .call_sites
+        .iter()
+        .filter(|cs| is_arming_call(cs, trusted, state_vars, facts))
+        .collect();
+    let Some(first) = arming.iter().map(|cs| cs.order).min() else { return false };
+    // (b) EVERY arming call must be a plain non-value method call. If any arming
+    // call is value-bearing / low-level / a token transfer, this is not the benign
+    // shape (a value send could itself extract funds on re-entry).
+    if !arming.iter().all(|cs| is_plain_nonvalue_call(cs)) {
+        return false;
+    }
+    // (a) consider the value-state writes strictly after the first arming call.
+    let post_call_value_writes: Vec<&sluice_ir::StorageAccess> = f
+        .effects
+        .storage_writes
+        .iter()
+        .filter(|w| w.order > first && is_value_state_var(&w.var))
+        .collect();
+    // There must be at least one (otherwise nothing to suppress), and EVERY one of
+    // them must be a same-slot reset/`delete`. A single fresh-computed value write
+    // (the genuine drain) defeats the suppression.
+    !post_call_value_writes.is_empty()
+        && post_call_value_writes
+            .iter()
+            .all(|w| is_same_slot_reset(&f.effects.storage_reads, w))
+}
+
 /// True iff the read-only-flagged getter `f` (or one of its DIRECTLY resolved
 /// internal callees) performs a genuine reentrancy-capable external/low-level call
 /// in its OWN body. Read-only reentrancy is only reportable when the getter itself
@@ -653,6 +736,23 @@ impl Detector for ReentrancyDetector {
                 // is nothing for re-entry to corrupt.
                 if r.kind == ReentrancyKind::Classic
                     && !has_qualifying_post_call_write(f, &r.vars_written_after, &trusted, &state_vars, &call_facts)
+                {
+                    continue;
+                }
+
+                // PRECISION GATE 2c (classic only) — benign cleanup-delete shape.
+                // Suppress when the arming call is a plain, non-value, non-token-
+                // transfer `External` method call (no `{value:}`, no `.call`) AND
+                // the only post-call value-state effect is a `delete` / in-place
+                // reset of the same slot (a cleanup of a per-key temporary record).
+                // Re-entering such a call moves no value and the after-effect only
+                // zeroes an idempotent slot, so there is nothing to profit from —
+                // the WildcatMarketController `resetReserveRatio` shape
+                // (`market.setReserveRatioBips(...)` then `delete temp[market]`). A
+                // value-bearing / low-level / token-transfer call, or a fresh-
+                // computed balance update after the call, is never suppressed here.
+                if r.kind == ReentrancyKind::Classic
+                    && is_benign_cleanup_delete(f, &trusted, &state_vars, &call_facts)
                 {
                     continue;
                 }
@@ -1317,6 +1417,82 @@ mod tests {
         assert!(
             fs.iter().any(|f| f.category == Category::Reentrancy),
             "a real call-then-write must still fire even when the write uses a SafeMath helper"
+        );
+    }
+
+    // ---- R-next FP (Wildcat `resetReserveRatio`): a plain, non-value `External`
+    // method call into a protocol market followed by a `delete temp[market]` cleanup
+    // must stay silent. The call moves no value and the only post-call effect is an
+    // idempotent reset of a per-key temporary record — re-entry cannot profit. Real
+    // site: WildcatMarketController.resetReserveRatio. ----
+    #[test]
+    fn silent_on_cleanup_delete_after_plain_nonvalue_call() {
+        let src = r#"
+            interface IMarket { function setReserveRatioBips(uint16 b) external; }
+            contract WildcatMarketController {
+                struct Temp { uint16 reserveRatioBips; uint256 expiry; }
+                mapping(address => Temp) public temporaryExcessReserveRatio;
+                function resetReserveRatio(address market) external {
+                    Temp memory tmp = temporaryExcessReserveRatio[market];      // pre-call read (copy)
+                    if (tmp.expiry == 0) revert();
+                    if (block.timestamp < tmp.expiry) revert();
+                    IMarket(market).setReserveRatioBips(tmp.reserveRatioBips);   // plain, no-value External call
+                    delete temporaryExcessReserveRatio[market];                 // cleanup delete AFTER the call
+                }
+            }
+        "#;
+        assert!(
+            !fires(src),
+            "cleanup-delete after a plain non-value external call must stay silent"
+        );
+    }
+
+    // ---- Recall guard A: a GENUINE balance drain (`balances[msg.sender] -= amt`
+    // after a `.call{value:}`) must STILL fire — the value/low-level call defeats
+    // the cleanup-delete suppression (it is not a plain non-value method call). ----
+    #[test]
+    fn fires_on_value_call_then_balance_decrement_not_suppressed() {
+        let src = r#"
+            contract Bank {
+                mapping(address => uint256) public balances;
+                function withdraw(uint256 amt) external {
+                    uint256 bal = balances[msg.sender];
+                    require(bal >= amt);
+                    (bool ok,) = msg.sender.call{value: amt}(""); // value/low-level call (NOT plain)
+                    require(ok);
+                    balances[msg.sender] -= amt;                  // genuine post-call balance drain
+                }
+            }
+        "#;
+        let fs = reentrancy_findings(src);
+        assert!(
+            fs.iter().any(|f| f.category == Category::Reentrancy),
+            "a real value-call-then-balance-decrement must still fire (not a benign cleanup delete)"
+        );
+    }
+
+    // ---- Recall guard B: a `delete` post-call write does NOT over-suppress when the
+    // arming call IS value-bearing. A `delete balances[msg.sender]` after a
+    // `.call{value:}` is still a re-entry surface (the value send can be re-entered
+    // before the slot is zeroed) — the value call defeats the suppression. ----
+    #[test]
+    fn fires_on_delete_after_value_bearing_call() {
+        let src = r#"
+            contract Bank {
+                mapping(address => uint256) public balances;
+                function withdrawAll() external {
+                    uint256 bal = balances[msg.sender];
+                    require(bal > 0);
+                    (bool ok,) = msg.sender.call{value: bal}(""); // value call — not a plain method call
+                    require(ok);
+                    delete balances[msg.sender];                  // delete AFTER a value call still fires
+                }
+            }
+        "#;
+        let fs = reentrancy_findings(src);
+        assert!(
+            fs.iter().any(|f| f.category == Category::Reentrancy),
+            "a delete after a VALUE-bearing call must still fire (don't over-suppress on delete alone)"
         );
     }
 }

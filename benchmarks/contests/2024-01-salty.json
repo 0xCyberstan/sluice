@@ -1,0 +1,121 @@
+{
+  "name": "2024-01-salty",
+  "repo": "code-423n4/2024-01-salty",
+  "commit": "01eb9e21f1d0aa7a058897914bbca9c994d314e0",
+  "local_path": "~/Data/bench/2024-01-salty",
+  "scope_dirs": ["src"],
+  "audit_url": "https://code4rena.com/reports/2024-01-salty",
+  "note": "Salty.IO — an AMM with a collateralized USDS stablecoin, staking/liquidity rewards, and a DAO. Official C4 report: 6 High / 31 Medium. This manifest pins a conservative, high-confidence subset (all 6 Highs + 4 Mediums) each verified to a real (contract, function, file, line) in src at commit 01eb9e2. The remaining 27 Mediums are dropped where the report summary did not let us pin the exact source mechanism without guessing. Most kept findings are protocol-specific accounting/logic bugs (out-of-class for Sluice's modeled detector set); the first-depositor, oracle-manipulation, uint128-truncation, rounding, and slippage findings are marked in_class. IDs carry the report's H-/M- number.",
+  "known_findings": [
+    {
+      "id": "H-01",
+      "severity": "High",
+      "contract": "Upkeep",
+      "function": "step11",
+      "file": "src/Upkeep.sol",
+      "line": 233,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "step11() reads `releaseableAmount = VestingWallet(teamVestingWallet).releasable(salt)` (L233), then calls `.release(salt)` (L236) and `salt.safeTransfer(managedTeamWallet().mainWallet(), releaseableAmount)` (L238). VestingWallet.release() has no access control, so anyone can call it directly first; the wallet then sends SALT to the Upkeep contract (the beneficiary set at Deployment.sol L213), step11's releasable reads ~0, and the already-released SALT is stranded in Upkeep instead of reaching the team wallet (H-01). Protocol-specific call-ordering/stranded-funds logic bug; the missing-access-control root is on the out-of-scope OZ VestingWallet, no modeled detector fits the in-scope mechanism."
+    },
+    {
+      "id": "H-02",
+      "severity": "High",
+      "contract": "StakingRewards",
+      "function": "_increaseUserShare",
+      "file": "src/staking/StakingRewards.sol",
+      "line": 78,
+      "bug_class": "first-depositor",
+      "in_class": true,
+      "summary": "_increaseUserShare only adds offsetting virtualRewards `if ( existingTotalShares != 0 )` (L78-85); the first liquidity provider into a pool that already has accrued totalRewards gets zero virtualRewards, so userRewardForPool (rewardsShare - virtualRewards, L243-251) credits them the entire pre-existing totalRewards balance for the pool (H-02). First-depositor / share-price family; mapped to Sluice's FirstDepositor/Erc4626Inflation family (in_class)."
+    },
+    {
+      "id": "H-03",
+      "severity": "High",
+      "contract": "CoreSaltyFeed",
+      "function": "getPriceBTC",
+      "file": "src/price_feed/CoreSaltyFeed.sol",
+      "line": 40,
+      "bug_class": "price-manipulation",
+      "in_class": true,
+      "summary": "CoreSaltyFeed.getPriceBTC/getPriceETH derive the price purely from live internal pool reserves: `return ( reservesUSDS * 10**8 ) / reservesWBTC` (L40, and L52 for ETH) with no TWAP, no staleness, no manipulation guard. PriceAggregator averages this spot read with the Chainlink/Uniswap feeds, so an attacker can move the Salty pool spot price cheaply to skew the aggregated collateral price and trigger or block liquidations (H-03). Manipulable spot price drives share/collateral valuation; mapped to Sluice's OracleManipulation/PriceManipulation family (in_class)."
+    },
+    {
+      "id": "H-04",
+      "severity": "High",
+      "contract": "StakingRewards",
+      "function": "_increaseUserShare",
+      "file": "src/staking/StakingRewards.sol",
+      "line": 83,
+      "bug_class": "integer-overflow",
+      "in_class": true,
+      "summary": "_increaseUserShare computes `virtualRewardsToAdd = Math.ceilDiv(totalRewards[poolID]*increaseShareAmount, existingTotalShares)` then `user.virtualRewards += uint128(virtualRewardsToAdd)` and `totalRewards[poolID] += uint128(virtualRewardsToAdd)` (L81-84). An attacker who donates/inflates totalRewards makes virtualRewardsToAdd exceed 2^128; the unchecked `uint128(...)` downcast silently truncates the value, corrupting per-user and pool reward accounting so later users cannot claim their proportional share (H-04). Unsafe uint256->uint128 downcast; mapped to Sluice's SignedCast/IntegerOverflow family (in_class)."
+    },
+    {
+      "id": "H-05",
+      "severity": "High",
+      "contract": "StakingRewards",
+      "function": "_increaseUserShare",
+      "file": "src/staking/StakingRewards.sol",
+      "line": 70,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "_increaseUserShare resets `user.cooldownExpiration = block.timestamp + stakingConfig.modificationCooldown()` on every share increase (L70), and liquidateUser -> _decreaseUserShare(wallet, ..., useCooldown=true) hits the `require(block.timestamp >= user.cooldownExpiration)` gate (L107). A liquidatable user front-runs liquidation with a minimal depositCollateralAndIncreaseShare to re-arm their cooldown, making the subsequent liquidateUser revert and buying time to escape liquidation (H-05). Protocol-specific cooldown-griefing logic bug, no modeled detector."
+    },
+    {
+      "id": "H-06",
+      "severity": "High",
+      "contract": "CollateralAndLiquidity",
+      "function": "repayUSDS",
+      "file": "src/stable/CollateralAndLiquidity.sol",
+      "line": 125,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "repayUSDS sends the repaid USDS to the USDS token contract itself — `usds.safeTransferFrom(msg.sender, address(usds), amountRepaid)` (L125) — then `liquidizer.incrementBurnableUSDS(amountRepaid)` (L128). The Liquidizer increments usdsThatShouldBeBurned but the tokens land at address(usds), not the Liquidizer, so Liquidizer._possiblyBurnUSDS sees insufficient balance and withdraws Protocol Owned Liquidity to cover the gap; meanwhile USDS.burnTokensInContract can burn the stranded balance for anyone, building bad debt (H-06). Protocol-specific wrong-destination accounting bug, no modeled detector."
+    },
+    {
+      "id": "M-01",
+      "severity": "Medium",
+      "contract": "StakingRewards",
+      "function": "_decreaseUserShare",
+      "file": "src/staking/StakingRewards.sol",
+      "line": 118,
+      "bug_class": "rounding-direction",
+      "in_class": true,
+      "summary": "_decreaseUserShare computes `virtualRewardsToRemove = (user.virtualRewards * decreaseShareAmount) / user.userShare` (L118) which rounds DOWN, while claimableRewards = rewardsForAmount - virtualRewardsToRemove (L132-133). Withdrawing in many small increments rounds the removed virtual-rewards offset down toward zero each time, letting a user collect more SALT than they actually earned (M-01). Rounding-direction-favoring-user; mapped to Sluice's RoundingDirection/PrecisionLoss family (in_class)."
+    },
+    {
+      "id": "M-09",
+      "severity": "Medium",
+      "contract": "Pools",
+      "function": "removeLiquidity",
+      "file": "src/pools/Pools.sol",
+      "line": 187,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "removeLiquidity's post-withdrawal DUST guard is `require((reserves.reserve0 >= PoolUtils.DUST) && (reserves.reserve0 >= PoolUtils.DUST), \"Insufficient reserves after liquidity removal\")` (L187) — it checks reserve0 TWICE and never checks reserve1, so liquidity can be removed down to a reserve1 below DUST, violating the pool's minimum-reserve invariant (M-09). Protocol-specific copy-paste missing-validation logic bug, no modeled detector."
+    },
+    {
+      "id": "M-18",
+      "severity": "Medium",
+      "contract": "CoreUniswapFeed",
+      "function": "_getUniswapTwapWei",
+      "file": "src/price_feed/CoreUniswapFeed.sol",
+      "line": 59,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "_getUniswapTwapWei derives the average tick with `int24 tick = int24((tickCumulatives[1] - tickCumulatives[0]) / int56(uint56(twapInterval)))` (L59). Solidity integer division truncates toward zero, so for a negative cumulative-tick delta the result is rounded the wrong way (unlike Uniswap's OracleLibrary which floors negatives), yielding a slightly incorrect TWAP price for negative ticks (M-18). Protocol-specific signed-division-rounding logic bug in tick math, no modeled detector."
+    },
+    {
+      "id": "M-26",
+      "severity": "Medium",
+      "contract": "DAO",
+      "function": "formPOL",
+      "file": "src/dao/DAO.sol",
+      "line": 321,
+      "bug_class": "slippage",
+      "in_class": true,
+      "summary": "formPOL calls `collateralAndLiquidity.depositLiquidityAndIncreaseShare( tokenA, tokenB, amountA, amountB, 0, block.timestamp, true )` (L321) — minLiquidityReceived is hardcoded 0 and the deadline is block.timestamp, so POL formation has neither slippage nor deadline protection and can be sandwiched/MEV'd (M-26). Hardcoded zero min-out; mapped to Sluice's Slippage family (in_class). Note: also carries a missing-deadline aspect (block.timestamp deadline)."
+    }
+  ]
+}

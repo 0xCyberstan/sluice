@@ -15,9 +15,11 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 | `2023-04-frankencoin` | 100% (8/8) | 0% (0/13) | 2 | 1 | 67 |
 | `2023-06-stader` | 100% (3/3) | 8% (1/12) | 1 | 0 | 32 |
 | `2023-07-basin` | 100% (3/3) | 0% (0/2) | 2 | 1 | 44 |
-| `2023-10-wildcat` | 0% (0/1) | 0% (0/14) | 1 | 1 | 41 |
+| `2023-10-wildcat` | 0% (0/1) | 0% (0/14) | 0 | 0 | 40 |
+| `2023-12-ethereumcreditguild` | 0% (0/3) | 0% (0/17) | 2 | 2 | 68 |
+| `2024-01-salty` | 0% (0/5) | 0% (0/5) | 2 | 2 | 62 |
 | `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 4 |
-| **AGGREGATE** | **97% (31/32)** | **7% (4/55)** | **26** | **18** | **497** |
+| **AGGREGATE** | **78% (31/40)** | **5% (4/77)** | **29** | **21** | **626** |
 
 ## Per-finding detail
 
@@ -158,7 +160,51 @@ Repo `code-423n4/2023-10-wildcat` @ `1f4422eb6ce844622a29cac6300472e3ab74705a`.
 | M-06 | Medium | `missing-implementation` | no | ❌ missed | — | create2WithStoredInitCode performs `deployment := create2(...)` in assembly and returns it without checking `iszero(deployment)` (L106-117), unlike deployInitC… |
 | M-07 | Medium | `logic` | no | ❌ missed | — | removeMarket() (onlyOwner) deletes a market from _markets (L199). The sentinel's createEscrow requires `isRegisteredMarket(msg.sender)` (WildcatSanctionsSentin… |
 | M-08 | Medium | `economic-invariant` | no | ❌ missed | — | Controller.setAnnualInterestBips forces a 90% (9000 bip) reserve ratio for 2 weeks whenever the borrower LOWERS the rate (L474-485), and resetReserveRatio only… |
-| M-10 | Medium | `logic` | no | 🟡 near (class mismatch) | — | Controller.setAnnualInterestBips forwards `WildcatMarket(market).setAnnualInterestBips(annualInterestBips)` (L487) without calling assertValueInRange against M… |
+| M-10 | Medium | `logic` | no | ❌ missed | — | Controller.setAnnualInterestBips forwards `WildcatMarket(market).setAnnualInterestBips(annualInterestBips)` (L487) without calling assertValueInRange against M… |
+
+### `2023-12-ethereumcreditguild`
+
+Repo `code-423n4/2023-12-ethereumcreditguild` @ `2facb8f941da70bf075380784b3139f8e694b98a`.
+
+| Known | Sev | Class | In-class | Result | Matched by | Summary |
+|---|---|---|---|---|---|---|
+| H-01 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | claimGaugeRewards initializes a first-time staker's reward baseline with `if (_userGaugeProfitIndex == 0) { _userGaugeProfitIndex = 1e18; }` (L424-426) rather … |
+| H-02 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | transfer() (and transferFrom L646) snapshot `rebasingStateTo = rebasingState[to]` into memory at the top (L560), then update the `from` shares, then recompute … |
+| H-03 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | When bad debt is realized the ProfitManager marks the creditMultiplier DOWN. onBid recomputes a loan's principal live from the current multiplier: `principal =… |
+| H-04 | High | `accounting-logic` | no | 🟡 near (class mismatch) | — | getRewards evaluates the slash condition `if (lastGaugeLoss > uint256(userStake.lastGaugeLoss)) slashed = true;` (L229) BEFORE `userStake = _stakes[user][term]… |
+| M-01 | Medium | `oracle-staleness` | yes | ❌ missed | — | getBidDetail derives the Dutch-auction price purely from `block.timestamp - startTime` against midPoint/auctionDuration (L134-160) with no L2 sequencer-uptime … |
+| M-02 | Medium | `logic` | no | 🟡 near (class mismatch) | — | RateLimitedMinter.mint is gated by `whenNotPaused` (L49-52). GUILD reward minting in SurplusGuildMinter (and credit reward forwarding) flows through this mint;… |
+| M-03 | Medium | `logic` | no | ❌ missed | — | totalBorrowedCredit returns `CreditToken(credit).targetTotalSupply() - SimplePSM(psm).redeemableCredit()` (L172-176). redeemableCredit = getMintAmountOut(pegTo… |
+| M-04 | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | On a loss beyond the surplus buffer, notifyPnL recomputes `newCreditMultiplier = (creditMultiplier * (creditTotalSupply - loss)) / creditTotalSupply` (L332-333… |
+| M-06 | Medium | `logic` | no | 🟡 near (class mismatch) | — | offboard() only requires `canOffboard[term]` (L154) and never resets it; the flag is cleared only in cleanup() (L197). Once a poll reaches quorum and canOffboa… |
+| M-07 | Medium | `missing-implementation` | no | ❌ missed | — | _call() only permits calling a loan if `isDeprecatedGauge(term) \|\| partialRepayDelayPassed(loanId)` (L652-656). A loan whose debt grows past maxDebtPerCollat… |
+| M-12 | Medium | `logic` | no | ❌ missed | — | distribute() resets the reward interpolation window to `endTimestamp = block.timestamp + DISTRIBUTION_PERIOD` (30 days) on EVERY call (L364-384), updating __re… |
+| M-13 | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | debtCeiling reads `creditMinterBuffer = RateLimitedMinter(refs.creditMinter).buffer()` (L282-283) and uses it as a min() cap on the returned ceiling (L290-291,… |
+| M-14 | Medium | `logic` | no | ❌ missed | — | _partialRepay requires `principalRepaid != 0 && interestRepaid != 0` (L519-522). For a loan with 0 interest accrued (e.g. interestRate 0, or repaid in the same… |
+| M-16 | Medium | `logic` | no | ❌ missed | — | bid() settles a Dutch auction whose price is a pure function of elapsed blocks (getBidDetail L118). A bidder can use block stuffing and/or an ERC-777 receive/t… |
+| M-19 | Medium | `accounting-logic` | no | ❌ missed | — | _decrementGaugeWeight only blocks an unstake when `issuance > debtCeiling(-int256(weight))` (L224-231); debtCeiling applies a gaugeWeightTolerance of 1.2e18 (1… |
+| M-20 | Medium | `logic` | no | ❌ missed | — | proposeOffboard requires `block.number > lastPollBlock[term] + POLL_DURATION_BLOCKS` (~7 days, L94-97), so a new offboard poll for a term cannot be opened with… |
+| M-21 | Medium | `logic` | no | 🟡 near (class mismatch) | — | SimplePSM.mint calls `CreditToken(credit).mint(to, amountOut)` directly (L110), and redeem burns directly (L140), bypassing the RateLimitedMinter that gates al… |
+| M-22 | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | The borrow() debt-ceiling check uses `calculateGaugeAllocation(this, totalBorrowedCredit + borrowAmount) * gaugeWeightTolerance / 1e18` (L383-387), while the p… |
+| M-23 | Medium | `rounding-direction` | yes | 🟡 near (class mismatch) | — | Share<->balance conversions round down in _balance2shares/_shares2balance (L256, L266-273). In _mint the realized reward `mintAmount = rebasedBalance - rawBala… |
+| M-25 | Medium | `unbounded-loop` | yes | 🟡 near (class mismatch) | — | getRewards calls `ProfitManager(profitManager).claimRewards(address(this))` (L239), which loops over ALL gauges this contract votes for (ProfitManager.claimRew… |
+
+### `2024-01-salty`
+
+Repo `code-423n4/2024-01-salty` @ `01eb9e21f1d0aa7a058897914bbca9c994d314e0`.
+
+| Known | Sev | Class | In-class | Result | Matched by | Summary |
+|---|---|---|---|---|---|---|
+| H-01 | High | `logic` | no | ❌ missed | — | step11() reads `releaseableAmount = VestingWallet(teamVestingWallet).releasable(salt)` (L233), then calls `.release(salt)` (L236) and `salt.safeTransfer(manage… |
+| H-02 | High | `first-depositor` | yes | ❌ missed | — | _increaseUserShare only adds offsetting virtualRewards `if ( existingTotalShares != 0 )` (L78-85); the first liquidity provider into a pool that already has ac… |
+| H-03 | High | `price-manipulation` | yes | ❌ missed | — | CoreSaltyFeed.getPriceBTC/getPriceETH derive the price purely from live internal pool reserves: `return ( reservesUSDS * 10**8 ) / reservesWBTC` (L40, and L52 … |
+| H-04 | High | `integer-overflow` | yes | ❌ missed | — | _increaseUserShare computes `virtualRewardsToAdd = Math.ceilDiv(totalRewards[poolID]*increaseShareAmount, existingTotalShares)` then `user.virtualRewards += ui… |
+| H-05 | High | `logic` | no | ❌ missed | — | _increaseUserShare resets `user.cooldownExpiration = block.timestamp + stakingConfig.modificationCooldown()` on every share increase (L70), and liquidateUser -… |
+| H-06 | High | `accounting-logic` | no | ❌ missed | — | repayUSDS sends the repaid USDS to the USDS token contract itself — `usds.safeTransferFrom(msg.sender, address(usds), amountRepaid)` (L125) — then `liquidizer.… |
+| M-01 | Medium | `rounding-direction` | yes | 🟡 near (class mismatch) | — | _decreaseUserShare computes `virtualRewardsToRemove = (user.virtualRewards * decreaseShareAmount) / user.userShare` (L118) which rounds DOWN, while claimableRe… |
+| M-09 | Medium | `logic` | no | ❌ missed | — | removeLiquidity's post-withdrawal DUST guard is `require((reserves.reserve0 >= PoolUtils.DUST) && (reserves.reserve0 >= PoolUtils.DUST), "Insufficient reserves… |
+| M-18 | Medium | `logic` | no | 🟡 near (class mismatch) | — | _getUniswapTwapWei derives the average tick with `int24 tick = int24((tickCumulatives[1] - tickCumulatives[0]) / int56(uint56(twapInterval)))` (L59). Solidity … |
+| M-26 | Medium | `slippage` | yes | ❌ missed | — | formPOL calls `collateralAndLiquidity.depositLiquidityAndIncreaseShare( tokenA, tokenB, amountA, amountB, 0, block.timestamp, true )` (L321) — minLiquidityRece… |
 
 ### `2024-05-loop`
 

@@ -1,0 +1,231 @@
+{
+  "name": "2023-12-ethereumcreditguild",
+  "repo": "code-423n4/2023-12-ethereumcreditguild",
+  "commit": "2facb8f941da70bf075380784b3139f8e694b98a",
+  "local_path": "~/Data/bench/2023-12-ethereumcreditguild",
+  "scope_dirs": ["src"],
+  "audit_url": "https://code4rena.com/reports/2023-12-ethereumcreditguild",
+  "note": "The Ethereum Credit Guild — a trust-minimized credit/lending protocol with gauge-voted lending terms (LendingTerm), a Dutch-auction liquidation (AuctionHouse), a SimplePSM, surplus/loss accounting (ProfitManager), a rebasing CREDIT token (ERC20RebaseDistributor) and a GUILD gauge-voting token. Official C4 report: 4 High / 25 Medium. This manifest pins a conservative, high-confidence subset of those findings, each verified to a real (contract, function, file, line) in src at commit 2facb8f. Most are protocol-specific gauge/accounting/auction-lifecycle bugs (out-of-class for Sluice's modeled detector set); only the sequencer-uptime, rounding, and unbounded-loop findings are marked in_class. Mediums whose published locus could not be pinned to a single verified mechanism in source (M-05, M-08, M-09, M-10, M-11, M-15, M-17, M-18, M-24) were dropped rather than guessed. IDs carry the report's H-/M- number.",
+  "known_findings": [
+    {
+      "id": "H-01",
+      "severity": "High",
+      "contract": "ProfitManager",
+      "function": "claimGaugeRewards",
+      "file": "src/governance/ProfitManager.sol",
+      "line": 424,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "claimGaugeRewards initializes a first-time staker's reward baseline with `if (_userGaugeProfitIndex == 0) { _userGaugeProfitIndex = 1e18; }` (L424-426) rather than snapshotting the gauge's *current* gaugeProfitIndex at the time the user's weight is incremented. A user who increments gauge weight (GuildToken._incrementGaugeWeight -> claimGaugeRewards) after profit already accrued is credited the full `deltaIndex = _gaugeProfitIndex - 1e18` (L427-429), receiving rewards that accrued before they staked, with no waiting period (H-01). Protocol-specific reward-index accounting bug, no modeled detector."
+    },
+    {
+      "id": "H-02",
+      "severity": "High",
+      "contract": "ERC20RebaseDistributor",
+      "function": "transfer",
+      "file": "src/tokens/ERC20RebaseDistributor.sol",
+      "line": 553,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "transfer() (and transferFrom L646) snapshot `rebasingStateTo = rebasingState[to]` into memory at the top (L560), then update the `from` shares, then recompute the `to` shares from the STALE in-memory `rebasingStateTo.nShares` and a freshly re-read `rawToBalanceAfter = ERC20.balanceOf(to)` (L605-623). When `from == to` (self-transfer) and the address is rebasing, the sender-side burn of shares is not reflected in the stale `to` snapshot, so shares are double-counted and an attacker mints arbitrary balance / steals all distributed rebase rewards (H-02). Protocol-specific stale-snapshot share-accounting bug, no modeled detector."
+    },
+    {
+      "id": "H-03",
+      "severity": "High",
+      "contract": "LendingTerm",
+      "function": "onBid",
+      "file": "src/loan/LendingTerm.sol",
+      "line": 754,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "When bad debt is realized the ProfitManager marks the creditMultiplier DOWN. onBid recomputes a loan's principal live from the current multiplier: `principal = (borrowAmount * loans[loanId].borrowCreditMultiplier) / creditMultiplier` (L754-755), and getLoanDebt does the same (L230). A drop in creditMultiplier during concurrent auctions inflates every other called loan's principal relative to its frozen callDebt, so settling one bad-debt auction forces additional loans in auction to also settle as bad debt — a cascade (H-03). Protocol-specific credit-multiplier mark-down accounting, no modeled detector."
+    },
+    {
+      "id": "H-04",
+      "severity": "High",
+      "contract": "SurplusGuildMinter",
+      "function": "getRewards",
+      "file": "src/loan/SurplusGuildMinter.sol",
+      "line": 229,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "getRewards evaluates the slash condition `if (lastGaugeLoss > uint256(userStake.lastGaugeLoss)) slashed = true;` (L229) BEFORE `userStake = _stakes[user][term]` is loaded (L234). On the uninitialized stack `userStake.lastGaugeLoss == 0`, so for any term that ever had a loss (lastGaugeLoss != 0) a brand-new staker is flagged slashed and immediately wiped (L274-284) on their first interaction (H-04). Protocol-specific uninitialized-memory ordering bug, no modeled detector."
+    },
+    {
+      "id": "M-01",
+      "severity": "Medium",
+      "contract": "AuctionHouse",
+      "function": "getBidDetail",
+      "file": "src/loan/AuctionHouse.sol",
+      "line": 118,
+      "bug_class": "oracle-staleness",
+      "in_class": true,
+      "summary": "getBidDetail derives the Dutch-auction price purely from `block.timestamp - startTime` against midPoint/auctionDuration (L134-160) with no L2 sequencer-uptime check; if the sequencer was down, on restart the auction has effectively skipped ahead (offering full collateral for near-zero CREDIT, or vice-versa), so auctions fail or execute at bad prices (M-01). Mapped to Sluice's OracleStaleness/SequencerUptime family (in_class)."
+    },
+    {
+      "id": "M-02",
+      "severity": "Medium",
+      "contract": "RateLimitedMinter",
+      "function": "mint",
+      "file": "src/rate-limits/RateLimitedMinter.sol",
+      "line": 49,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "RateLimitedMinter.mint is gated by `whenNotPaused` (L49-52). GUILD reward minting in SurplusGuildMinter (and credit reward forwarding) flows through this mint; when the protocol is paused, users staking via SurplusGuildMinter cannot get rewards minted and therefore cannot complete unstake/withdraw flows that depend on mint, locking funds for the pause duration (M-02). Protocol-specific pause-coupling logic, no modeled detector."
+    },
+    {
+      "id": "M-03",
+      "severity": "Medium",
+      "contract": "ProfitManager",
+      "function": "totalBorrowedCredit",
+      "file": "src/governance/ProfitManager.sol",
+      "line": 172,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "totalBorrowedCredit returns `CreditToken(credit).targetTotalSupply() - SimplePSM(psm).redeemableCredit()` (L172-176). redeemableCredit = getMintAmountOut(pegTokenBalance) scales with 1/creditMultiplier, so after a creditMultiplier change redeemableCredit can exceed targetTotalSupply and the subtraction underflows-reverts; because debtCeiling() calls totalBorrowedCredit, gauge weight decrements / borrows revert, breaking gauges (M-03). Protocol-specific accounting-underflow, no modeled detector."
+    },
+    {
+      "id": "M-04",
+      "severity": "Medium",
+      "contract": "ProfitManager",
+      "function": "notifyPnL",
+      "file": "src/governance/ProfitManager.sol",
+      "line": 332,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "On a loss beyond the surplus buffer, notifyPnL recomputes `newCreditMultiplier = (creditMultiplier * (creditTotalSupply - loss)) / creditTotalSupply` (L332-333). A large user can drive `loss` close to or beyond `creditTotalSupply` (or otherwise distort the ratio), collapsing the creditMultiplier toward zero in one event and breaking the system-wide PnL/peg accounting intentionally or unintentionally (M-04). Protocol-specific PnL-accounting bug, no modeled detector."
+    },
+    {
+      "id": "M-06",
+      "severity": "Medium",
+      "contract": "LendingTermOffboarding",
+      "function": "offboard",
+      "file": "src/governance/LendingTermOffboarding.sol",
+      "line": 154,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "offboard() only requires `canOffboard[term]` (L154) and never resets it; the flag is cleared only in cleanup() (L197). Once a poll reaches quorum and canOffboard[term] is set true (supportOffboard L138-140), the flag (and the persisted poll weight) can be re-used to re-offboard a term that governance re-onboarded, bypassing a fresh DAO vote (M-06). Protocol-specific flag-lifecycle logic, no modeled detector."
+    },
+    {
+      "id": "M-07",
+      "severity": "Medium",
+      "contract": "LendingTerm",
+      "function": "_call",
+      "file": "src/loan/LendingTerm.sol",
+      "line": 652,
+      "bug_class": "missing-implementation",
+      "in_class": false,
+      "summary": "_call() only permits calling a loan if `isDeprecatedGauge(term) || partialRepayDelayPassed(loanId)` (L652-656). A loan whose debt grows past maxDebtPerCollateralToken (undercollateralized) but whose term is neither deprecated nor has a missed periodic partial-repay cannot be called/liquidated, so the position sits creating bad debt with no liquidation path (M-07). Protocol-specific missing-liquidation-trigger, no modeled detector."
+    },
+    {
+      "id": "M-12",
+      "severity": "Medium",
+      "contract": "ERC20RebaseDistributor",
+      "function": "distribute",
+      "file": "src/tokens/ERC20RebaseDistributor.sol",
+      "line": 364,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "distribute() resets the reward interpolation window to `endTimestamp = block.timestamp + DISTRIBUTION_PERIOD` (30 days) on EVERY call (L364-384), updating __rebasingSharePrice/__unmintedRebaseRewards targets. Anyone can call distribute() with a tiny amount repeatedly to perpetually push the targetTimestamp forward, prolonging the time over which already-distributed rewards become realized to holders (M-12). Protocol-specific interpolation-reset logic, no modeled detector."
+    },
+    {
+      "id": "M-13",
+      "severity": "Medium",
+      "contract": "LendingTerm",
+      "function": "debtCeiling",
+      "file": "src/loan/LendingTerm.sol",
+      "line": 282,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "debtCeiling reads `creditMinterBuffer = RateLimitedMinter(refs.creditMinter).buffer()` (L282-283) and uses it as a min() cap on the returned ceiling (L290-291, L324-326). The creditMinter buffer is a global rate-limit shared across all terms, not a per-term capacity, so folding it into this term's debt ceiling mis-states the term's true borrowable amount (M-13). Protocol-specific buffer-misuse accounting, no modeled detector."
+    },
+    {
+      "id": "M-14",
+      "severity": "Medium",
+      "contract": "LendingTerm",
+      "function": "_partialRepay",
+      "file": "src/loan/LendingTerm.sol",
+      "line": 519,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "_partialRepay requires `principalRepaid != 0 && interestRepaid != 0` (L519-522). For a loan with 0 interest accrued (e.g. interestRate 0, or repaid in the same conditions where interest rounds to 0), interestRepaid is 0 and the call always reverts, so a borrower under a term with periodic partial-repay obligations cannot make the required partial repayment and the loan becomes callable (M-14). Protocol-specific conflicting-require logic, no modeled detector."
+    },
+    {
+      "id": "M-16",
+      "severity": "Medium",
+      "contract": "AuctionHouse",
+      "function": "bid",
+      "file": "src/loan/AuctionHouse.sol",
+      "line": 166,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "bid() settles a Dutch auction whose price is a pure function of elapsed blocks (getBidDetail L118). A bidder can use block stuffing and/or an ERC-777 receive/transfer hook (collateral push in LendingTerm.onBid) that reverts to grief competing bids and drag the auction into the cheaper phase, winning collateral below fair value (M-16). Protocol-specific auction-griefing logic, no modeled detector."
+    },
+    {
+      "id": "M-19",
+      "severity": "Medium",
+      "contract": "GuildToken",
+      "function": "_decrementGaugeWeight",
+      "file": "src/tokens/GuildToken.sol",
+      "line": 226,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "_decrementGaugeWeight only blocks an unstake when `issuance > debtCeiling(-int256(weight))` (L224-231); debtCeiling applies a gaugeWeightTolerance of 1.2e18 (120%) on top of the gauge weight (LendingTerm.debtCeiling L305). Because of that tolerance the computed post-decrement ceiling stays above issuance even after removing most of the weight, so a holder can unstake well over 90% of GUILD voting for a gauge that is using its full debt allocation (M-19). Protocol-specific tolerance-accounting bug, no modeled detector."
+    },
+    {
+      "id": "M-20",
+      "severity": "Medium",
+      "contract": "LendingTermOffboarding",
+      "function": "proposeOffboard",
+      "file": "src/governance/LendingTermOffboarding.sol",
+      "line": 95,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "proposeOffboard requires `block.number > lastPollBlock[term] + POLL_DURATION_BLOCKS` (~7 days, L94-97), so a new offboard poll for a term cannot be opened within 7 days of the previous one. If a term needs to be offboarded twice in a 7-day window (e.g. re-onboarded then needs re-offboarding) the second poll cannot start, leaving bad debt to accrue (M-20). Protocol-specific poll-cooldown logic, no modeled detector."
+    },
+    {
+      "id": "M-21",
+      "severity": "Medium",
+      "contract": "SimplePSM",
+      "function": "mint",
+      "file": "src/loan/SimplePSM.sol",
+      "line": 103,
+      "bug_class": "logic",
+      "in_class": false,
+      "summary": "SimplePSM.mint calls `CreditToken(credit).mint(to, amountOut)` directly (L110), and redeem burns directly (L140), bypassing the RateLimitedMinter that gates all other CREDIT issuance. CREDIT can therefore be minted/redeemed through the PSM without consuming the governance rate-limit buffer, weakening the issuance-velocity control that protects against governance/oracle attacks (M-21). Protocol-specific rate-limit-bypass logic, no modeled detector."
+    },
+    {
+      "id": "M-22",
+      "severity": "Medium",
+      "contract": "LendingTerm",
+      "function": "debtCeiling",
+      "file": "src/loan/LendingTerm.sol",
+      "line": 305,
+      "bug_class": "accounting-logic",
+      "in_class": false,
+      "summary": "The borrow() debt-ceiling check uses `calculateGaugeAllocation(this, totalBorrowedCredit + borrowAmount) * gaugeWeightTolerance / 1e18` (L383-387), while the public debtCeiling() view computes the ceiling through a different toleratedGaugeWeight / otherGaugesWeight formula (L305-330). The two formulas can disagree, so debtCeiling() reports a value inconsistent with what borrow() actually enforces (M-22). Protocol-specific formula-inconsistency accounting bug, no modeled detector."
+    },
+    {
+      "id": "M-23",
+      "severity": "Medium",
+      "contract": "ERC20RebaseDistributor",
+      "function": "_mint",
+      "file": "src/tokens/ERC20RebaseDistributor.sol",
+      "line": 542,
+      "bug_class": "rounding-direction",
+      "in_class": true,
+      "summary": "Share<->balance conversions round down in _balance2shares/_shares2balance (L256, L266-273). In _mint the realized reward `mintAmount = rebasedBalance - rawBalance` (L542) and the analogous subtractions in transfer/_burn can underflow when rounding makes the recomputed rebasedBalance momentarily less than the raw balance, reverting transfers and mints for affected balances (M-23). Genuine rounding-direction / precision-loss bug; mapped to Sluice's RoundingDirection/PrecisionLoss family (in_class)."
+    },
+    {
+      "id": "M-25",
+      "severity": "Medium",
+      "contract": "SurplusGuildMinter",
+      "function": "getRewards",
+      "file": "src/loan/SurplusGuildMinter.sol",
+      "line": 239,
+      "bug_class": "unbounded-loop",
+      "in_class": true,
+      "summary": "getRewards calls `ProfitManager(profitManager).claimRewards(address(this))` (L239), which loops over ALL gauges this contract votes for (ProfitManager.claimRewards L443, `for i < gauges.length`). As the SurplusGuildMinter accumulates positions across many terms, every stake/unstake/getRewards iterates the full gauge list and can exceed the block gas limit, DoSing the function (M-25). Mapped to Sluice's UnboundedLoop/DenialOfService family (in_class)."
+    }
+  ]
+}

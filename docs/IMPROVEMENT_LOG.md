@@ -1085,3 +1085,32 @@ both to keep the metric honest (guard against 8-contest overfitting) and to hunt
   registered protocol-deployed contract whose callee is `nonReentrant`.
 - This wave added NO code changes (corpus + report only); no gate needed beyond confirming the scoreboard loads & scores
   the 9th contest cleanly (it does). _done._
+
+### NORTH STAR — wave 9 (corpus 9→11 + reentrancy FP fixed + 2 fresh hunts): honest harder baseline
+More benchmarks, more precision, more bug-hunting (4 agents: 2 verified manifests, 1 precision fix, 1 deep hunt). Cloned
+**2024-01-salty** (AMM + USDS stablecoin + staking + DAO) and **2023-12-ethereumcreditguild** (gauge-voted credit protocol)
+read-only into `~/Data/bench/`.
+- **P — `benchmarks/contests/2024-01-salty.json`:** 10 findings pinned (all 6 Highs + 4 Mediums), 27 Mediums honestly
+  DROPPED (report summaries too shallow to pin without guessing). 5 in-class (H-02 first-depositor, H-03 price-manip,
+  H-04 uint128-truncation, M-01 rounding, M-26 slippage), 5 out-of-class.
+- **Q — `benchmarks/contests/2023-12-ethereumcreditguild.json`:** 20 findings pinned (4H/16M), 9 Mediums dropped (couldn't
+  separate distinct loci without guessing). 3 in-class (M-01 oracle-staleness, M-23 rounding, M-25 unbounded-loop), 17
+  out-of-class. 12 location-near (Sluice fires the right line, wrong class — validates the loci + maps the uplift surface).
+- **R — reentrancy.rs PRECISION FIX (Wildcat FP):** principled suppression of the benign cleanup-delete shape — a post-call
+  storage write that is a same-slot `delete`/reset, where every arming call is a plain non-value, non-token-transfer
+  External method call. Removes the false `resetReserveRatio` High WITHOUT weakening real catches (every real-hack
+  reentrancy fixture arms via a value/low-level/token-transfer call → unaffected). 955 engine tests, all real-hacks green,
+  dogfood reentrancy counts unchanged. Wildcat Crit/High 1→0.
+- **S — Salty deep hunt:** no stake-your-name High. **Both Sluice leads CONFIRMED FALSE POSITIVES** (FlashLoanGovernance @
+  Proposals.castVote — defeated by 2-week unstake timelock + non-transferable xSALT; TwapManipulation @ CoreUniswapFeed —
+  30-min TWAP inside a closest-two-of-three median-with-3%-divergence). Found a Medium (empty-pool first-depositor reward
+  theft) + confirmed C4 M-09 (Low). Writeup in `docs/dogfood-findings/salty-2026-06-05.md`. Best deeper lead: atomic
+  swap-then-liquidate vs the WBTC/WETH collateral pool (needs ArbitrageSearch bisection math).
+- **Integration:** disjoint (R=reentrancy.rs; P/Q=new contest JSONs). Authoritative gate: build 0 warnings, **955 engine
+  tests / 0 fail**, full workspace green, corpus + real_hacks green. 135 detectors.
+- **SCOREBOARD (now 11 contests, 626 findings): in-class 78% (31/40), out-of-class 5% (4/77), Crit/High 29 (21 unmatched).**
+  The in-class drop 97%→78% is the HONEST generalization signal — the 8 new in-class misses (Salty/ECG) are MODELED classes
+  (first-depositor / price-manip / integer-overflow / rounding / oracle-staleness / unbounded-loop) that don't fire on
+  fresh untuned codebases = the highest-value, GENERALIZABLE detector-robustness targets (not overfitting). Wildcat
+  Crit/High 1→0 (R's FP fix). Known FPs for the precision backlog: Salty FlashLoanGovernance + TwapManipulation (both need
+  cross-contract reasoning to suppress; logged in salty-2026-06-05.md). _done._
