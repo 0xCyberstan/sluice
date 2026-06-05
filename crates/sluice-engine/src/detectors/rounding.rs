@@ -84,6 +84,29 @@ impl Detector for RoundingDetector {
                 }
             }
 
+            // ---- Arm 5: floored offset subtracted from a user payout ----
+            // In a withdraw/decrease/claim/redeem path, a deduction term is
+            // computed with a truncating division (`a * b / c` or `a / c`) and
+            // then *subtracted* from a user-claimable/payout quantity. Because the
+            // subtrahend is floored, the user receives MORE than the exact value —
+            // the floor favors the claimer, the opposite of the protocol-favoring
+            // direction. Salty `_decreaseUserShare` floors `virtualRewardsToRemove`
+            // (a virtual-rewards offset) and then pays out
+            // `rewardsForAmount - virtualRewardsToRemove`, so withdrawing in many
+            // small increments lets a user over-claim (M-01). Unlike Arm 1 this
+            // fires on internal helpers too (the offset is rarely in the external
+            // entry point) but is gated on the subtracted-offset structure so a
+            // floor that is *added* to a payout (favoring the protocol) or one that
+            // is explicitly rounded does not trip it.
+            if is_payout_path_name(&f.name) && f.is_state_mutating() {
+                if let Some(span) = find_floored_offset_subtracted_from_payout(f) {
+                    if !uses_explicit_rounding(cx, f) {
+                        out.push(self.subtracted_offset_finding(cx, f, span));
+                        continue;
+                    }
+                }
+            }
+
             // ---- Arm 3: sqrt-based reserve recovery ----
             // A reserve/invariant value recovered through an integer square root
             // (`LibMath.sqrt(..)`, `x.sqrt()`) or its inverse `s ** 2 / b`. Integer
@@ -201,6 +224,32 @@ impl RoundingDetector {
                  acceptable price on-chain with a ceil division (round the required price *up*) before \
                  comparing, or relax the collateral check to tolerate the truncation (e.g. compare \
                  against `minted * ONE_DEC18` with a >= that accounts for the rounding direction).",
+            );
+        cx.finish(b, f.id, span)
+    }
+
+    fn subtracted_offset_finding(&self, cx: &AnalysisContext, f: &Function, span: sluice_ir::Span) -> Finding {
+        let b = FindingBuilder::new(self.id(), Category::RoundingDirection)
+            .title("Floored deduction subtracted from a user payout (rounds in the claimer's favor)")
+            .severity(Severity::Medium)
+            .confidence(0.5)
+            .dimension(Dimension::ValueFlow)
+            .message(format!(
+                "`{}` is a withdraw/decrease/claim path that computes a deduction term with a \
+                 truncating integer division (`a * b / c`) and then *subtracts* it from a \
+                 user-claimable/payout quantity. Solidity division truncates toward zero, so the \
+                 floored subtrahend is too small and the resulting payout is too large — the rounding \
+                 favors the claimer instead of the protocol. By withdrawing/claiming in many small \
+                 increments a user can repeatedly capture the per-call floor and over-claim (e.g. a \
+                 virtual-rewards offset `virtualRewards * amount / userShare` floored and then \
+                 subtracted from the claimable rewards).",
+                f.name
+            ))
+            .recommendation(
+                "Round a subtracted deduction/offset term *up* (against the claimer) so the payout can \
+                 never exceed the exact value — e.g. `Math.mulDiv(a, b, c, Rounding.Ceil)` or a \
+                 `mulDivUp`/`ceilDiv` helper for the offset that is later subtracted, rather than the \
+                 default truncating division.",
             );
         cx.finish(b, f.id, span)
     }
@@ -485,6 +534,224 @@ fn contract_has_collateral_product_invariant(cx: &AnalysisContext, contract: &sl
     src.contains("collateral")
         && src.contains("price")
         && (src.contains("minted") || src.contains("debt") || src.contains("borrow"))
+}
+
+// ---------------------------------------------------------------------------
+// Arm 5: floored offset subtracted from a user payout
+// ---------------------------------------------------------------------------
+
+/// A withdraw/decrease/claim/redeem/unstake path: the kind of function where a
+/// deduction subtracted from a payout decides how much a user takes out. Kept to
+/// payout-reducing verbs (not `mint`/`deposit`, where a floored *added* term
+/// favors the protocol) so the arm only considers the favors-the-claimer shape.
+fn is_payout_path_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    [
+        "decrease", "withdraw", "redeem", "claim", "unstake", "unbond", "exit",
+        "harvest", "payout", "cashout",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
+/// Names that denote a user-claimable / payout quantity — the thing a floored,
+/// subtracted offset bleeds into. Used to require the subtraction result actually
+/// lands in a payout (so plain `a - b` bookkeeping does not trip the arm).
+fn is_payout_quantity_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.contains("claimable")
+        || l.contains("reward")
+        || l.contains("payout")
+        || l.contains("payable")
+        || l.contains("owed")
+        || l.contains("withdrawable")
+        || l.contains("amountout")
+        || l.contains("amounttosend")
+        || l.contains("amounttotransfer")
+        || l.contains("topay")
+        || l.contains("toclaim")
+}
+
+/// Detect the Salty M-01 shape: a deduction term computed with a *truncating*
+/// integer division (`a * b / c` or bare `a / c`, not a ceil idiom / `mulDiv`
+/// helper) that is then **subtracted** from a payout quantity.
+///
+/// Conservative, all required:
+///   1. an assignment `offset = <floored mul-div / bare div>` whose target is a
+///      local/state name and whose value is a truncating division (so the
+///      subtrahend is rounded down);
+///   2. a subtraction `A - offset` (the floored value on the *right* of `-`, i.e.
+///      actually deducted) whose enclosing assignment target is a payout-shaped
+///      name — or, failing a named target, the subtraction result is the argument
+///      of a `transfer`/`safeTransfer` payout call.
+///
+/// Returns the span of the floored division (the offending quotient).
+fn find_floored_offset_subtracted_from_payout(f: &Function) -> Option<sluice_ir::Span> {
+    // A hand-rolled ceil anywhere in the offset would mean rounding was considered;
+    // `uses_explicit_rounding` already covers the textual helpers, but a structural
+    // ceil idiom in the body also disqualifies (the offset is rounded up).
+    if has_ceil_idiom(f) {
+        return None;
+    }
+
+    // (1) Collect names bound to a truncating division — both `T x = a / b;`
+    // (a `VarDecl` with an init, the Salty spelling) and `x = a / b;` (an
+    // `Assign`). Record the bound name and the span of the offending `/`.
+    use sluice_ir::StmtKind;
+    let mut floored_offsets: Vec<(String, sluice_ir::Span)> = Vec::new();
+    for s in &f.body {
+        s.visit(&mut |st| {
+            if let StmtKind::VarDecl { name: Some(name), init: Some(init), .. } = &st.kind {
+                if let Some(div_span) = first_truncating_div_span(init) {
+                    floored_offsets.push((name.to_ascii_lowercase(), div_span));
+                }
+            }
+        });
+        s.visit_exprs(&mut |e| {
+            if let ExprKind::Assign { target, value, .. } = &e.kind {
+                if let Some(name) = target.simple_name() {
+                    if let Some(div_span) = first_truncating_div_span(value) {
+                        floored_offsets.push((name.to_ascii_lowercase(), div_span));
+                    }
+                }
+            }
+        });
+    }
+    if floored_offsets.is_empty() {
+        return None;
+    }
+
+    // (2) A subtraction `A - offset` whose result flows to a payout. We look for a
+    // `Sub` whose RHS is (or contains) one of the floored-offset names, and whose
+    // enclosing assignment target is payout-shaped (or whose result feeds a
+    // transfer). Because we scan assignments, the common
+    // `claimableRewards = rewardsForAmount - virtualRewardsToRemove;` is caught.
+    let offset_names: Vec<&str> = floored_offsets.iter().map(|(n, _)| n.as_str()).collect();
+
+    // Does a transfer-style payout call exist in the body? (fallback path for when
+    // the subtraction is not directly assigned to a named payout var).
+    let has_payout_transfer = body_has_payout_transfer(f);
+
+    // The specific floored-offset name that is actually deducted into a payout.
+    let mut deducted: Option<String> = None;
+    for s in &f.body {
+        // `T payout = A - offset;` form.
+        s.visit(&mut |st| {
+            if deducted.is_some() {
+                return;
+            }
+            if let StmtKind::VarDecl { name: Some(name), init: Some(init), .. } = &st.kind {
+                let target_is_payout = is_payout_quantity_name(name);
+                if target_is_payout || has_payout_transfer {
+                    if let Some(off) = sub_deducts_offset(init, &offset_names) {
+                        deducted = Some(off);
+                    }
+                }
+            }
+        });
+        // `payout = A - offset;` form.
+        s.visit_exprs(&mut |e| {
+            if deducted.is_some() {
+                return;
+            }
+            if let ExprKind::Assign { target, value, .. } = &e.kind {
+                let target_is_payout = target
+                    .simple_name()
+                    .map(is_payout_quantity_name)
+                    .unwrap_or(false);
+                if target_is_payout || has_payout_transfer {
+                    if let Some(off) = sub_deducts_offset(value, &offset_names) {
+                        deducted = Some(off);
+                    }
+                }
+            }
+        });
+    }
+    let deducted = deducted?;
+
+    // Report the span of the floored division that becomes the subtrahend.
+    floored_offsets
+        .iter()
+        .find(|(n, _)| *n == deducted)
+        .map(|(_, sp)| *sp)
+}
+
+/// Span of the first *truncating* integer division in `e`: a `Div` whose
+/// numerator contains a `Mul` (`a * b / c`) or a bare `a / c`, but NOT a
+/// hand-rolled ceil (`(a + b - 1) / b`). Returns `None` if no such division.
+fn first_truncating_div_span(e: &Expr) -> Option<sluice_ir::Span> {
+    let mut found = None;
+    e.visit(&mut |n| {
+        if found.is_some() {
+            return;
+        }
+        if let ExprKind::Binary { op: BinOp::Div, lhs, .. } = &n.kind {
+            // Exclude the ceil idiom: a `- 1` inside the numerator.
+            let mut is_ceil = false;
+            lhs.visit(&mut |m| {
+                if let ExprKind::Binary { op: BinOp::Sub, rhs, .. } = &m.kind {
+                    if is_one(rhs) {
+                        is_ceil = true;
+                    }
+                }
+            });
+            if !is_ceil {
+                found = Some(n.span);
+            }
+        }
+    });
+    found
+}
+
+/// If `e` contains a subtraction `A - X` where `X` (the right operand, the
+/// deducted term) is — or transitively references — one of `offset_names`,
+/// return that matched offset name (lowercased). The subtrahend must be on the
+/// *right* of `-` so a floored term that is added, or that is the minuend, does
+/// not count.
+fn sub_deducts_offset(e: &Expr, offset_names: &[&str]) -> Option<String> {
+    let mut found: Option<String> = None;
+    e.visit(&mut |n| {
+        if found.is_some() {
+            return;
+        }
+        if let ExprKind::Binary { op: BinOp::Sub, rhs, .. } = &n.kind {
+            rhs.visit(&mut |m| {
+                if found.is_some() {
+                    return;
+                }
+                if let Some(name) = m.simple_name() {
+                    let l = name.to_ascii_lowercase();
+                    if offset_names.contains(&l.as_str()) {
+                        found = Some(l);
+                    }
+                }
+            });
+        }
+    });
+    found
+}
+
+/// True if the body performs a token-transfer-style payout (`transfer`,
+/// `safeTransfer`, `safeTransferFrom`, `send`) — evidence the computed amount is
+/// actually paid out to a user.
+fn body_has_payout_transfer(f: &Function) -> bool {
+    let mut found = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            if let ExprKind::Call(c) = &e.kind {
+                if let Some(n) = c.func_name.as_deref() {
+                    let l = n.to_ascii_lowercase();
+                    if l == "transfer" || l == "safetransfer" || l == "safetransferfrom" || l == "send" {
+                        found = true;
+                    }
+                }
+            }
+        });
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1189,132 @@ mod tests {
         let fs = run(PRICE_GATE_NO_INVARIANT);
         assert!(
             !fs.iter().any(|f| f.detector == "rounding-direction"),
+            "{:?}",
+            fs
+        );
+    }
+
+    // ---- Arm 5: floored offset subtracted from a user payout (Salty M-01) ----
+    // `_decreaseUserShare` floors `virtualRewardsToRemove` (a virtual-rewards
+    // offset) with `virtualRewards * amount / userShare`, then pays out
+    // `rewardsForAmount - virtualRewardsToRemove`. The floored subtrahend makes
+    // the payout too large; withdrawing in many small increments over-claims.
+    const OFFSET_VULN: &str = r#"
+        contract StakingRewards {
+            mapping(address => uint256) public virtualRewards;
+            mapping(address => uint256) public userShare;
+            mapping(bytes32 => uint256) public totalRewards;
+            mapping(bytes32 => uint256) public totalShares;
+            function _decreaseUserShare(address wallet, bytes32 poolID, uint256 decreaseShareAmount) internal {
+                uint256 rewardsForAmount = (totalRewards[poolID] * decreaseShareAmount) / totalShares[poolID];
+                uint256 virtualRewardsToRemove = (virtualRewards[wallet] * decreaseShareAmount) / userShare[wallet];
+                userShare[wallet] -= decreaseShareAmount;
+                virtualRewards[wallet] -= virtualRewardsToRemove;
+                uint256 claimableRewards = 0;
+                if (virtualRewardsToRemove < rewardsForAmount)
+                    claimableRewards = rewardsForAmount - virtualRewardsToRemove;
+                if (claimableRewards != 0)
+                    salt.safeTransfer(wallet, claimableRewards);
+            }
+        }
+    "#;
+
+    // Same shape but the subtracted offset is rounded *up* (against the claimer)
+    // via a ceil idiom, so the payout can never exceed the exact value — no finding.
+    const OFFSET_SAFE: &str = r#"
+        contract StakingRewards {
+            mapping(address => uint256) public virtualRewards;
+            mapping(address => uint256) public userShare;
+            mapping(bytes32 => uint256) public totalRewards;
+            mapping(bytes32 => uint256) public totalShares;
+            function _decreaseUserShare(address wallet, bytes32 poolID, uint256 decreaseShareAmount) internal {
+                uint256 rewardsForAmount = (totalRewards[poolID] * decreaseShareAmount) / totalShares[poolID];
+                uint256 virtualRewardsToRemove = (virtualRewards[wallet] * decreaseShareAmount + userShare[wallet] - 1) / userShare[wallet];
+                userShare[wallet] -= decreaseShareAmount;
+                virtualRewards[wallet] -= virtualRewardsToRemove;
+                uint256 claimableRewards = 0;
+                if (virtualRewardsToRemove < rewardsForAmount)
+                    claimableRewards = rewardsForAmount - virtualRewardsToRemove;
+                if (claimableRewards != 0)
+                    salt.safeTransfer(wallet, claimableRewards);
+            }
+        }
+    "#;
+
+    // A floored quotient that is *added* to a payout favors the protocol (the user
+    // gets less, not more) — the opposite direction — and must NOT fire.
+    const OFFSET_ADDED_SAFE: &str = r#"
+        contract StakingRewards {
+            mapping(address => uint256) public bonus;
+            mapping(address => uint256) public userShare;
+            mapping(bytes32 => uint256) public totalRewards;
+            mapping(bytes32 => uint256) public totalShares;
+            function withdrawRewards(address wallet, bytes32 poolID, uint256 amount) external {
+                uint256 base = (totalRewards[poolID] * amount) / totalShares[poolID];
+                uint256 extra = (bonus[wallet] * amount) / userShare[wallet];
+                uint256 claimableRewards = base + extra;
+                salt.safeTransfer(wallet, claimableRewards);
+            }
+        }
+    "#;
+
+    // A non-payout function (deposit/mint) with a subtracted floored offset must
+    // NOT trip Arm 5 — the verb gate excludes the protocol-favoring direction.
+    const OFFSET_MINT_SAFE: &str = r#"
+        contract Vault {
+            uint256 public totalSupply;
+            uint256 public totalAssets;
+            mapping(address => uint256) public fee;
+            function mint(address to, uint256 assets) external {
+                uint256 gross = assets * totalSupply / totalAssets;
+                uint256 cut = (fee[to] * assets) / totalSupply;
+                uint256 net = gross - cut;
+                totalSupply += net;
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_floored_offset_subtracted_from_payout() {
+        let fs = run(OFFSET_VULN);
+        assert!(
+            fs.iter().any(|f| f.detector == "rounding-direction"
+                && f.function == "_decreaseUserShare"),
+            "{:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_rounded_up_subtracted_offset() {
+        let fs = run(OFFSET_SAFE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "rounding-direction"),
+            "{:?}",
+            fs
+        );
+    }
+
+    // Distinctive title of the Arm-5 finding; SAFE assertions key on this so a
+    // pre-existing Arm-1 conversion finding (on a `withdraw`/`mint` mul-div) does
+    // not mask an Arm-5 regression.
+    const OFFSET_TITLE: &str = "Floored deduction subtracted from a user payout (rounds in the claimer's favor)";
+
+    #[test]
+    fn silent_on_floored_offset_added_to_payout() {
+        let fs = run(OFFSET_ADDED_SAFE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "rounding-direction" && f.title == OFFSET_TITLE),
+            "{:?}",
+            fs
+        );
+    }
+
+    #[test]
+    fn silent_on_subtracted_offset_in_mint_path() {
+        let fs = run(OFFSET_MINT_SAFE);
+        assert!(
+            !fs.iter().any(|f| f.detector == "rounding-direction" && f.title == OFFSET_TITLE),
             "{:?}",
             fs
         );

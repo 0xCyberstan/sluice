@@ -1114,3 +1114,38 @@ read-only into `~/Data/bench/`.
   fresh untuned codebases = the highest-value, GENERALIZABLE detector-robustness targets (not overfitting). Wildcat
   Crit/High 1→0 (R's FP fix). Known FPs for the precision backlog: Salty FlashLoanGovernance + TwapManipulation (both need
   cross-contract reasoning to suppress; logged in salty-2026-06-05.md). _done._
+
+### NORTH STAR — wave 10 (in-class generalization push + 2 confirmed Highs): in-class 78%→88%
+Target = the modeled-class in-class gaps the corpus expansion exposed (detectors not generalizing to fresh Salty/ECG
+code). 4 worktree detector agents (disjoint files) + 1 deep ECG hunt, + a precision follow-up.
+- **A1 — integer_issues.rs → Salty H-04:** new arm for a narrowing `uintN(product)` downcast (a `*` or `mulDiv`/`ceilDiv`
+  product with an unbounded state/derived factor) that arm-2's attacker-flow gate misses (laundered through a library
+  call + storage factor). Fires at `_increaseUserShare:83`.
+- **A2 — rounding.rs → Salty M-01:** Arm 5 for a floored `/` offset SUBTRACTED from a user payout (favoring the claimer)
+  in a withdraw/decrease/claim function. Fires at `_decreaseUserShare:118`. (ECG M-23 honestly NOT covered — different
+  shape, share<->balance conversion in opaque helpers; forcing it would balloon noise.)
+- **A3 — slippage.rs → Salty M-26:** generalized `is_swap_like` to AMM zap/add-liquidity prefix families
+  (`depositLiquidity*`/`addLiquidity*`/`exactInput*`/…); the literal-`0`-min-out + `block.timestamp`-deadline matchers fire
+  at `formPOL:321`.
+- **A4 — dos.rs → ECG M-25:** Pattern 1c for a loop bounded by `X.length` where X is a per-account position list fetched
+  from an external getter keyed by an account-shaped arg (`GuildToken.userGauges(user)`), with per-iter call work. Fires at
+  the TRUE locus `ProfitManager.claimRewards:443`. Manifest M-25 RECONCILED honestly to that locus (the loop mechanism),
+  not the `getRewards:239` cross-contract entry the report named — pin-to-real-mechanism.
+- **A5 — ECG deep hunt:** confirmed 2 real Highs (self-transfer mints CREDIT via stale rebasingState snapshot → drains
+  PSM; `getRewards` reads `lastGaugeLoss` before loading the stake → spurious slashing). Writeup in
+  `docs/dogfood-findings/ethereumcreditguild-2026-06-05.md`.
+- **PRECISION FOLLOW-UP (FP caught + fixed):** A1's arm over-fired ONE false High on reserve `RToken.redeem:462`
+  (`uint192(mulDiv256(basketsNeeded_, amount, supply))`, which the code proves bounded: `amount < supply`). A1 had only
+  dogfood-tested aave/morpho/balancer/lido, not the contest corpus. Tightened the arm with `cast_in_state_write`: fire ONLY
+  when the narrowed product is written to a PERSISTENT slot (mapping/array index, struct member, or state var) — the
+  compounding-accounting shape — not a one-shot local conversion. Salty H-04 still fires (`+=`/`= packed`); reserve FP gone.
+- **CONCURRENCY NOTE:** two of the four parallel worktrees suffered a `git stash` cross-contamination (shared `.git`): A1's
+  worktree picked up A4's dos.rs and vice-versa. Verified each file against its author (integer_issues identical in both;
+  dos.rs taken from A4, the fuller version), so integration used the canonical copy of each. (Lesson: even worktree-isolated
+  agents share the object store; verify each worktree's diff is single-file before copy-back.)
+- **Integration:** disjoint (integer_issues/rounding/slippage/dos + the FP-fix on integer_issues). One authoritative gate:
+  build 0 warnings, **972 engine tests / 0 fail**, full workspace green, corpus + real_hacks green. 135 detectors.
+- **SCOREBOARD (11 contests, 631 findings): in-class 88% (35/40), out-of-class 5% (4/77), Crit/High 30 (21 unmatched).**
+  Salty 0%→60% (H-04/M-01/M-26), ECG 0%→33% (M-25). Precision RESTORED after the FP fix (unmatched back to 21, the
+  pre-wave-10 level). Remaining in-class gaps: Salty H-02 (first-depositor-in-rewards), H-03 (spot-reserve price), ECG M-01
+  (oracle-staleness/sequencer), M-23 (rebase rounding). _done._

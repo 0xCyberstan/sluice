@@ -366,6 +366,138 @@ impl Detector for IntegerIssuesDetector {
                         );
                     out.push(cx.finish(b, f.id, span));
                 });
+
+                // ---- (6) narrowing downcast of a MULTIPLICATION-derived value ----
+                // Arm (2) suppresses any cast whose operand is not proven
+                // `is_attacker_controlled` by the dataflow. That misses the Salty
+                // H-04 shape: a product of a STORAGE accumulator and a user amount,
+                // laundered through a `Math.ceilDiv`/`mulDiv` library call and bound
+                // to a local, then narrowed and accumulated back into state:
+                //
+                //   uint256 virtualRewardsToAdd =
+                //       Math.ceilDiv( totalRewards[poolID] * increaseShareAmount, existingTotalShares );
+                //   user.virtualRewards   += uint128(virtualRewardsToAdd);   // silent uint256->uint128 truncation
+                //   totalRewards[poolID]  += uint128(virtualRewardsToAdd);
+                //
+                // `totalRewards[poolID]` is storage (provenance StorageState, never
+                // attacker-tainted) and the `ceilDiv(...)` call launders the
+                // `increaseShareAmount` taint, so arm (2)'s `is_attacker_controlled`
+                // gate never sees it. But the *value* is the product of an unbounded
+                // storage accumulator and a user-chosen amount: once it exceeds
+                // `type(uintN).max` the cast silently truncates, corrupting the
+                // reward accounting (and, because the truncated value is *also*
+                // written back into the same `totalRewards` accumulator that fed the
+                // product, the corruption compounds).
+                //
+                // The signal is structural and deliberately narrow — it is NOT a
+                // bare `uintN(x)`:
+                //   * the operand is (directly, or via the local it is bound to) a
+                //     PRODUCT: a `*` multiplication or a `mulDiv`/`ceilDiv`-family
+                //     wide-multiply call (`Math.ceilDiv`, `FullMath.mulDiv`,
+                //     `mulDivUp`, `mulWad`, ...); AND
+                //   * the product is not provably bounded — at least one factor is a
+                //     non-constant, non-width-bounded value (a state read / call /
+                //     unbounded local), so the result can exceed the target width.
+                // A downcast of a small constant, a width-safe value, a clamped or
+                // monotone-shrunk local (suppressions A/B/B'/C/C' above already
+                // `return`ed before this point is reached for those operands) does
+                // NOT fire. Squares of two bare params with no state/`mulDiv` factor
+                // are left to arm (2)'s attacker-flow gate, so this stays off
+                // ordinary bounded `a * b` math.
+                let local_defs = local_init_exprs(f);
+                let mut reported_mul_widths: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+                visit_calls(f, |c, span| {
+                    if c.kind != CallKind::TypeCast {
+                        return;
+                    }
+                    let Some(ty) = cast_target_type(c) else { return };
+                    let Some(bits) = narrowing_int_bits(&ty) else {
+                        return;
+                    };
+                    if c.args.len() != 1 {
+                        return;
+                    }
+                    let Some(arg) = c.args.first() else { return };
+
+                    // Resolve the operand: the cast argument itself, or — when it is a
+                    // bare local — that local's last defining expression (so
+                    // `uint128(virtualRewardsToAdd)` is analysed as the `ceilDiv(...)`
+                    // product it was assigned).
+                    let resolved: &Expr = match &arg.kind {
+                        ExprKind::Ident(name) => {
+                            local_defs.get(name.as_str()).copied().unwrap_or(arg)
+                        }
+                        _ => arg,
+                    };
+
+                    // Must be a multiplication-derived value (a `*` or a
+                    // `mulDiv`/`ceilDiv`-family product), with at least one
+                    // non-constant, non-width-bounded factor.
+                    if !is_unbounded_product(cx, f, resolved, &widths, &fields, bits) {
+                        return;
+                    }
+
+                    // PRECISION — only the COMPOUNDING shape is dangerous: the
+                    // narrowed product must be written to a PERSISTENT slot (a
+                    // mapping/array index, a struct member, or a state var), so the
+                    // truncation corrupts ongoing accounting (Salty H-04:
+                    // `totalRewards[poolID] += uint128(...)`, `user.virtualRewards +=
+                    // uint128(...)`). A one-shot LOCAL conversion used once and never
+                    // persisted (e.g. reserve `RToken.redeem`'s `uint192 baskets =
+                    // uint192(mulDiv256(basketsNeeded_, amount, supply))`, which the
+                    // code proves bounded — `amount < supply`) is NOT accumulated into
+                    // state and must stay silent.
+                    if !cast_in_state_write(cx, f, span) {
+                        return;
+                    }
+
+                    // A guard `require(value <= type(uintN).max)` (or the operand's
+                    // own name pinned `<= cap`) already proves the product fits.
+                    if has_dominating_guard && ty.trim_start().starts_with("uint") {
+                        return;
+                    }
+
+                    // DEDUPE: one finding per (function, target width), shared with
+                    // nothing in arm (2) — a function that narrows several products
+                    // to the same `uintN` (the paired `x += uintN(p); y += uintN(p);`
+                    // accounting update) is a single review item.
+                    if !reported_mul_widths.insert(bits) {
+                        return;
+                    }
+
+                    let b = FindingBuilder::new(self.id(), Category::IntegerOverflow)
+                        .title(format!(
+                            "Narrowing downcast to `{ty}` of a multiplication-derived value silently truncates"
+                        ))
+                        .severity(Severity::Medium)
+                        // Structural confidence: the trigger is a `uintN` narrowing of
+                        // a `*`/`mulDiv`/`ceilDiv` product with an unbounded
+                        // (state/derived) factor that the width/clamp/shrink
+                        // suppressions did not already prove safe — a narrow
+                        // conjunction, not a bare cast. Set high enough that the
+                        // corroboration score clears the High label threshold, since
+                        // H-04 is a genuine accounting-corruption bug.
+                        .confidence(0.85)
+                        .dimension(Dimension::ValueFlow)
+                        .message(format!(
+                            "`{}` narrows a value derived from a multiplication (a `*` product or a \
+                             `mulDiv`/`ceilDiv`-style wide multiply) to `{ty}` ({bits}-bit). At least one \
+                             factor is an unbounded state/derived value, so the product can exceed \
+                             `type({ty}).max`. Solidity casts never revert: the high bits are silently \
+                             dropped, corrupting the downstream accounting — and when the truncated value \
+                             is accumulated back into the same total that feeds the product, the error \
+                             compounds. (Salty StakingRewards `_increaseUserShare`: `uint128(virtualRewardsToAdd)` \
+                             where `virtualRewardsToAdd = ceilDiv(totalRewards * amount, shares)`.)",
+                            f.name
+                        ))
+                        .recommendation(
+                            "Use OpenZeppelin `SafeCast.toUintN` (reverts on truncation) or `require` the \
+                             product is `<= type(uintN).max` before narrowing; widen the accumulator to \
+                             `uint256` if the product legitimately needs the range.",
+                        );
+                    out.push(cx.finish(b, f.id, span));
+                });
             }
 
             // ---- (3) division by a non-constant divisor with no zero-check ----
@@ -1590,6 +1722,179 @@ fn is_sqrt_price_name(name: &str) -> bool {
     name.to_ascii_lowercase().contains("sqrtprice")
 }
 
+// --------------- section (6): multiplication-derived downcast --------------
+
+/// Map of local name → its *last* defining expression (a `VarDecl` initializer
+/// or a plain `=` assignment value), in source order. Used by arm (6) to look
+/// through `uintN(local)` to the product the local was assigned, e.g.
+/// `uint256 v = ceilDiv(totalRewards * amount, shares); ... uint128(v)`.
+/// Compound assignments (`+=`/`-=`/...) are intentionally skipped: they are not a
+/// clean single-expression definition we can analyse for product-ness.
+fn local_init_exprs(f: &sluice_ir::Function) -> std::collections::HashMap<&str, &Expr> {
+    let mut map: std::collections::HashMap<&str, &Expr> = std::collections::HashMap::new();
+    for s in &f.body {
+        s.visit(&mut |st| match &st.kind {
+            sluice_ir::StmtKind::VarDecl { name: Some(n), init: Some(init), .. } => {
+                map.insert(n.as_str(), init);
+            }
+            sluice_ir::StmtKind::Expr(Expr {
+                kind: ExprKind::Assign { op: sluice_ir::AssignOp::Assign, target, value },
+                ..
+            }) => {
+                if let ExprKind::Ident(n) = &target.kind {
+                    map.insert(n.as_str(), value.as_ref());
+                }
+            }
+            _ => {}
+        });
+    }
+    map
+}
+
+/// True iff the narrowing-downcast at `cast_span` is written into a PERSISTENT
+/// slot — i.e. `cast_span` lies inside the span of an assignment whose target is a
+/// mapping/array index, a struct member, or a state variable. This is the
+/// compounding-accounting shape arm (6) targets (`totalRewards[poolID] +=
+/// uint128(product)`, `packed = uint128(product)`); a one-shot conversion bound to
+/// a plain local (`uint192 baskets = uint192(mulDiv(...))`, used once and never
+/// persisted) is NOT a persistent write and is suppressed — that is exactly the
+/// reserve `RToken.redeem` downcast the code proves bounded.
+fn cast_in_state_write(cx: &AnalysisContext, f: &sluice_ir::Function, cast_span: sluice_ir::Span) -> bool {
+    let mut found = false;
+    for s in &f.body {
+        s.visit_exprs(&mut |e| {
+            if found {
+                return;
+            }
+            let ExprKind::Assign { target, .. } = &e.kind else { return };
+            // Persistent target: a mapping/array index or struct member slot (covers
+            // `totalRewards[poolID]` and `user.virtualRewards`, including storage-
+            // pointer locals), or a plain state-var Ident (`packed`).
+            let persistent = matches!(&target.kind, ExprKind::Index { .. } | ExprKind::Member { .. })
+                || crate::detectors::prelude::root_is_state_var(cx, f, target);
+            if !persistent {
+                return;
+            }
+            // The cast (a sub-expression of this assignment's value) is written to the
+            // persistent slot iff its span is contained in the assignment's span.
+            if e.span.start <= cast_span.start && cast_span.end <= e.span.end {
+                found = true;
+            }
+        });
+        if found {
+            break;
+        }
+    }
+    found
+}
+
+/// True if `name` is a `mulDiv`/`ceilDiv`-family wide-multiply helper — a call
+/// that computes (and may round) a *product* of its first operands:
+/// `mulDiv`, `mulDivUp`, `mulDivDown`, `ceilDiv`, `mulWad`, `mulWadUp`,
+/// `fullMulDiv`, `mulDivRoundingUp`, ... (the library member name, lowercased).
+/// These launder a `a * b` product through a call so the dataflow taint and the
+/// syntactic `Mul` are both hidden from arm (2).
+fn is_muldiv_name(name: Option<&str>) -> bool {
+    let Some(n) = name else { return false };
+    let lc = n.to_ascii_lowercase();
+    lc == "ceildiv"
+        || lc.contains("muldiv")
+        || lc == "mulwad"
+        || lc == "mulwadup"
+        || lc == "mulwaddown"
+}
+
+/// True if `e` is (or contains, at its product's factors) a MULTIPLICATION-derived
+/// value with at least one factor that is NOT provably bounded to the cast's
+/// target width — i.e. a product whose result can exceed `type(uintN).max` and so
+/// silently truncate when narrowed. Two product shapes are recognized:
+///   * a syntactic `a * b` (`ExprKind::Binary { op: Mul }`); and
+///   * a `mulDiv`/`ceilDiv`-family call (`is_muldiv_name`), whose product lives in
+///     its first two arguments (`ceilDiv(x * y, z)` / `mulDiv(x, y, z)`).
+///
+/// "Unbounded factor" = a factor that is not a compile-time constant AND whose
+/// width [`operand_max_bits`] cannot prove is `<= bits`. A product of two small
+/// constants, or of values each provably `<= bits` wide, is bounded and does NOT
+/// fire (the cast cannot truncate). The whole point is precision: a bare `uintN(x)`
+/// where `x` is a plain identifier — no `*`, no `mulDiv` — never reaches here.
+fn is_unbounded_product(
+    cx: &AnalysisContext,
+    f: &sluice_ir::Function,
+    e: &Expr,
+    widths: &std::collections::HashMap<String, u32>,
+    fields: &std::collections::HashMap<String, u32>,
+    bits: u32,
+) -> bool {
+    // Peel a single widening numeric cast (`uint256(ceilDiv(...))`) so a product
+    // wrapped to recover its range is still seen.
+    if let ExprKind::Call(c) = &e.kind {
+        if c.kind == CallKind::TypeCast && c.args.len() == 1 {
+            if let Some(ty) = cast_target_type(c) {
+                let t = ty.trim();
+                if t.starts_with("uint") || t.starts_with("int") {
+                    if let Some(inner) = c.args.first() {
+                        return is_unbounded_product(cx, f, inner, widths, fields, bits);
+                    }
+                }
+            }
+        }
+    }
+
+    match &e.kind {
+        // Direct `a * b`: at least one factor must be non-constant and not
+        // width-provably `<= bits`.
+        ExprKind::Binary { op: BinOp::Mul, lhs, rhs } => {
+            factor_is_unbounded(cx, f, lhs, widths, fields, bits)
+                || factor_is_unbounded(cx, f, rhs, widths, fields, bits)
+        }
+        // A `mulDiv`/`ceilDiv`-family call: its product is in the leading
+        // argument(s). `ceilDiv(x * y, z)` carries the `*` in arg0 (handled by the
+        // recursion); `mulDiv(x, y, z)` multiplies arg0 by arg1. Require an
+        // unbounded factor among the first two args.
+        ExprKind::Call(c)
+            if matches!(c.kind, CallKind::Internal | CallKind::External | CallKind::Unknown)
+                && is_muldiv_name(c.func_name.as_deref()) =>
+        {
+            let lead = c.args.iter().take(2);
+            for a in lead {
+                // arg may itself be a `x * y` product (ceilDiv form) — recurse.
+                if matches!(&a.kind, ExprKind::Binary { op: BinOp::Mul, .. }) {
+                    if is_unbounded_product(cx, f, a, widths, fields, bits) {
+                        return true;
+                    }
+                } else if factor_is_unbounded(cx, f, a, widths, fields, bits) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// A single product factor is "unbounded" (could push the product past the target
+/// width) when it is NOT a compile-time constant AND its provable width is not
+/// `<= bits`. A constant factor, or a factor proven `<= bits` wide, cannot by
+/// itself make the product overflow the narrowed range.
+fn factor_is_unbounded(
+    cx: &AnalysisContext,
+    f: &sluice_ir::Function,
+    e: &Expr,
+    widths: &std::collections::HashMap<String, u32>,
+    fields: &std::collections::HashMap<String, u32>,
+    bits: u32,
+) -> bool {
+    if is_constant_expr(e) {
+        return false;
+    }
+    match operand_max_bits(cx, f, e, widths, fields) {
+        Some(w) => w > bits,
+        // Width unknown (a state read, an index `totalRewards[poolID]`, a call
+        // result): conservatively unbounded.
+        None => true,
+    }
+}
+
 /// Names that an upper-bound guard pins in *this* function: a `require(x <= n)` /
 /// `require(x < n)` (the surviving comparison) or an `if (x > n) revert` /
 /// `if (x >= n) revert` (the revert prunes the over-limit branch). A product
@@ -2787,5 +3092,182 @@ contract C {
 }
 "#;
         assert!(!fires_sqrt_price_square(src), "square of an ordinary local must be silent (scoped to oracle prices)");
+    }
+
+    // ------------------------------------------------------------------
+    // Arm (6) MULTIPLICATION-DERIVED DOWNCAST: the Salty H-04 shape.
+    //   uint256 v = Math.ceilDiv(totalRewards[poolID] * amount, shares);
+    //   user.virtualRewards  += uint128(v);   // silent uint256->uint128 truncation
+    //   totalRewards[poolID] += uint128(v);
+    // The product launders the taint through a library call and one factor is a
+    // storage accumulator, so arm (2)'s attacker-flow gate misses it. Arm (6)
+    // catches the `uintN(product)` narrowing structurally.
+    // ------------------------------------------------------------------
+
+    fn integer_findings(src: &str) -> Vec<sluice_findings::Finding> {
+        run(src).into_iter().filter(|f| f.detector == "integer-issues").collect()
+    }
+
+    // POSITIVE (6): the exact Salty H-04 shape — a `uint128(...)` of a
+    // `Math.ceilDiv(totalRewards[poolID] * amount, shares)` product, in an
+    // `internal` function (so arm (2)'s `is_attacker_controlled` gate never sees
+    // it). Must FIRE.
+    #[test]
+    fn fires_on_salty_h04_muldiv_product_downcast() {
+        let src = r#"
+pragma solidity ^0.8.12;
+library Math { function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) { return (a + b - 1) / b; } }
+contract StakingRewards {
+    struct UserShareInfo { uint128 userShare; uint128 virtualRewards; uint256 cooldownExpiration; }
+    mapping(bytes32 => uint256) public totalShares;
+    mapping(bytes32 => uint256) public totalRewards;
+    mapping(address => mapping(bytes32 => UserShareInfo)) internal _userShareInfo;
+    function _increaseUserShare( address wallet, bytes32 poolID, uint256 increaseShareAmount, bool useCooldown ) internal {
+        UserShareInfo storage user = _userShareInfo[wallet][poolID];
+        uint256 existingTotalShares = totalShares[poolID];
+        if ( existingTotalShares != 0 ) {
+            uint256 virtualRewardsToAdd = Math.ceilDiv( totalRewards[poolID] * increaseShareAmount, existingTotalShares );
+            user.virtualRewards += uint128(virtualRewardsToAdd);
+            totalRewards[poolID] += uint128(virtualRewardsToAdd);
+        }
+        user.userShare += uint128(increaseShareAmount);
+        totalShares[poolID] = existingTotalShares + increaseShareAmount;
+        useCooldown;
+    }
+}
+"#;
+        let fs = integer_findings(src);
+        assert!(
+            fs.iter().any(|f| f.category == sluice_findings::Category::IntegerOverflow
+                && f.function == "_increaseUserShare"),
+            "Salty H-04 muldiv-product downcast must fire in _increaseUserShare: {:?}",
+            fs
+        );
+    }
+
+    // POSITIVE (6): a bare `uint128(a * b)` product of a state read and a param,
+    // narrowed and stored — the inline (non-`mulDiv`) form. Must FIRE.
+    #[test]
+    fn fires_on_inline_product_downcast_into_state() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint256 public acc;
+    uint128 public packed;
+    function f(uint256 amount) internal {
+        packed = uint128(acc * amount);
+    }
+}
+"#;
+        assert!(fires(src), "uint128 of (state * amount) product must fire");
+    }
+
+    // NEGATIVE (6): a product of two SMALL CONSTANTS cannot overflow the target —
+    // both factors are bounded literals, so it must stay SILENT.
+    #[test]
+    fn silent_on_product_of_constants() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint128 public packed;
+    function f() internal {
+        packed = uint128(3 * 7);
+    }
+}
+"#;
+        assert!(!fires(src), "downcast of a constant*constant product must be silent");
+    }
+
+    // NEGATIVE (6): a product whose factors are BOTH provably narrow (each a
+    // `uint40` param) cannot exceed a `uint128` target (40+40 = 80 <= 128), so the
+    // narrowing is width-safe and must stay SILENT.
+    #[test]
+    fn silent_on_product_of_narrow_factors() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint128 public packed;
+    function f(uint40 a, uint40 b) internal {
+        packed = uint128(a * b);
+    }
+}
+"#;
+        // Both factors are uint40 (40+40 = 80 bits <= 128), so the product fits the
+        // target and arm (6) must not fire on it.
+        let fired = integer_findings(src).iter().any(|f| {
+            f.title.contains("multiplication-derived")
+        });
+        assert!(!fired, "product of two narrow (uint40) factors into uint128 must not fire arm (6)");
+    }
+
+    // NEGATIVE (6): a bare `uintN(x)` with NO multiplication — a plain identifier
+    // bound to a non-product — must not be claimed by arm (6) (arm (2) governs
+    // that, gated on attacker flow). Here `x` is a state read with no `*`.
+    #[test]
+    fn arm6_silent_on_non_product_downcast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint256 public acc;
+    uint128 public packed;
+    function f() internal {
+        uint256 v = acc;
+        packed = uint128(v);
+    }
+}
+"#;
+        let fired = integer_findings(src)
+            .iter()
+            .any(|f| f.title.contains("multiplication-derived"));
+        assert!(!fired, "arm (6) must not fire on a non-product downcast");
+    }
+
+    // NEGATIVE (6): a product GUARDED by `require(v <= type(uint128).max)` before
+    // the narrowing cannot truncate — the dominating guard suppresses it.
+    #[test]
+    fn silent_on_guarded_product_downcast() {
+        let src = r#"
+pragma solidity ^0.8.20;
+contract C {
+    uint256 public acc;
+    uint128 public packed;
+    function f(uint256 amount) internal {
+        uint256 v = acc * amount;
+        if (v > type(uint128).max) revert();
+        packed = uint128(v);
+    }
+}
+"#;
+        assert!(!fires(src), "guarded (type(uint128).max) product downcast must be silent");
+    }
+
+    // NEGATIVE (6): a one-shot LOCAL conversion of a `mulDiv` product that is used
+    // once (in a call / emit) and NEVER written to a persistent slot must stay
+    // silent — the reserve `RToken.redeem` shape (`uint192 baskets =
+    // uint192(mulDiv256(basketsNeeded_, amount, supply))`, proven bounded:
+    // `amount < supply`). Only the COMPOUNDING shape (narrowed product accumulated
+    // into state) is dangerous, so this plain-local conversion must not fire.
+    #[test]
+    fn silent_on_oneshot_local_product_not_persisted() {
+        let src = r#"
+pragma solidity ^0.8.20;
+library M { function mulDiv(uint256 a, uint256 b, uint256 c) internal pure returns (uint256) { return a * b / c; } }
+interface H { function quote(uint192 x) external view returns (uint256); }
+contract C {
+    uint192 public basketsNeeded;
+    H public h;
+    event Redemption(address who, uint256 amount, uint192 baskets);
+    function redeem(uint256 amount) external {
+        uint256 supply = 1000e18;
+        uint192 baskets = uint192(M.mulDiv(basketsNeeded, amount, supply));
+        emit Redemption(msg.sender, amount, baskets);
+        h.quote(baskets);
+    }
+}
+"#;
+        assert!(
+            !fires(src),
+            "a one-shot local product conversion never written to state must be silent (reserve RToken.redeem shape)"
+        );
     }
 }

@@ -219,13 +219,13 @@
     {
       "id": "M-25",
       "severity": "Medium",
-      "contract": "SurplusGuildMinter",
-      "function": "getRewards",
-      "file": "src/loan/SurplusGuildMinter.sol",
-      "line": 239,
+      "contract": "ProfitManager",
+      "function": "claimRewards",
+      "file": "src/governance/ProfitManager.sol",
+      "line": 443,
       "bug_class": "unbounded-loop",
       "in_class": true,
-      "summary": "getRewards calls `ProfitManager(profitManager).claimRewards(address(this))` (L239), which loops over ALL gauges this contract votes for (ProfitManager.claimRewards L443, `for i < gauges.length`). As the SurplusGuildMinter accumulates positions across many terms, every stake/unstake/getRewards iterates the full gauge list and can exceed the block gas limit, DoSing the function (M-25). Mapped to Sluice's UnboundedLoop/DenialOfService family (in_class)."
+      "summary": "The unbounded loop of M-25 lives in ProfitManager.claimRewards (L443, `for i < gauges.length` over the full per-user gauge list fetched from GuildToken.userGauges, each iteration doing reward accounting + a CREDIT transfer); it is reached cross-contract from SurplusGuildMinter.getRewards (L239, `ProfitManager(profitManager).claimRewards(address(this))`). As positions accumulate across many gauges/terms the loop can exceed the block gas limit, DoSing the claim path (M-25). Pinned to the TRUE mechanism locus (the loop in claimRewards) rather than the cross-contract entry getRewards, per the pin-to-real-mechanism rule. Mapped to Sluice's UnboundedLoop/DenialOfService family (in_class)."
     }
   ]
 }

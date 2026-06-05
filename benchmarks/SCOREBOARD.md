@@ -16,10 +16,10 @@ Recall + precision of Sluice vs published audit findings, over the contest corpu
 | `2023-06-stader` | 100% (3/3) | 8% (1/12) | 1 | 0 | 32 |
 | `2023-07-basin` | 100% (3/3) | 0% (0/2) | 2 | 1 | 44 |
 | `2023-10-wildcat` | 0% (0/1) | 0% (0/14) | 0 | 0 | 40 |
-| `2023-12-ethereumcreditguild` | 0% (0/3) | 0% (0/17) | 2 | 2 | 68 |
-| `2024-01-salty` | 0% (0/5) | 0% (0/5) | 2 | 2 | 62 |
-| `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 4 |
-| **AGGREGATE** | **78% (31/40)** | **5% (4/77)** | **29** | **21** | **626** |
+| `2023-12-ethereumcreditguild` | 33% (1/3) | 0% (0/17) | 2 | 2 | 69 |
+| `2024-01-salty` | 60% (3/5) | 0% (0/5) | 3 | 2 | 65 |
+| `2024-05-loop` | 100% (2/2) | 50% (1/2) | 1 | 0 | 5 |
+| **AGGREGATE** | **88% (35/40)** | **5% (4/77)** | **30** | **21** | **631** |
 
 ## Per-finding detail
 
@@ -187,7 +187,7 @@ Repo `code-423n4/2023-12-ethereumcreditguild` @ `2facb8f941da70bf075380784b3139f
 | M-21 | Medium | `logic` | no | 🟡 near (class mismatch) | — | SimplePSM.mint calls `CreditToken(credit).mint(to, amountOut)` directly (L110), and redeem burns directly (L140), bypassing the RateLimitedMinter that gates al… |
 | M-22 | Medium | `accounting-logic` | no | 🟡 near (class mismatch) | — | The borrow() debt-ceiling check uses `calculateGaugeAllocation(this, totalBorrowedCredit + borrowAmount) * gaugeWeightTolerance / 1e18` (L383-387), while the p… |
 | M-23 | Medium | `rounding-direction` | yes | 🟡 near (class mismatch) | — | Share<->balance conversions round down in _balance2shares/_shares2balance (L256, L266-273). In _mint the realized reward `mintAmount = rebasedBalance - rawBala… |
-| M-25 | Medium | `unbounded-loop` | yes | 🟡 near (class mismatch) | — | getRewards calls `ProfitManager(profitManager).claimRewards(address(this))` (L239), which loops over ALL gauges this contract votes for (ProfitManager.claimRew… |
+| M-25 | Medium | `unbounded-loop` | yes | ✅ caught | UnboundedLoop @ profitmanager.sol:443 | The unbounded loop of M-25 lives in ProfitManager.claimRewards (L443, `for i < gauges.length` over the full per-user gauge list fetched from GuildToken.userGau… |
 
 ### `2024-01-salty`
 
@@ -196,15 +196,15 @@ Repo `code-423n4/2024-01-salty` @ `01eb9e21f1d0aa7a058897914bbca9c994d314e0`.
 | Known | Sev | Class | In-class | Result | Matched by | Summary |
 |---|---|---|---|---|---|---|
 | H-01 | High | `logic` | no | ❌ missed | — | step11() reads `releaseableAmount = VestingWallet(teamVestingWallet).releasable(salt)` (L233), then calls `.release(salt)` (L236) and `salt.safeTransfer(manage… |
-| H-02 | High | `first-depositor` | yes | ❌ missed | — | _increaseUserShare only adds offsetting virtualRewards `if ( existingTotalShares != 0 )` (L78-85); the first liquidity provider into a pool that already has ac… |
+| H-02 | High | `first-depositor` | yes | 🟡 near (class mismatch) | — | _increaseUserShare only adds offsetting virtualRewards `if ( existingTotalShares != 0 )` (L78-85); the first liquidity provider into a pool that already has ac… |
 | H-03 | High | `price-manipulation` | yes | ❌ missed | — | CoreSaltyFeed.getPriceBTC/getPriceETH derive the price purely from live internal pool reserves: `return ( reservesUSDS * 10**8 ) / reservesWBTC` (L40, and L52 … |
-| H-04 | High | `integer-overflow` | yes | ❌ missed | — | _increaseUserShare computes `virtualRewardsToAdd = Math.ceilDiv(totalRewards[poolID]*increaseShareAmount, existingTotalShares)` then `user.virtualRewards += ui… |
-| H-05 | High | `logic` | no | ❌ missed | — | _increaseUserShare resets `user.cooldownExpiration = block.timestamp + stakingConfig.modificationCooldown()` on every share increase (L70), and liquidateUser -… |
+| H-04 | High | `integer-overflow` | yes | ✅ caught | IntegerOverflow @ stakingrewards.sol:83 | _increaseUserShare computes `virtualRewardsToAdd = Math.ceilDiv(totalRewards[poolID]*increaseShareAmount, existingTotalShares)` then `user.virtualRewards += ui… |
+| H-05 | High | `logic` | no | 🟡 near (class mismatch) | — | _increaseUserShare resets `user.cooldownExpiration = block.timestamp + stakingConfig.modificationCooldown()` on every share increase (L70), and liquidateUser -… |
 | H-06 | High | `accounting-logic` | no | ❌ missed | — | repayUSDS sends the repaid USDS to the USDS token contract itself — `usds.safeTransferFrom(msg.sender, address(usds), amountRepaid)` (L125) — then `liquidizer.… |
-| M-01 | Medium | `rounding-direction` | yes | 🟡 near (class mismatch) | — | _decreaseUserShare computes `virtualRewardsToRemove = (user.virtualRewards * decreaseShareAmount) / user.userShare` (L118) which rounds DOWN, while claimableRe… |
+| M-01 | Medium | `rounding-direction` | yes | ✅ caught | RoundingDirection @ stakingrewards.sol:118 | _decreaseUserShare computes `virtualRewardsToRemove = (user.virtualRewards * decreaseShareAmount) / user.userShare` (L118) which rounds DOWN, while claimableRe… |
 | M-09 | Medium | `logic` | no | ❌ missed | — | removeLiquidity's post-withdrawal DUST guard is `require((reserves.reserve0 >= PoolUtils.DUST) && (reserves.reserve0 >= PoolUtils.DUST), "Insufficient reserves… |
 | M-18 | Medium | `logic` | no | 🟡 near (class mismatch) | — | _getUniswapTwapWei derives the average tick with `int24 tick = int24((tickCumulatives[1] - tickCumulatives[0]) / int56(uint56(twapInterval)))` (L59). Solidity … |
-| M-26 | Medium | `slippage` | yes | ❌ missed | — | formPOL calls `collateralAndLiquidity.depositLiquidityAndIncreaseShare( tokenA, tokenB, amountA, amountB, 0, block.timestamp, true )` (L321) — minLiquidityRece… |
+| M-26 | Medium | `slippage` | yes | ✅ caught | Slippage @ dao.sol:321 | formPOL calls `collateralAndLiquidity.depositLiquidityAndIncreaseShare( tokenA, tokenB, amountA, amountB, 0, block.timestamp, true )` (L321) — minLiquidityRece… |
 
 ### `2024-05-loop`
 

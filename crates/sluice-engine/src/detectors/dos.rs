@@ -24,6 +24,28 @@
 //!    guard in the grower suppresses it, as do `.push`es that are length-capped).
 //!    Emitted as [`Category::UnboundedLoop`].
 //!
+//! 1c. **Unbounded loop over an aggregate-growable list fetched from another
+//!    contract** — a loop whose bound is `V.length` (or which indexes `V`) where
+//!    `V` is a *local* variable initialized in the same function from an external
+//!    getter that returns an array (`X.userGauges(user)`, `X.getPositions(...)`,
+//!    …), and whose body does genuine per-iteration work (a call — internal or
+//!    external — or a storage write). This is the EthereumCreditGuild
+//!    `ProfitManager.claimRewards` shape (M-25): the loop iterates
+//!    `GuildToken(guild).userGauges(user)` and calls `claimGaugeRewards` (which
+//!    itself transfers CREDIT) on every element. The list of gauges a user is in
+//!    grows permissionlessly (any holder can `incrementGauge` into more gauges),
+//!    so as positions accumulate the per-element work multiplied by the count
+//!    eventually exceeds the block gas limit and the claim path bricks. Unlike
+//!    pattern (1) the growing array lives in *another* contract (so it is not in
+//!    this contract's `growable_arrays`), and unlike (1b) the bound is a memory
+//!    array (not a state counter) and the per-iteration work may be an *internal*
+//!    call that fans out to external transfers. Conservative gates keep it quiet:
+//!    the bound local must be sourced from an *external* call (a caller-supplied
+//!    calldata/memory array, or a freshly `new`-allocated array, does NOT count),
+//!    the loop body must do non-trivial work (a call or a storage write — pure
+//!    read/arithmetic accumulators stay silent), and `try`-wrapped fault-tolerant
+//!    loops are suppressed. Emitted as [`Category::UnboundedLoop`].
+//!
 //! 2. **External call inside a loop** — a `for`/`while`/`do-while` whose body
 //!    transfers control to an external party (`.transfer`/`.send`/low-level
 //!    `.call`, an interface call). A single reverting / griefing recipient
@@ -280,6 +302,67 @@ impl Detector for DosDetector {
                     }
                 }
             }
+
+            // ---- Pattern 1c: unbounded loop over an aggregate-growable list that
+            // was FETCHED from another contract via an external getter, with genuine
+            // per-iteration work. This is the EthereumCreditGuild
+            // `ProfitManager.claimRewards` shape (M-25):
+            //   address[] memory gauges = GuildToken(guild).userGauges(user);
+            //   for (uint i = 0; i < gauges.length; ) {
+            //       creditEarned += claimGaugeRewards(user, gauges[i]); // internal, fans out to a CREDIT transfer
+            //   }
+            // The iterated list grows permissionlessly in the *other* contract (any
+            // holder can `incrementGauge` into more gauges), so neither pattern (1)
+            // (growable storage array in THIS contract) nor (1b) (a state counter
+            // bound + in-loop external call) matches. We key on: a loop whose bound
+            // reads a LOCAL whose initializer is an EXTERNAL call returning an array,
+            // and whose body does non-trivial work (a call — internal or external —
+            // or a storage write).
+            //
+            // Conservative gates that keep this quiet on real protocols:
+            //   * the bound local must be sourced from an *external* call — a
+            //     caller-supplied calldata/memory parameter, or a `new T[](n)`
+            //     allocation, is NOT externally fetched and stays silent;
+            //   * the loop body must do real per-element work (a call or a storage
+            //     write); a pure read/arithmetic accumulator stays silent; and
+            //   * `try`-wrapped fault-tolerant loops are suppressed (one failing
+            //     element does not brick the batch).
+            if !emitted {
+                let fetched = locals_from_external_getter(f);
+                if !fetched.is_empty() {
+                    let hit = loops_in(f).into_iter().find(|ls| {
+                        loop_bound_reads_state(ls, &fetched)
+                            && loop_has_per_iteration_work(loop_body(ls))
+                            && !loop_is_fault_tolerant(cx, f, ls)
+                    });
+                    if let Some(ls) = hit {
+                        let b = FindingBuilder::new(self.id(), Category::UnboundedLoop)
+                            .title("Unbounded loop over an aggregate-growable list fetched from another contract")
+                            .severity(Severity::Medium)
+                            .confidence(0.5)
+                            .dimension(Dimension::Invariant)
+                            .dimension(Dimension::Frontier)
+                            .message(format!(
+                                "`{}` loops up to the length of a list it fetches from another contract via an \
+                                 external getter, and does per-element work (a call or storage write) on every \
+                                 iteration. The fetched list grows as positions accumulate — and where any user \
+                                 can permissionlessly add entries (e.g. voting into more gauges), it grows without \
+                                 an enforced bound — so the per-element gas multiplied by the element count \
+                                 eventually exceeds the block gas limit and the function can never complete, \
+                                 permanently freezing the logic (and any funds) that depend on it.",
+                                f.name
+                            ))
+                            .recommendation(
+                                "Cap or paginate the per-element work, bound the number of positions a single \
+                                 account can accumulate, or restructure so the gas cost cannot be driven past the \
+                                 block limit as the fetched list grows.",
+                            );
+                        out.push(cx.finish(b, f.id, ls.span));
+                        emitted = true;
+                    }
+                }
+            }
+            let _ = emitted;
 
             // ---- Pattern 4: single-recipient push-payment that requires success
             // (Asymmetry M-06 / SafEth `unstake`). A withdrawal/claim/unstake/redeem-
@@ -873,6 +956,142 @@ fn loop_bound_reads_state(loop_stmt: &Stmt, state: &std::collections::HashSet<St
         _ => {}
     }
     hit
+}
+
+/// Local variables declared in `f` whose initializer is (or contains) an EXTERNAL
+/// call returning an array — i.e. a list FETCHED from another contract via a getter
+/// (`address[] memory gauges = GuildToken(guild).userGauges(user)`). Iterating such
+/// a list up to its `.length`, while doing per-element work, is the M-25 DoS shape:
+/// the list lives in another contract and grows as positions accumulate (and where
+/// any user can permissionlessly add entries, grows unbounded). Returns the local
+/// variable names.
+///
+/// Conservative by construction: a local initialized from a calldata/memory
+/// parameter, a `new T[](n)` allocation, or pure arithmetic does NOT qualify — only
+/// a genuine cross-contract external call (`CallKind::External` / low-level / static)
+/// is treated as an externally-fetched list. A `TypeCast` wrapper
+/// (`GuildToken(guild)`) is the *receiver* of the external method call, so it is the
+/// outer call (`.userGauges(...)`, classified External) that we match.
+fn locals_from_external_getter(f: &Function) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for s in &f.body {
+        s.visit(&mut |st| {
+            if let StmtKind::VarDecl { name: Some(name), init: Some(init), .. } = &st.kind {
+                if init_is_external_array_fetch(init) {
+                    out.insert(name.clone());
+                }
+            }
+        });
+    }
+    out
+}
+
+/// True if an initializer expression is an external call that transfers control to
+/// another contract AND is keyed by an ACCOUNT-shaped argument — the fetch of a
+/// *per-account position list* from a getter (`GuildToken(guild).userGauges(user)`,
+/// `X.getPositions(msg.sender)`, `X.listOf(address(this))`). The account argument is
+/// the load-bearing discriminator: it is what makes the list grow as that account
+/// accumulates positions, and what (where the add path is permissionless) lets the
+/// aggregate grow without bound.
+///
+/// This deliberately EXCLUDES protocol *registry* getters that take no per-account
+/// argument or are keyed by a protocol-config key: `pool.getReservesList()`,
+/// `stakingRouter.getStakingModuleIds()`, `incentives.getRewardsByAsset(asset)`.
+/// Those are admin-curated, bounded lists — iterating them is not an attacker-
+/// driven DoS — so requiring an account-shaped argument keeps real protocols quiet.
+fn init_is_external_array_fetch(init: &Expr) -> bool {
+    // Find the outermost call that is an external transfer-of-control (the getter),
+    // unwrapping any cast/member/index chain that wraps it.
+    fn head_external_call(e: &Expr) -> Option<&sluice_ir::Call> {
+        match &e.kind {
+            ExprKind::Call(c) if c.kind.is_external_transfer_of_control() => Some(c),
+            ExprKind::Call(c) if matches!(c.kind, CallKind::TypeCast) => {
+                c.args.iter().find_map(head_external_call)
+            }
+            ExprKind::Member { base, .. } | ExprKind::Index { base, .. } => head_external_call(base),
+            _ => None,
+        }
+    }
+    match head_external_call(init) {
+        Some(c) => c.args.iter().any(expr_is_account_shaped),
+        None => false,
+    }
+}
+
+/// True if an expression denotes an account/holder — `msg.sender`, `address(this)`,
+/// or an account-shaped identifier (`user`/`account`/`owner`/`staker`/`holder`/
+/// `recipient`/`who`). Such an argument to a list getter is what makes the returned
+/// list a *per-account* position list (the thing that grows as the account takes
+/// positions), distinguishing it from a no-arg / config-keyed protocol registry.
+fn expr_is_account_shaped(e: &Expr) -> bool {
+    match &e.kind {
+        // `msg.sender`
+        ExprKind::Member { base, member } => {
+            if member == "sender" {
+                if let ExprKind::Ident(b) = &base.kind {
+                    if b == "msg" {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        // `address(this)` / `payable(this)` casts wrap `this`.
+        ExprKind::Call(c) if matches!(c.kind, CallKind::TypeCast) => {
+            c.args.iter().any(expr_is_account_shaped)
+        }
+        ExprKind::Ident(n) => {
+            if n == "this" {
+                return true;
+            }
+            let n = n.trim_start_matches('_').to_ascii_lowercase();
+            matches!(
+                n.as_str(),
+                "user" | "account" | "owner" | "staker" | "holder" | "recipient" | "who" | "from" | "beneficiary"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// True if a loop body does genuine per-iteration work: it contains a call (of any
+/// kind that transfers control — internal, external, or low-level) OR a storage
+/// write (an indexed/member assignment, a compound assignment, or a `.push`). A
+/// pure read/arithmetic accumulator into a *local* (`t += weights[i]`) is NOT
+/// counted as protocol work — but an internal call that fans out to external
+/// transfers (the M-25 `claimGaugeRewards(...)`) IS. We err toward requiring a
+/// CALL: an internal/external/low-level call is the load-bearing per-element cost
+/// that scales with the list length.
+fn loop_has_per_iteration_work(body: &[Stmt]) -> bool {
+    let mut work = false;
+    for s in body {
+        s.visit_exprs(&mut |e| {
+            if work {
+                return;
+            }
+            if let ExprKind::Call(c) = &e.kind {
+                // Any genuine function call (not a mere type cast / builtin like
+                // `require`) is per-element work that scales with the bound.
+                let is_real_call = matches!(
+                    c.kind,
+                    CallKind::Internal
+                        | CallKind::External
+                        | CallKind::LowLevelCall
+                        | CallKind::DelegateCall
+                        | CallKind::StaticCall
+                        | CallKind::Send
+                        | CallKind::Transfer
+                );
+                if is_real_call {
+                    work = true;
+                }
+            }
+        });
+        if work {
+            break;
+        }
+    }
+    work
 }
 
 /// True if the function name is withdrawal/claim/unstake/redeem-shaped — the
@@ -1510,6 +1729,148 @@ mod tests {
                     && f.category == sluice_findings::Category::DenialOfService
             }),
             "payable refund-excess tail must not fire Pattern 4: {:?}",
+            fs
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Pattern 1c: unbounded loop over an aggregate-growable list fetched from
+    // another contract (EthereumCreditGuild `ProfitManager.claimRewards`, M-25).
+    // ------------------------------------------------------------------
+
+    // POSITIVE: the M-25 shape — `gauges` is a memory array fetched from another
+    // contract's getter (`GuildToken(guild).userGauges(user)`), the loop iterates
+    // `gauges.length` and does per-element work via an internal call
+    // (`claimGaugeRewards`, which fans out to a CREDIT transfer). The gauge list
+    // grows permissionlessly. Must FIRE as UnboundedLoop.
+    #[test]
+    fn fires_on_external_fetched_list_loop() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            interface GuildToken { function userGauges(address u) external view returns (address[] memory); }
+            interface CreditToken { function transfer(address t, uint256 a) external returns (bool); }
+            contract ProfitManager {
+                address public guild;
+                address public credit;
+                mapping(address => mapping(address => uint256)) public userGaugeProfitIndex;
+                mapping(address => uint256) public gaugeProfitIndex;
+
+                function claimGaugeRewards(address user, address gauge) public returns (uint256 earned) {
+                    earned = gaugeProfitIndex[gauge] - userGaugeProfitIndex[user][gauge];
+                    userGaugeProfitIndex[user][gauge] = gaugeProfitIndex[gauge];
+                    if (earned != 0) {
+                        CreditToken(credit).transfer(user, earned);
+                    }
+                }
+
+                function claimRewards(address user) external returns (uint256 creditEarned) {
+                    address[] memory gauges = GuildToken(guild).userGauges(user);
+                    for (uint256 i = 0; i < gauges.length; ) {
+                        creditEarned += claimGaugeRewards(user, gauges[i]);
+                        unchecked { ++i; }
+                    }
+                }
+            }
+        "#);
+        assert!(
+            fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::UnboundedLoop
+                    && f.function == "claimRewards"
+            }),
+            "loop over an externally-fetched growable list with per-element work must fire as UnboundedLoop: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: same loop shape, but `ids` is a CALLER-supplied calldata array, not
+    // a list fetched from another contract. A caller's own batch size is its own
+    // concern, not a protocol DoS. Must stay SILENT for Pattern 1c.
+    #[test]
+    fn silent_on_calldata_array_loop_with_work() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            contract Batch {
+                mapping(uint256 => uint256) public seen;
+                function process(uint256[] calldata ids) external {
+                    for (uint256 i = 0; i < ids.length; i++) {
+                        seen[ids[i]] = block.timestamp;
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::UnboundedLoop
+            }),
+            "loop over a caller-supplied calldata array must not fire Pattern 1c: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: a list fetched from another contract, but the loop body is a PURE
+    // read/arithmetic accumulator (no call, no storage write) — the gas per element
+    // is tiny, off-chain re-readable. Must stay SILENT (per-element WORK gates 1c).
+    #[test]
+    fn silent_on_external_fetched_list_pure_loop() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            interface Registry { function listOf(address u) external view returns (uint256[] memory); }
+            contract Reader {
+                address public registry;
+                uint256 public total;
+                function sum(address u) external {
+                    uint256[] memory xs = Registry(registry).listOf(u);
+                    uint256 t = 0;
+                    for (uint256 i = 0; i < xs.length; i++) {
+                        t += xs[i];
+                    }
+                    total = t;
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::UnboundedLoop
+            }),
+            "pure-accumulator loop over a fetched list must not fire Pattern 1c: {:?}",
+            fs
+        );
+    }
+
+    // NEGATIVE: a loop over a list fetched from another contract via a NO-ARG /
+    // config-keyed REGISTRY getter (`getReservesList()`, `getStakingModuleIds()`,
+    // `getRewardsByAsset(asset)`), with a per-element external call. These are
+    // admin-curated, bounded protocol registries — not a per-account position list
+    // an attacker can grow — so Pattern 1c must stay SILENT (the account-shaped
+    // argument is the load-bearing discriminator). Aave `setPoolPause` /
+    // `refreshRewardTokens` and Lido `_checkCLBalanceDecrease` are of this kind.
+    #[test]
+    fn silent_on_registry_getter_loop() {
+        let fs = run(r#"
+            pragma solidity ^0.8.0;
+            interface IPool {
+                function getReservesList() external view returns (address[] memory);
+                function setReservePause(address a, bool p) external;
+            }
+            contract Configurator {
+                address public pool;
+                function setPoolPause(bool p) external {
+                    address[] memory reserves = IPool(pool).getReservesList();
+                    for (uint256 i = 0; i < reserves.length; i++) {
+                        IPool(pool).setReservePause(reserves[i], p);
+                    }
+                }
+            }
+        "#);
+        assert!(
+            !fs.iter().any(|f| {
+                f.detector == "denial-of-service"
+                    && f.category == sluice_findings::Category::UnboundedLoop
+            }),
+            "loop over a no-arg admin registry getter must not fire Pattern 1c: {:?}",
             fs
         );
     }

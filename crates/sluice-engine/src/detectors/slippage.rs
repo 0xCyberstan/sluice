@@ -475,24 +475,43 @@ fn is_protection_token(name: &str) -> bool {
 /// Swap / liquidity router method names worth inspecting. Restricting to these
 /// keeps precision high — we never flag an arbitrary call that happens to carry
 /// a `0` argument.
+///
+/// Includes the bespoke "zapping" liquidity-deposit primitives (Salty's
+/// `depositLiquidityAndIncreaseShare`, generic `depositLiquidity*`/`addLiquidity*`):
+/// these add liquidity to an AMM and take a `minLiquidityReceived`/`amountOutMin`
+/// argument plus a `deadline`, so a literal `0` min-liquidity or `block.timestamp`
+/// deadline is the same sandwichable value-leak as a router swap.
 fn is_swap_like(c: &Call) -> bool {
-    matches!(
-        c.func_name.as_deref(),
-        Some(
-            "swap"
-                | "swapExactTokensForTokens"
-                | "swapExactETHForTokens"
-                | "swapTokensForExactTokens"
-                | "exactInput"
-                | "exactInputSingle"
-                | "exactOutputSingle"
-                | "addLiquidity"
-                | "removeLiquidity"
-                | "mint"
-                | "deposit"
-                | "redeem"
-        )
-    )
+    let name = c.func_name.as_deref().unwrap_or("");
+    if matches!(
+        name,
+        "swap"
+            | "swapExactTokensForTokens"
+            | "swapExactETHForTokens"
+            | "swapTokensForExactTokens"
+            | "exactInput"
+            | "exactInputSingle"
+            | "exactOutputSingle"
+            | "addLiquidity"
+            | "removeLiquidity"
+            | "mint"
+            | "deposit"
+            | "redeem"
+    ) {
+        return true;
+    }
+    // Prefix families for AMM add-liquidity / zap / swap primitives whose exact
+    // method name varies by protocol but which all carry a min-output + deadline:
+    //   `depositLiquidity*`  (Salty `depositLiquidityAndIncreaseShare`)
+    //   `addLiquidity*`      (`addLiquidityETH`, `addLiquidityAndStake`, ...)
+    //   `exactInput*` / `exactOutput*` (UniswapV3 router variants)
+    //   `swapExact*` / `swapTokens*` / `swap*ForTokens` (router swap variants)
+    name.starts_with("depositLiquidity")
+        || name.starts_with("addLiquidity")
+        || name.starts_with("exactInput")
+        || name.starts_with("exactOutput")
+        || name.starts_with("swapExact")
+        || name.starts_with("swapTokens")
 }
 
 /// True if `e` is a literal numeric/hex zero (`0`, `0x0`, `0x00`, ...).
@@ -678,6 +697,71 @@ mod tests {
     fn silent_on_safe() {
         let fs = run(SAFE);
         assert!(!fs.iter().any(|f| f.detector == "slippage"));
+    }
+
+    // Salty M-26: protocol-owned-liquidity formation zaps into the AMM via a
+    // bespoke `depositLiquidityAndIncreaseShare` with a literal `0`
+    // `minLiquidityReceived` and a `block.timestamp` deadline — neither slippage
+    // nor expiry protection, fully sandwichable.
+    const LP_ZAP_VULN: &str = r#"
+        interface ICollateralAndLiquidity {
+            function depositLiquidityAndIncreaseShare(
+                address tokenA, address tokenB,
+                uint256 amountA, uint256 amountB,
+                uint256 minLiquidityReceived, uint256 deadline, bool useZapping
+            ) external returns (uint256, uint256, uint256);
+        }
+        contract DAO {
+            ICollateralAndLiquidity collateralAndLiquidity;
+            function formPOL(address tokenA, address tokenB, uint256 amountA, uint256 amountB) external {
+                collateralAndLiquidity.depositLiquidityAndIncreaseShare(
+                    tokenA, tokenB, amountA, amountB, 0, block.timestamp, true );
+            }
+        }
+    "#;
+
+    #[test]
+    fn fires_on_lp_zap_zero_minliquidity() {
+        let fs = run(LP_ZAP_VULN);
+        assert!(
+            fs.iter()
+                .any(|f| f.detector == "slippage" && f.function == "formPOL"),
+            "expected a slippage finding on the zero-minLiquidity LP zap: {:?}",
+            fs
+        );
+    }
+
+    // Same primitive, but with a real caller-supplied `minLiquidity` and a future
+    // `deadline` — neither a literal 0 nor block.timestamp, so it must stay silent.
+    #[test]
+    fn silent_on_lp_zap_with_real_bounds() {
+        let src = r#"
+            interface ICollateralAndLiquidity {
+                function depositLiquidityAndIncreaseShare(
+                    address tokenA, address tokenB,
+                    uint256 amountA, uint256 amountB,
+                    uint256 minLiquidityReceived, uint256 deadline, bool useZapping
+                ) external returns (uint256, uint256, uint256);
+            }
+            contract DAO {
+                ICollateralAndLiquidity collateralAndLiquidity;
+                function formPOL(
+                    address tokenA, address tokenB,
+                    uint256 amountA, uint256 amountB,
+                    uint256 minLiquidity, uint256 deadline
+                ) external {
+                    collateralAndLiquidity.depositLiquidityAndIncreaseShare(
+                        tokenA, tokenB, amountA, amountB, minLiquidity, deadline, true );
+                }
+            }
+        "#;
+        let fs = run(src);
+        assert!(
+            !fs.iter()
+                .any(|f| f.detector == "slippage" && f.function == "formPOL"),
+            "an LP zap with real min-liquidity and deadline must not fire: {:?}",
+            fs
+        );
     }
 
     // ---- Class 2: self-priced mint/redeem on a bonding curve ----
